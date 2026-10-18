@@ -756,6 +756,8 @@ impl Store {
             info.last_seen = now();
             self.save_worker(&info)?;
         }
+        // Logs never change scheduling; skipping `schedule` keeps reconnect log replay linear.
+        let reschedule = !matches!(message, WorkerMessage::Log { .. });
         match message {
             WorkerMessage::Hello { .. } => bail!("hello already received"),
             WorkerMessage::Started { job_id, attempt_id } => {
@@ -812,7 +814,10 @@ impl Store {
             WorkerMessage::Environment { status } => self.receive_status(worker, status)?,
             WorkerMessage::Heartbeat => {}
         }
-        self.schedule()
+        if reschedule {
+            self.schedule()?;
+        }
+        Ok(())
     }
     fn disconnect(&mut self, worker: &str, session: Uuid) -> Result<()> {
         if self.sessions.get(worker).is_none_or(|s| s.id != session) {

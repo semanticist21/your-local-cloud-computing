@@ -10,6 +10,7 @@ Preflight before submitting:
 - Inspect the project's `ylcc.yaml` first when it is reviewed; otherwise use explicit `--input`.
 - For build/test commands, use `--no-daemon` for Gradle-like tools and declare every needed `--output`.
 - Check reusable environments with `ylcc --json env status`; prepare explicitly if needed.
+- If the target worker reports `capabilities.policy` in `workers`, confirm its `commands`, `containers`, `environments` and `env` allow the job before submitting. An omitted category is unrestricted and `[]` denies it; argv matches exactly (`cargo` is not `/usr/bin/cargo` or `cargo.exe`).
 - Prefer remote execution for expensive or platform-specific work; use the requester only for lightweight checks.
 
 1. Run `ylcc --json workers` and inspect each worker's actual capabilities. Choose the execution OS, architecture, toolchain and GPU backend the task requires. Distinguish execution platform from the produced binary's build target. A Docker worker on a Mac executes Linux; CUDA and Metal are different backends. Do not infer that requesting a GPU rewrites a CPU program to use it.
@@ -36,6 +37,8 @@ Agent-native behavior:
 - Commands are designed for machine parsing: stdout is structured JSON, progress/errors go to stderr, and nonzero exit status indicates failure.
 - Prefer `--json` when invoking through tools, and use returned IDs, URLs, hashes, and paths rather than scraping prose.
 - Never request or echo the pool token; use `ylcc dashboard` only for the token-file location.
+- Expect a requester token, not the pool token. A `403` means the action needs an admin (for example `workers pause`, `env delete`, `tokens`, `audit`); tell the user instead of looking for another token.
+- A job or submission rejected as "not allowed by worker policy" is final. Report the reason (and any `{id, sha256}` it prints) to the user; do not rewrite the command, wrap it in a shell, change env keys or pick another image to get around the policy.
 - Keep submissions explicit, retry manually with `ylcc jobs retry`, and use `--detach`/`jobs wait` for long work.
 
 6. Before upgrading an existing pool, use `ylcc update --latest` to resolve the newest published tag, or `ylcc update --version VERSION`; add `--apply` to execute the verified installer instead of printing it, and `--force` only after draining is complete or impossible to verify. Without `--version`, the current package version is used. The upgrade keeps saved Hub URL/token-file/results directory references, worker data, hub data, and service IDs unless you reinstall. Drain jobs and stop the hub service before replacing its binary, then verify with `ylcc --version`. For a Windows worker that must come back after a reboot without a login, install the service with `--at-startup` from an elevated shell. Upgrade background workers remotely with `ylcc workers update --all` (or named IDs, optional `--version vX.Y.Z`): it pauses each worker, waits for its jobs, swaps the verified release binary, waits for the reconnect and resumes it; container workers are skipped and need their image recreated. Workers free finished checkouts immediately and unused caches/environments after 7 days or under disk pressure, so a missing cache or environment is rebuilt, not an error.

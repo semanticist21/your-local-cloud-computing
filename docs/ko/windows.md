@@ -80,7 +80,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -V
 
 `-ExecutionPolicy Bypass`는 그 자식 프로세스에만 적용되며 사용자나 머신의 실행 정책을 바꾸지 않습니다. 조직의 그룹 정책은 여전히 실행을 제한할 수 있습니다. 설치 스크립트는 PATH를 바꾸지 않고 실행 파일과 라이선스만 배치합니다. 백그라운드 워커를 등록한 뒤에는 실행 파일을 설치된 위치에 그대로 두고, 업그레이드는 `ylcc workers update`로 하세요([백그라운드 서비스](services.md#워커-업데이트) 참고).
 
-기존 풀 토큰을 안전한 관리 채널로 `$env:APPDATA\ylcc\token`에 옮깁니다. ACL은 본인 사용자, SYSTEM, Administrators로 제한하세요. `ylcc init`은 **새** 풀을 설정할 때만 보호된 토큰을 만듭니다. 합류하는 워커에서 다른 토큰을 생성하지 마세요. 그다음 설정하고 시작합니다.
+기존 풀 토큰이나 `ylcc tokens create --role worker --worker-id windows-build`로 만든 워커 토큰([보안](security.md#토큰))을 안전한 관리 채널로 `$env:APPDATA\ylcc\token`에 옮깁니다. ACL은 본인 사용자, SYSTEM, Administrators로 제한하세요. `ylcc init`은 **새** 풀을 설정할 때만 보호된 토큰을 만듭니다. 합류하는 워커에서 다른 토큰을 생성하지 마세요. 그다음 설정하고 시작합니다.
 
 ```powershell
 $token = Join-Path $env:APPDATA 'ylcc\token'
@@ -104,6 +104,8 @@ Get-Content -LiteralPath (Join-Path $env:LOCALAPPDATA 'ylcc\service\worker.log')
 ```
 
 이것은 설치한 사용자로, 제한된 권한과 대화형 로그온 토큰으로 실행되는 작업 스케줄러 태스크입니다. 그 사용자가 로그온할 때 시작되며, 사용자가 계속 로그인되어 있어야 합니다. 세션이 잠겨 있는 것은 괜찮습니다. Windows SCM 서비스가 아니므로 로그인 전에는 시작되지 않습니다. 재부팅 후 아무도 로그인하지 않아도 잡을 받아야 하는 머신이라면 `--at-startup`을 붙여 관리자 권한 PowerShell에서 설치하세요. 그러면 태스크가 부팅 시 S4U 태스크로 시작하며, 같은 사용자의 일반 권한으로 실행되지만 네트워크 자격 증명은 없습니다(SMB 공유 등 Windows 인증이 필요한 리소스는 쓸 수 없고, 허브 연결에는 영향이 없습니다). 로컬 작업 스케줄러 정책이 등록을 거부할 수 있으며, 그 경우 명령이 오류를 보고합니다. 태스크는 설치한 셸의 PATH를 캡처합니다. SDK/도구 경로를 바꾼 뒤에는 다시 설치하고, `workers`로 서비스의 실제 기능을 확인하세요. 비공개 토큰/잡 데이터에는 NTFS처럼 ACL을 지원하는 로컬 디스크를 쓰세요. ACL 보호가 제대로 동작하지 않는 파일 시스템은 거부됩니다.
+
+[워커 명령 정책](security.md#워커-명령-정책)은 Windows에서도 argv를 정확히 비교합니다. `cargo` 규칙은 `cargo.exe`나 전체 경로로 실행하는 잡과 일치하지 않으므로, 잡이 명령을 쓰는 방식 그대로 규칙을 작성하세요. 워커는 정책 파일의 ACL을 검사하지 않습니다. 워커 사용자가 수정할 수 없는 Administrators 소유 위치에 두세요.
 
 지원 체크아웃에서 아무 요청자에서나 네이티브 [PowerShell 예제](../../examples/jobs/windows-check.ps1)를 제출합니다.
 

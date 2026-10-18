@@ -14,6 +14,8 @@ Start a new agent session. For Codex, skills are discovered from `~/.agents/skil
 
 Ask naturally: “Build this on a Linux x86_64 worker and bring back the binary,” or explicitly invoke `$ylcc`. The skill discovers workers, chooses requirements and selected inputs, submits asynchronously, checks logs/status and downloads declared results. It does not add an MCP server or run another agent on the worker.
 
+Give the agent a [requester token](security.md#roles), not the pool token. A `403` means the action needs an admin. Before submitting to a worker with a command policy, the skill checks `capabilities.policy` in `ylcc --json workers`; a "not allowed by worker policy" rejection is final, and the agent reports it instead of working around it.
+
 Try these natural prompts after installing the skill:
 - "Check the pool and workers, but don't run anything."
 - "Run this only on a powered Windows x86_64 worker."

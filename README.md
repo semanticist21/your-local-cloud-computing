@@ -43,7 +43,9 @@ flowchart LR
 
 YLCC is a pool for trusted people and trusted code: one person or a small team sharing their own machines, not multi-tenant CI.
 
-- **Who can run jobs?** Anyone holding the pool token. One shared token authorizes arbitrary workloads on every worker, so give it only to trusted operators.
+- **Who can run jobs?** Anyone holding an admin or requester token. The Hub's original pool token is the admin root; issue each machine its own [role token](docs/security.md#roles) (admin, requester or worker) so you can revoke one machine without touching the rest. Requesters still see every job, log and output, and can run arbitrary code on workers, so give them only to trusted operators.
+- **What is recorded?** Token, job, worker-control and environment changes go to an [audit log](docs/security.md#audit-log) that admins can read with `ylcc audit` or in the dashboard. Each job records who submitted it.
+- **Can a worker refuse work?** Optionally. A [command policy](docs/security.md#worker-command-policy) allowlists commands, images, environments and env keys. It limits which program starts, not what it does: build tools run code from their inputs. It is defence in depth, not a sandbox; use containers for isolation.
 - **What can a job touch?** Native jobs run with the worker service user's permissions; use a dedicated non-admin account on shared machines ([Services](docs/services.md)). A container runtime socket grants control over that runtime and its mounted host resources.
 - **How is traffic protected?** The Hub has no TLS of its own. Put it behind a private HTTPS endpoint such as Tailscale Serve, never a public one. Workers only connect outward; they open no inbound ports.
 - **Who limits resources?** The machine owner. Concurrency is a job count, not a CPU or memory cap.
@@ -75,7 +77,7 @@ ylcc init
 ylcc hub --listen 127.0.0.1:7443 --data-dir "$HOME/.local/share/ylcc/hub"
 ```
 
-The Hub serves its read-only dashboard at the same address. Open `http://127.0.0.1:7443/` on the Hub machine, or use the private HTTPS address from another device, then enter the pool token in the browser. The dashboard shows workers, jobs and environment readiness and refreshes every five seconds. Its token is kept only in that browser tab.
+The Hub serves its read-only dashboard at the same address. Open `http://127.0.0.1:7443/` on the Hub machine, or use the private HTTPS address from another device, then enter the pool token or a requester token in the browser. The dashboard shows workers, jobs and environment readiness and refreshes every five seconds. Its token is kept only in that browser tab. Admins also see the audit log and issued tokens.
 
 Do not send the pool token over plain HTTP on an untrusted network. For direct LAN access, bind the Hub to a reachable private interface and apply the host firewall's normal restrictions.
 
@@ -87,7 +89,7 @@ tailscale serve --bg --https=10000 http://127.0.0.1:7443
 
 Use the resulting private `https://HUB.example.ts.net:10000` address below. Keep any existing Serve configuration intact; do not enable Funnel. See [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve).
 
-All authorized requesters and workers need the same token file. Transfer it through your existing secure administration channel, keep it outside projects and images, and restrict it with `chmod 600`. The default is `~/.config/ylcc/token`.
+The pool token is the admin root of the pool. The quick start below shares it with every machine, which keeps working unchanged, but on anything beyond a personal pool issue each worker and requester its own token with `ylcc tokens create` ([Security](docs/security.md#tokens)). Transfer token files through your existing secure administration channel, keep them outside projects and images, and restrict them with `chmod 600`. The default is `~/.config/ylcc/token`.
 
 ### 2. Connect workers
 
@@ -137,6 +139,7 @@ Next, see [Running jobs](docs/jobs.md) for detached jobs, results and input rule
 - [Docker and Podman](docs/containers.md): container workers, sibling-container execution
 - [Reusable environments](docs/environments.md): image and native tool environments
 - [Use from an agent](docs/agents.md): the bundled agent skill
+- [Security](docs/security.md): role tokens, audit log, worker command policy
 - [GPU and platform checks](docs/gpu.md): CUDA, ROCm, Metal, cross-platform builds
 - [Diagnose and develop](docs/development.md): troubleshooting, tests, CI and releases
 

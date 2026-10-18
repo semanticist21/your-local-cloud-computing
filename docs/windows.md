@@ -80,7 +80,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -V
 
 `-ExecutionPolicy Bypass` applies only to that child process; it does not change your user or machine execution policy. Organization Group Policy can still restrict execution. The installer places the executable and licenses without changing PATH. Keep the executable at its installed location after registering a background worker; upgrade it with `ylcc workers update` (see [Background services](services.md#updating-workers)).
 
-Transfer your existing pool token through your secure administration channel to `$env:APPDATA\ylcc\token`. Restrict its ACL to your user, SYSTEM and Administrators; `ylcc init` creates a protected token only when setting up a **new** pool. Do not generate a different token on a joining worker. Then configure and start:
+Transfer your existing pool token, or a worker token created with `ylcc tokens create --role worker --worker-id windows-build` ([Security](security.md#tokens)), through your secure administration channel to `$env:APPDATA\ylcc\token`. Restrict its ACL to your user, SYSTEM and Administrators; `ylcc init` creates a protected token only when setting up a **new** pool. Do not generate a different token on a joining worker. Then configure and start:
 
 ```powershell
 $token = Join-Path $env:APPDATA 'ylcc\token'
@@ -104,6 +104,8 @@ Get-Content -LiteralPath (Join-Path $env:LOCALAPPDATA 'ylcc\service\worker.log')
 ```
 
 This is a Task Scheduler task running as the installing user with limited privileges and an interactive logon token. It starts at that user's logon and requires the user to stay logged in; a locked session is fine. It is not a Windows SCM service and does not start before login. For a machine that must serve jobs after a reboot without anyone logging in, add `--at-startup` and run the install from an elevated PowerShell: the task then starts at boot as an S4U task, still unelevated as the same user, but without network credentials (SMB shares and other Windows-authenticated resources are unavailable; the Hub connection is unaffected). Local Task Scheduler policy can reject registration; the command reports the error. The task captures the installing shell's PATH. Reinstall it after changing SDK/tool paths, and check `workers` for the actual service capabilities. Use a local ACL-capable disk such as NTFS for private token/job data; filesystems without working ACL protection are rejected.
+
+A [worker command policy](security.md#worker-command-policy) matches argv exactly on Windows too: a rule for `cargo` does not match a job running `cargo.exe` or a full path, so write rules the way your jobs spell the command. The worker does not check the policy file's ACL; keep it in an Administrators-owned location the worker user cannot modify.
 
 From the support checkout, submit the native [PowerShell example](../examples/jobs/windows-check.ps1) from any requester:
 

@@ -25,6 +25,8 @@ sudo /absolute/path/to/ylcc --hub https://HUB.example.ts.net:10000 \
 
 Service installation captures the current executable location and native user's `PATH`; keep the binary there. System-user macOS installs set a user-specific `HOME` and a standard tool path. After changing tool paths, reinstall the service and verify capabilities under the service account.
 
+To restrict what a worker runs, add `--policy /absolute/path/policy.yaml` to `service install --role worker`. The file is validated at install time and the service runs with its absolute path. Keep it owned by root or an administrator and not writable by the service account; with macOS `--system-user`, that account must still be able to read it. See [worker command policy](security.md#worker-command-policy).
+
 Keep launchd stdout/stderr logs on the internal system volume, separate from external job data. macOS can reject opening log paths on removable volumes before starting the executable, producing `posix_spawn: Operation not permitted` or `EX_CONFIG` (78) without a worker log. Check the plist's `StandardOutPath`/`StandardErrorPath` and `launchctl print` when diagnosing this failure; readable external tokens and a valid working directory do not establish that launchd can open those log paths.
 
 An external Mac volume with “Ignore ownership” enabled (`noowners`) cannot enforce this account isolation. A plaintext sparsebundle on that volume does not fix it: other local accounts can read or modify the backing bands regardless of permissions inside the mounted image.

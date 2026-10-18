@@ -25,6 +25,8 @@ sudo /absolute/path/to/ylcc --hub https://HUB.example.ts.net:10000 \
 
 서비스 설치는 현재 실행 파일 위치와 네이티브 사용자의 `PATH`를 캡처하므로, 바이너리를 그 위치에 두세요. macOS 시스템 사용자 설치는 사용자별 `HOME`과 표준 도구 경로를 설정합니다. 도구 경로를 바꾼 뒤에는 서비스를 다시 설치하고, 서비스 계정에서 기능을 확인하세요.
 
+워커가 실행할 작업을 제한하려면 `service install --role worker`에 `--policy /absolute/path/policy.yaml`을 추가하세요. 파일은 설치할 때 검증되고, 서비스는 그 절대 경로로 실행됩니다. 파일은 root나 관리자 소유로 두고 서비스 계정이 쓸 수 없게 하세요. macOS `--system-user`를 쓰는 경우 그 계정이 파일을 읽을 수는 있어야 합니다. [워커 명령 정책](security.md#워커-명령-정책)을 참고하세요.
+
 launchd stdout/stderr 로그는 외부 잡 데이터와 분리해 내부 시스템 볼륨에 두세요. macOS는 실행 파일을 시작하기 전에 이동식 볼륨의 로그 경로 열기를 거부할 수 있으며, 이 경우 워커 로그 없이 `posix_spawn: Operation not permitted`나 `EX_CONFIG`(78)가 납니다. 이 실패를 진단할 때는 plist의 `StandardOutPath`/`StandardErrorPath`와 `launchctl print`를 확인하세요. 외부 토큰을 읽을 수 있고 작업 디렉터리가 유효하다고 해서 launchd가 그 로그 경로를 열 수 있다는 뜻은 아닙니다.
 
 “소유권 무시”(`noowners`)가 켜진 외부 Mac 볼륨은 이 계정 격리를 강제할 수 없습니다. 그 볼륨 위의 평문 sparsebundle로도 해결되지 않습니다. 마운트된 이미지 내부의 권한과 관계없이 다른 로컬 계정이 백킹 밴드를 읽거나 수정할 수 있기 때문입니다.

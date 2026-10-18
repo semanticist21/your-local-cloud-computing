@@ -781,6 +781,11 @@ impl Store {
                         .context("invalid environment log ID")?;
                     identifier(id)?;
                     identifier(revision)?;
+                    // Workers replay preparation logs on every reconnect; rejecting a deleted
+                    // environment's log would drop the connection and loop forever.
+                    if self.environment(id)?.is_none() {
+                        return Ok(());
+                    }
                     let environment = self
                         .environment_revision(id, revision)?
                         .context("unknown environment log revision")?;
@@ -1663,6 +1668,17 @@ mod tests {
                 error: None,
             };
             assert!(store.receive_status("one", stale).is_err());
+            let session = store.sessions["one"].id;
+            let replayed = LogEntry {
+                job_id: "environment:native:v1".into(),
+                attempt_id: "environment:one:native:v1".into(),
+                seq: 1,
+                stream: "system".into(),
+                text: "replayed".into(),
+            };
+            assert!(store
+                .receive("one", session, WorkerMessage::Log { entry: replayed })
+                .is_ok());
             assert!(store.statuses().unwrap().is_empty());
         }
         // A deleted id can be registered again.

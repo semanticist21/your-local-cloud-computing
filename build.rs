@@ -9,8 +9,8 @@ fn main() {
     println!("cargo:rustc-env=YLCC_VERSION={}", version());
 }
 
-/// Release builds (`YLCC_RELEASE=1`) report the package version; any other build from a Git
-/// checkout adds the commit, so an unreleased binary never claims a published version.
+/// Release builds (`YLCC_RELEASE=1`) report the package version; any other build adds the
+/// commit, or `+source` without Git, so an unreleased binary never claims a published version.
 fn version() -> String {
     let package = std::env::var("CARGO_PKG_VERSION").unwrap();
     println!("cargo:rerun-if-env-changed=YLCC_RELEASE");
@@ -38,6 +38,6 @@ fn version() -> String {
             let dirty = git(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty());
             format!("{package}+g{commit}{}", if dirty { ".dirty" } else { "" })
         }
-        _ => package,
+        _ => format!("{package}+source"),
     }
 }

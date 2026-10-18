@@ -43,8 +43,8 @@ x86_64/arm64용 Linux/macOS 버전 바이너리를 내려받습니다. 설치 �
 
 ```bash
 task_tmp="$(mktemp -d)"
-curl -fL https://raw.githubusercontent.com/semanticist21/your-local-cloud-computing/v0.4.8/scripts/install.sh -o "$task_tmp/install.sh"
-bash "$task_tmp/install.sh" --version v0.4.8
+curl -fL https://raw.githubusercontent.com/semanticist21/your-local-cloud-computing/v0.4.9/scripts/install.sh -o "$task_tmp/install.sh"
+bash "$task_tmp/install.sh" --version v0.4.9
 rm "$task_tmp/install.sh"
 rmdir "$task_tmp"
 export PATH="$HOME/.local/bin:$PATH"

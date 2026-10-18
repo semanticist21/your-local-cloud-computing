@@ -53,6 +53,9 @@ enum Commands {
         /// Command policy YAML; without it the worker runs every job it is assigned.
         #[arg(long)]
         policy: Option<PathBuf>,
+        /// Do not report CPU, memory, load and disk usage to the Hub.
+        #[arg(long)]
+        no_metrics: bool,
     },
     /// Show the input snapshot manifest without submitting a job.
     Manifest(Selection),
@@ -1079,6 +1082,7 @@ async fn execute() -> Result<()> {
             data_dir,
             max_jobs,
             policy,
+            no_metrics,
         } => {
             let id = id.unwrap_or_else(default_worker_id);
             let policy = policy.map(|path| Policy::load(&path)).transpose()?;
@@ -1089,6 +1093,7 @@ async fn execute() -> Result<()> {
                 id,
                 max_jobs,
                 policy,
+                !no_metrics,
             )
             .await
         }

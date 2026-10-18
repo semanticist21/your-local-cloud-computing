@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useState, type FormEvent, type ReactNode } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Link,
@@ -34,6 +34,9 @@ import {
   X,
 } from 'lucide-react'
 import { Badge, Button } from './components/ui'
+
+// Recharts loads only when a worker page is opened.
+const WorkerMetricsCharts = lazy(() => import('./components/WorkerMetrics'))
 import {
   AuthError,
   auditQuery,
@@ -453,6 +456,10 @@ function WorkerPage() {
           <Detail label="Command policy">{caps.policy ? <PolicyBadge policy={caps.policy} /> : <span className="muted-text">None (runs any job)</span>}</Detail>
         </dl>
       </section>
+
+      <Suspense fallback={<LoadingState compact />}>
+        <WorkerMetricsCharts workerId={worker.id} os={caps.os} />
+      </Suspense>
 
       {caps.policy && <PolicySection policy={caps.policy} />}
 

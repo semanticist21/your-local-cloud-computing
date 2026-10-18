@@ -131,6 +131,8 @@ fn image_ref(image: &str) -> Result<()> {
 fn terminal(state: &str) -> bool {
     matches!(state, "succeeded" | "failed" | "cancelled")
 }
+/// Worker resource samples older than this are deleted as new ones arrive.
+const METRICS_RETENTION: u64 = 7 * 24 * 60 * 60;
 fn active(state: &str) -> bool {
     matches!(state, "assigned" | "running" | "cancelling" | "unknown")
 }
@@ -170,7 +172,8 @@ impl Store {
             CREATE TABLE IF NOT EXISTS environment_status (worker TEXT NOT NULL, environment TEXT NOT NULL, revision TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(worker, environment, revision));
             CREATE TABLE IF NOT EXISTS logs (job TEXT NOT NULL, attempt TEXT NOT NULL, seq INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(job, attempt, seq));
             CREATE TABLE IF NOT EXISTS tokens (id TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE, data TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS audit (seq INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL);")?;
+            CREATE TABLE IF NOT EXISTS audit (seq INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS metrics (worker TEXT NOT NULL, at INTEGER NOT NULL, cpu REAL NOT NULL, memory_used INTEGER NOT NULL, memory_total INTEGER NOT NULL, load REAL NOT NULL, disk REAL NOT NULL, PRIMARY KEY(worker, at)) WITHOUT ROWID;")?;
         let mut store = Self {
             db,
             blobs: data.join("blobs"),
@@ -276,7 +279,28 @@ impl Store {
     fn delete_worker(&mut self, id: &str) -> Result<()> {
         self.db.execute("DELETE FROM worker_settings WHERE id=?1", [id])?;
         self.db.execute("DELETE FROM workers WHERE id=?1", [id])?;
+        self.db.execute("DELETE FROM metrics WHERE worker=?1", [id])?;
         Ok(())
+    }
+    /// Averages samples from the last `range` seconds into at most about 300 points.
+    fn metrics(&self, worker: &str, range: u64) -> Result<Vec<WorkerMetrics>> {
+        let range = range.clamp(60, METRICS_RETENTION);
+        let step = (range / 300).max(15) as i64;
+        let mut statement = self.db.prepare(
+            "SELECT at/?3*?3, avg(cpu), avg(memory_used), max(memory_total), avg(load), avg(disk)
+             FROM metrics WHERE worker=?1 AND at>=?2 GROUP BY at/?3 ORDER BY 1",
+        )?;
+        let rows = statement.query_map(params![worker, (now() - range) as i64, step], |r| {
+            Ok(WorkerMetrics {
+                at: r.get::<_, i64>(0)? as u64,
+                cpu_percent: r.get(1)?,
+                memory_used: r.get::<_, f64>(2)? as u64,
+                memory_total: r.get::<_, i64>(3)? as u64,
+                load: r.get(4)?,
+                disk_percent: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
     /// Removes an environment with its revisions, worker statuses and preparation logs.
     /// Deleting a missing id succeeds so retries are idempotent; jobs that still use it block deletion.
@@ -1146,6 +1170,17 @@ impl Store {
             WorkerMessage::Finished { report } => self.report(worker, report)?,
             WorkerMessage::Environment { status } => self.receive_status(worker, status)?,
             WorkerMessage::Heartbeat => {}
+            WorkerMessage::Metrics { metrics: m } => {
+                let at = now() as i64;
+                self.db.execute(
+                    "INSERT OR REPLACE INTO metrics VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![worker, at, m.cpu_percent, m.memory_used as i64, m.memory_total as i64, m.load, m.disk_percent],
+                )?;
+                self.db.execute(
+                    "DELETE FROM metrics WHERE worker=?1 AND at<?2",
+                    params![worker, at - METRICS_RETENTION as i64],
+                )?;
+            }
             WorkerMessage::UpdateFailed { error } => {
                 if let Some(mut info) = self.one::<WorkerInfo>("SELECT data FROM workers WHERE id=?1", worker)? {
                     info.update_error = Some(error);
@@ -1319,6 +1354,7 @@ fn router(state: Shared) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), admin_only));
     let requester = Router::new()
         .route("/v1/workers", get(workers))
+        .route("/v1/workers/{id}/metrics", get(worker_metrics))
         .route("/v1/blobs/missing", post(missing_blobs))
         .route("/v1/jobs", post(submit).get(jobs))
         .route("/v1/jobs/{id}", get(job))
@@ -1350,7 +1386,7 @@ fn router(state: Shared) -> Router {
                 Json(serde_json::json!({
                     "status":"ok",
                     "version":crate::VERSION,
-                    "capabilities":["job_priority", "worker_control", "scoped_tokens", "audit_log", "command_policy", "job_worker"]
+                    "capabilities":["job_priority", "worker_control", "scoped_tokens", "audit_log", "command_policy", "job_worker", "worker_metrics"]
                 }))
             }),
         )
@@ -1493,6 +1529,21 @@ async fn audit(
 }
 async fn workers(State(state): State<Shared>) -> ApiResult<Json<Vec<WorkerInfo>>> {
     Ok(Json(lock(&state)?.workers()?))
+}
+#[derive(Deserialize)]
+struct MetricsQuery {
+    #[serde(default = "default_metrics_range")]
+    range: u64,
+}
+fn default_metrics_range() -> u64 {
+    3600
+}
+async fn worker_metrics(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    Query(query): Query<MetricsQuery>,
+) -> ApiResult<Json<Vec<WorkerMetrics>>> {
+    Ok(Json(lock(&state)?.metrics(&id, query.range)?))
 }
 async fn delete_worker(
     State(state): State<Shared>,
@@ -2752,6 +2803,31 @@ mod tests {
         job.requirements.tools.clear();
         job.requirements.gpu = Some("metal".into());
         assert!(!candidate(&worker, &job, None).is_empty());
+    }
+    #[test]
+    fn worker_metrics_are_stored_bucketed_and_pruned() {
+        let (_dir, mut store) = test_store();
+        let (session, _rx) = worker(&mut store, "one");
+        let old = (now() - METRICS_RETENTION - 60) as i64;
+        store
+            .db
+            .execute("INSERT INTO metrics VALUES('one',?1,1,1,1,1,1)", [old])
+            .unwrap();
+        let metrics = WorkerMetrics { cpu_percent: 40.0, memory_used: 2, memory_total: 8, ..Default::default() };
+        store.receive("one", session, WorkerMessage::Metrics { metrics }).unwrap();
+        let total: i64 = store.db.query_row("SELECT count(*) FROM metrics", [], |r| r.get(0)).unwrap();
+        assert_eq!(total, 1, "samples older than the retention are deleted");
+        // Two samples inside one 15 s bucket average into one point.
+        let bucket = (now() as i64 - 600) / 15 * 15;
+        for (offset, cpu) in [(1, 10.0), (2, 30.0)] {
+            store.db.execute("INSERT INTO metrics VALUES('one',?1,?2,2,8,0,0)", params![bucket + offset, cpu]).unwrap();
+        }
+        let samples = store.metrics("one", 3600).unwrap();
+        assert_eq!(samples.len(), 2);
+        assert_eq!((samples[0].at as i64, samples[0].cpu_percent), (bucket, 20.0));
+        assert_eq!((samples[1].cpu_percent, samples[1].memory_total), (40.0, 8));
+        store.delete_worker("one").unwrap();
+        assert!(store.metrics("one", 3600).unwrap().is_empty());
     }
     #[test]
     fn worker_requirement_selects_only_that_worker() {

@@ -199,6 +199,24 @@ export const jobLogsQuery = (jobId: string, active: boolean) =>
     placeholderData: keepPreviousData,
   })
 
+export type WorkerMetrics = {
+  at: number
+  cpu_percent: number
+  memory_used: number
+  memory_total: number
+  load: number
+  disk_percent: number
+}
+
+/** Averaged samples for the last `range` seconds; workers report every 15 s. */
+export const workerMetricsQuery = (workerId: string, range: number) =>
+  queryOptions({
+    queryKey: ['worker-metrics', workerId, range],
+    queryFn: () => get<WorkerMetrics[]>(`/v1/workers/${encodeURIComponent(workerId)}/metrics?range=${range}`),
+    refetchInterval: 15000,
+    placeholderData: keepPreviousData,
+  })
+
 export const errorMessage = (error: unknown) => (error instanceof Error ? error.message : 'Could not reach the Hub.')
 
 const toMs = (timestamp: number) => (timestamp < 1_000_000_000_000 ? timestamp * 1000 : timestamp)

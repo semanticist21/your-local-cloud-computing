@@ -64,6 +64,8 @@ struct State {
     events: broadcast::Sender<WorkerMessage>,
     /// The operator's allowlist from `--policy`; `None` runs everything the Hub assigns.
     policy: Option<Policy>,
+    /// Report host resource samples to Hubs that accept them (off with `--no-metrics`).
+    metrics: bool,
 }
 
 #[derive(Debug)]
@@ -226,6 +228,7 @@ pub async fn run(
     id: String,
     max_jobs: usize,
     policy: Option<Policy>,
+    metrics: bool,
 ) -> Result<()> {
     identifier(&id)?;
     ensure!(max_jobs > 0, "max-jobs must be positive");
@@ -284,6 +287,7 @@ pub async fn run(
         workspaces: Mutex::new(HashSet::new()),
         events,
         policy,
+        metrics,
     });
     load_state(&state).await?;
     if let Ok(exe) = std::env::current_exe() {
@@ -561,7 +565,14 @@ async fn connection(state: Arc<State>) -> Result<()> {
             }
         }
     }
+    // Older Hubs reject unknown messages and drop the connection, so ask before sending samples.
+    let mut system = (state.metrics && hub_accepts_metrics(&state).await).then(|| {
+        let mut system = sysinfo::System::new();
+        system.refresh_cpu_usage(); // CPU usage is the difference between two refreshes.
+        system
+    });
     let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+    heartbeat.tick().await; // The first tick is immediate; the CPU baseline needs time to accumulate.
     loop {
         tokio::select! {
             value = source.next() => match value {
@@ -603,8 +614,39 @@ async fn connection(state: Arc<State>) -> Result<()> {
                 Err(broadcast::error::RecvError::Lagged(_)) => bail!("event stream lagged; reconnect to replay durable logs"),
                 Err(_) => return Ok(()),
             },
-            _ = heartbeat.tick() => sink.send(Message::Text(serde_json::to_string(&WorkerMessage::Heartbeat)?.into())).await?,
+            _ = heartbeat.tick() => {
+                let message = match system.as_mut() {
+                    Some(system) => WorkerMessage::Metrics { metrics: sample(system, &state.data) },
+                    None => WorkerMessage::Heartbeat,
+                };
+                sink.send(Message::Text(serde_json::to_string(&message)?.into())).await?
+            }
         }
+    }
+}
+
+async fn hub_accepts_metrics(state: &State) -> bool {
+    let health = async {
+        let response = state.client.get(format!("{}/health", state.hub)).send().await?;
+        response.error_for_status()?.json::<serde_json::Value>().await
+    };
+    health.await.is_ok_and(|health| {
+        health["capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| capabilities.iter().any(|c| c == "worker_metrics"))
+    })
+}
+
+fn sample(system: &mut sysinfo::System, data: &Path) -> WorkerMetrics {
+    system.refresh_cpu_usage();
+    system.refresh_memory();
+    WorkerMetrics {
+        at: 0,
+        cpu_percent: system.global_cpu_usage().into(),
+        memory_used: system.used_memory(),
+        memory_total: system.total_memory(),
+        load: sysinfo::System::load_average().one,
+        disk_percent: crate::platform::disk_usage(data).map_or(0.0, |used| used * 100.0),
     }
 }
 
@@ -3022,6 +3064,7 @@ mod tests {
             workspaces: Mutex::new(HashSet::new()),
             events,
             policy: None,
+        metrics: false,
         })
     }
     #[test]

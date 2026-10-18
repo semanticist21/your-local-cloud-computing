@@ -321,6 +321,19 @@ pub struct AttemptReport {
     #[serde(default)]
     pub results: Vec<FileEntry>,
 }
+/// One host resource sample; `at` is set by the Hub on receipt.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkerMetrics {
+    #[serde(default)]
+    pub at: u64,
+    pub cpu_percent: f64,
+    pub memory_used: u64,
+    pub memory_total: u64,
+    /// One-minute load average; 0 where the OS has none (Windows).
+    pub load: f64,
+    /// Used fraction of the worker data directory's filesystem, 0 to 100.
+    pub disk_percent: f64,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkerMessage {
@@ -347,6 +360,10 @@ pub enum WorkerMessage {
         status: EnvironmentStatus,
     },
     Heartbeat,
+    /// Sent instead of a heartbeat when the Hub advertises `worker_metrics`.
+    Metrics {
+        metrics: WorkerMetrics,
+    },
     /// A requested self-update did not replace the binary; the worker keeps running.
     UpdateFailed {
         error: String,

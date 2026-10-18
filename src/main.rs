@@ -124,6 +124,35 @@ enum Commands {
         #[command(subcommand)]
         command: Services,
     },
+    /// Issue, list or revoke per-machine Hub tokens (requires an admin token).
+    Tokens {
+        #[command(subcommand)]
+        command: Tokens,
+    },
+    /// Show recent Hub audit events, newest first (requires an admin token).
+    Audit {
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+}
+#[derive(Subcommand)]
+enum Tokens {
+    /// Create a token and write its secret to a new owner-only file; the secret is never printed.
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long, value_enum)]
+        role: Role,
+        /// Worker id a worker token may connect as (required for --role worker).
+        #[arg(long)]
+        worker_id: Option<String>,
+        /// New file for the secret; an existing file is never replaced.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    List,
+    /// Revoke a token by id; workers connected with it are disconnected.
+    Revoke { id: String },
 }
 #[derive(Args)]
 struct Selection {
@@ -619,6 +648,17 @@ fn pairs(values: Vec<String>) -> Result<BTreeMap<String, String>> {
         })
         .collect()
 }
+/// Fails with an upgrade hint when the Hub does not advertise `capability` in /health.
+async fn require_capability(client: &Client, capability: &str, feature: &str) -> Result<()> {
+    let health: serde_json::Value = client.get("/health").await?;
+    if !health["capabilities"]
+        .as_array()
+        .is_some_and(|capabilities| capabilities.iter().any(|c| c == capability))
+    {
+        bail!("this Hub does not support {feature}; upgrade the Hub first")
+    }
+    Ok(())
+}
 fn print<T: Serialize>(v: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
@@ -820,6 +860,57 @@ async fn execute() -> Result<()> {
                 uuid::Uuid::new_v4().simple()
             )?;
             print(&serde_json::json!({"token_file":token}))
+        }
+        Commands::Tokens { command } => {
+            let client = Client::new(&hub, &token)?;
+            require_capability(&client, "scoped_tokens", "scoped tokens").await?;
+            match command {
+                Tokens::Create {
+                    name,
+                    role,
+                    worker_id,
+                    out,
+                } => {
+                    if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+                        fs::create_dir_all(parent)?;
+                    }
+                    // Claim the file first so a created token always has somewhere to live.
+                    let mut file = platform::create_private_file(&out).with_context(|| {
+                        format!("{} exists or cannot be created; token files are never replaced", out.display())
+                    })?;
+                    let request = TokenRequest {
+                        name,
+                        role,
+                        worker_id,
+                    };
+                    let created = match client.post::<_, CreatedToken>("/v1/tokens", &request).await {
+                        Ok(created) => created,
+                        Err(error) => {
+                            drop(file);
+                            let _ = fs::remove_file(&out);
+                            return Err(error);
+                        }
+                    };
+                    writeln!(file, "{}", created.secret)?;
+                    file.sync_all()?;
+                    print(&serde_json::json!({"token": created.token, "token_file": absolute_path(&out)?}))
+                }
+                Tokens::List => print(&client.get::<Vec<TokenInfo>>("/v1/tokens").await?),
+                Tokens::Revoke { id } => {
+                    ylcc::client::segment(&id)?;
+                    let revoked: TokenInfo = client.delete_json(&format!("/v1/tokens/{id}")).await?;
+                    print(&serde_json::json!({"revoked": revoked}))
+                }
+            }
+        }
+        Commands::Audit { limit } => {
+            let client = Client::new(&hub, &token)?;
+            require_capability(&client, "audit_log", "the audit log").await?;
+            print(
+                &client
+                    .get::<Vec<AuditEvent>>(&format!("/v1/audit?limit={}", limit.clamp(1, 1000)))
+                    .await?,
+            )
         }
         Commands::Configure => {
             ylcc::client::validate_hub(&hub)?;
@@ -1399,6 +1490,26 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
+    #[test]
+    fn token_and_audit_commands_parse() {
+        let cli = Cli::try_parse_from([
+            "ylcc", "tokens", "create", "--name", "builder", "--role", "worker", "--worker-id",
+            "builder", "--out", "builder.token",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Tokens { command: Tokens::Create { role: Role::Worker, worker_id: Some(_), .. } }
+        ));
+        assert!(Cli::try_parse_from(["ylcc", "tokens", "create", "--name", "x", "--role", "root", "--out", "f"]).is_err());
+        assert!(Cli::try_parse_from(["ylcc", "tokens", "create", "--name", "x", "--role", "requester"]).is_err());
+        assert!(Cli::try_parse_from(["ylcc", "tokens", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["ylcc", "tokens", "revoke", "t123"]).is_ok());
+        assert!(matches!(
+            Cli::try_parse_from(["ylcc", "audit", "--limit", "5"]).unwrap().command,
+            Commands::Audit { limit: 5 }
+        ));
+    }
     #[test]
     fn existing_commands_and_negative_priorities_parse() {
         let cli = Cli::try_parse_from(["ylcc", "workers"]).unwrap();

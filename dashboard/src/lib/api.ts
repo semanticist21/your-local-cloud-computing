@@ -48,6 +48,7 @@ export type Job = {
   exit_code?: number | null
   error?: string | null
   results?: FileEntry[]
+  submitted_by?: string | null
 }
 
 export type LogEntry = { job_id: string; attempt_id: string; seq: number; stream: string; text: string }
@@ -64,6 +65,32 @@ export type EnvironmentStatus = {
   revision: string
   state: string
   error?: string | null
+}
+
+export type Role = 'admin' | 'requester' | 'worker'
+
+export type Principal = { name: string; role: Role; token_id?: string; worker_id?: string }
+
+export type TokenInfo = {
+  id: string
+  name: string
+  role: Role
+  worker_id?: string
+  created_at: number
+  created_by: string
+  last_used_at?: number
+  revoked_at?: number
+}
+
+export type AuditEvent = {
+  seq: number
+  at: number
+  actor: string
+  actor_token_id?: string
+  role: Role
+  action: string
+  target: string
+  detail?: string
 }
 
 export type Snapshot = {
@@ -93,6 +120,9 @@ export class AuthError extends Error {
   }
 }
 
+/** A valid token whose role cannot read this endpoint; the session stays connected. */
+export class ForbiddenError extends Error {}
+
 async function get<T>(path: string): Promise<T> {
   const response = await fetch(path, {
     headers: { Authorization: `Bearer ${readToken()}` },
@@ -100,6 +130,10 @@ async function get<T>(path: string): Promise<T> {
   })
   if (!response.ok) {
     if (response.status === 401) throw new AuthError()
+    if (response.status === 403) {
+      const body = (await response.json().catch(() => null)) as { error?: string } | null
+      throw new ForbiddenError(body?.error ?? 'This token cannot view this page.')
+    }
     const message = await response.text()
     throw new Error(message || `Hub returned ${response.status}`)
   }
@@ -120,6 +154,29 @@ export const snapshotQuery = queryOptions({
     return { workers, jobs, environments, environmentStatuses }
   },
   refetchInterval: pollMs,
+  placeholderData: keepPreviousData,
+})
+
+export const whoamiQuery = queryOptions({
+  queryKey: ['whoami'],
+  queryFn: () => get<Principal>('/v1/whoami'),
+  staleTime: Infinity,
+  retry: (count, error) => !(error instanceof AuthError) && count < 2,
+})
+
+export const auditQuery = queryOptions({
+  queryKey: ['audit'],
+  queryFn: () => get<AuditEvent[]>('/v1/audit?limit=500'),
+  retry: (count, error) => !(error instanceof ForbiddenError) && count < 3,
+  refetchInterval: (query) => (query.state.error instanceof ForbiddenError ? false : pollMs),
+  placeholderData: keepPreviousData,
+})
+
+export const tokensQuery = queryOptions({
+  queryKey: ['tokens'],
+  queryFn: () => get<TokenInfo[]>('/v1/tokens'),
+  retry: (count, error) => !(error instanceof ForbiddenError) && count < 3,
+  refetchInterval: (query) => (query.state.error instanceof ForbiddenError ? false : pollMs),
   placeholderData: keepPreviousData,
 })
 

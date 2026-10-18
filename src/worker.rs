@@ -289,9 +289,24 @@ pub async fn run(
     }
     let mut retry = 1;
     loop {
+        let started = tokio::time::Instant::now();
         match connection(state.clone()).await {
-            Ok(()) => retry = 1,
-            Err(error) => eprintln!("worker connection: {error:#}; reconnecting in {retry}s"),
+            // A Hub that refuses the hello closes at once; only a lasting session resets backoff.
+            Ok(()) if started.elapsed() > Duration::from_secs(60) => retry = 1,
+            Ok(()) => eprintln!(
+                "worker connection closed by the Hub; if this repeats, check the Hub log (a worker token is bound to one --id and stops working once revoked); reconnecting in {retry}s"
+            ),
+            Err(error) => {
+                let status = error.downcast_ref::<tokio_tungstenite::tungstenite::Error>().and_then(|error| match error {
+                    tokio_tungstenite::tungstenite::Error::Http(response) => Some(response.status()),
+                    _ => None,
+                });
+                match status.map(|status| status.as_u16()) {
+                    Some(401) => eprintln!("worker connection: the Hub rejected the token (401); it is wrong or revoked; reconnecting in {retry}s"),
+                    Some(403) => eprintln!("worker connection: this token's role cannot connect workers (403); use a worker or admin token; reconnecting in {retry}s"),
+                    _ => eprintln!("worker connection: {error:#}; reconnecting in {retry}s"),
+                }
+            }
         }
         tokio::time::sleep(Duration::from_secs(retry)).await;
         retry = (retry * 2).min(30);
@@ -3094,6 +3109,7 @@ mod tests {
             exit_code: None,
             error: None,
             results: vec![],
+            submitted_by: None,
         };
         accept(state.clone(), job, None).unwrap();
         assert!(!attempt.dir.join("work").exists());
@@ -3148,6 +3164,7 @@ mod tests {
             exit_code: None,
             error: None,
             results: vec![],
+            submitted_by: None,
         };
         let (cancel, receiver) = watch::channel(false);
         let (exit, _) = run_attempt(&state, &attempt, &job, None, receiver)
@@ -3601,6 +3618,7 @@ mod tests {
             exit_code: None,
             error: None,
             results: vec![],
+            submitted_by: None,
         };
         let (_keepalive, receiver) = watch::channel(false);
         let error = run_attempt(&state, &attempt, &job, Some(&environment), receiver)
@@ -3662,6 +3680,7 @@ mod tests {
             exit_code: None,
             error: None,
             results: vec![],
+            submitted_by: None,
         };
         let (_keepalive, receiver) = watch::channel(false);
         let (exit, _) = tokio::time::timeout(

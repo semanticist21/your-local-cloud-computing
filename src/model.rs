@@ -233,6 +233,9 @@ pub struct Job {
     pub error: Option<String>,
     #[serde(default)]
     pub results: Vec<FileEntry>,
+    /// Name of the token that submitted the job, recorded by the Hub; absent for older jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_by: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerInfo {
@@ -372,6 +375,75 @@ pub struct MissingBlobs {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PrepareRequest {
     pub worker_id: Option<String>,
+}
+/// What a Hub token may do: admins manage the pool, requesters run work, workers serve one id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Admin,
+    Requester,
+    Worker,
+}
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Role::Admin => "admin",
+            Role::Requester => "requester",
+            Role::Worker => "worker",
+        })
+    }
+}
+/// A scoped Hub token as the API shows it; the secret and its hash never leave the Hub.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenInfo {
+    pub id: String,
+    pub name: String,
+    pub role: Role,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    pub created_at: u64,
+    #[serde(default)]
+    pub created_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<u64>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenRequest {
+    pub name: String,
+    pub role: Role,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatedToken {
+    pub token: TokenInfo,
+    pub secret: String,
+}
+/// The identity a request authenticated as; `token_id` is absent for the pool token.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Principal {
+    pub name: String,
+    pub role: Role,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub seq: i64,
+    pub at: u64,
+    pub actor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_token_id: Option<String>,
+    pub role: Role,
+    pub action: String,
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 #[cfg(test)]
 mod tests {

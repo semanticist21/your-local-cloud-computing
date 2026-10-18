@@ -24,7 +24,9 @@ def main():
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
         hub_url = f"http://127.0.0.1:{port}"
-        prefix = [binary, "--hub", hub_url, "--token-file", str(token), "--results-dir", str(base / "results"), "--json"]
+        def using(token_file):
+            return [binary, "--hub", hub_url, "--token-file", str(token_file), "--results-dir", str(base / "results"), "--json"]
+        prefix = using(token)
         project = base / "project"
         project.mkdir()
         subprocess.run(["git", "init", "-q", str(project)], check=True)
@@ -38,15 +40,15 @@ def main():
         processes = []
         streams = []
 
-        def start(role, *args):
+        def start(role, *args, token_file=token):
             stream = (base / f"{role}-{len(streams)}.log").open("w+")
             streams.append(stream)
-            process = subprocess.Popen(prefix + [role, *args], stdout=stream, stderr=stream, start_new_session=os.name != "nt")
+            process = subprocess.Popen(using(token_file) + [role, *args], stdout=stream, stderr=stream, start_new_session=os.name != "nt")
             processes.append(process)
             return process
 
-        def cli(*args, ok=True, timeout=90):
-            result = subprocess.run(prefix + list(args), cwd=project, text=True, capture_output=True, timeout=timeout)
+        def cli(*args, ok=True, timeout=90, token_file=token):
+            result = subprocess.run(using(token_file) + list(args), cwd=project, text=True, capture_output=True, timeout=timeout)
             if ok and result.returncode:
                 raise AssertionError(f"{args}: {result.stderr}\n{result.stdout}")
             if not ok:
@@ -277,7 +279,41 @@ def main():
             assert state(parallel_a)["state"] == state(parallel_b)["state"] == "running"
             wait(parallel_a)
             wait(parallel_b)
-            print("PASS: native compile, snapshots, dedup, isolation, cancellation, reconnect, persistent environments, YAML task, priority, pause/resume, live concurrency")
+
+            # Scoped tokens: a requester runs work but cannot administer, a worker token serves only
+            # its own id, revocation takes effect at once, and the audit log records all of it.
+            laptop_token = base / "laptop.token"
+            created, _ = cli("tokens", "create", "--name", "laptop", "--role", "requester", "--out", str(laptop_token))
+            assert created["token"]["role"] == "requester" and "secret" not in created
+            assert laptop_token.read_text().strip() not in json.dumps(created)
+            second_token = base / "second.token"
+            cli("tokens", "create", "--name", "second", "--role", "worker", "--worker-id", "second-worker", "--out", str(second_token))
+            cli("tokens", "create", "--name", "dup", "--role", "requester", "--out", str(laptop_token), ok=False)
+            submitted, _ = cli("run", "--no-input", *common, "--", *noop, token_file=laptop_token)
+            assert submitted["state"] == "succeeded" and submitted["submitted_by"] == "laptop"
+            denied = cli("workers", "delete", "test-worker", ok=False, token_file=laptop_token)
+            assert "403" in denied.stderr, denied.stderr
+            cli("tokens", "list", ok=False, token_file=laptop_token)
+            second = start("worker", "--id", "second-worker", "--data-dir", str(base / "worker2"), token_file=second_token)
+            until(lambda: any(w["id"] == "second-worker" and w["online"] for w in cli("workers")[0]))
+            impostor = start("worker", "--id", "impostor", "--data-dir", str(base / "worker3"), token_file=second_token)
+            until(lambda: any(e["action"] == "worker.rejected" and e["target"] == "impostor" for e in cli("audit")[0]))
+            assert not any(w["id"] == "impostor" for w in cli("workers")[0])
+            stop(impostor)
+            tokens, _ = cli("tokens", "list")
+            ids = {t["name"]: t["id"] for t in tokens}
+            revoked, _ = cli("tokens", "revoke", ids["second"])
+            assert revoked["revoked"]["revoked_at"]
+            until(lambda: not next(w for w in cli("workers")[0] if w["id"] == "second-worker")["online"], timeout=15)
+            cli("tokens", "revoke", ids["laptop"])
+            gone = cli("jobs", "list", ok=False, token_file=laptop_token)
+            assert "401" in gone.stderr, gone.stderr
+            stop(second)
+            events, _ = cli("audit", "--limit", "500")
+            actions = {e["action"] for e in events}
+            assert {"token.create", "token.revoke", "job.submit", "job.priority", "worker.control", "worker.connect", "worker.rejected", "environment.upsert"} <= actions, actions
+            assert any(e["action"] == "job.submit" and e["actor"] == "laptop" and e["target"] == submitted["id"] for e in events)
+            print("PASS: native compile, snapshots, dedup, isolation, cancellation, reconnect, persistent environments, YAML task, priority, pause/resume, live concurrency, scoped tokens, audit")
         except BaseException:
             for stream in streams:
                 stream.flush()

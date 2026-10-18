@@ -3,8 +3,9 @@ use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
     body::Body,
+    Extension,
     extract::{
-        DefaultBodyLimit, Path, State, WebSocketUpgrade,
+        DefaultBodyLimit, Path, Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, StatusCode, header},
@@ -73,12 +74,27 @@ fn lock(state: &Shared) -> ApiResult<MutexGuard<'_, Store>> {
 struct Session {
     id: Uuid,
     tx: mpsc::UnboundedSender<HubMessage>,
+    /// The scoped token the worker authenticated with, so revoking it closes the session.
+    token: Option<String>,
 }
+/// Audit rows kept; older events are pruned so a busy pool cannot fill the disk.
+const AUDIT_RETENTION: i64 = 10_000;
+/// Worker-caused audit events (connect, rejected) allowed per token per hour.
+const WORKER_AUDIT_PER_HOUR: u32 = 20;
 struct Store {
     db: Connection,
     blobs: PathBuf,
     token: String,
     sessions: HashMap<String, Session>,
+    /// Active scoped tokens by SHA-256 of their secret.
+    tokens: HashMap<String, TokenInfo>,
+    /// When each token's `last_used_at` was last written, to bound writes from polling clients.
+    token_used: HashMap<String, u64>,
+    /// Hourly worker audit budget per actor: window start, events written, suppression noted.
+    worker_audit: HashMap<String, (u64, u32, bool)>,
+    /// Last audited connect signature per worker id, so steady reconnects are not re-logged.
+    connect_seen: HashMap<String, String>,
+    audit_inserts: u64,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct WorkerSettings {
@@ -121,6 +137,24 @@ fn active(state: &str) -> bool {
 fn encode<T: Serialize>(value: &T) -> Result<String> {
     Ok(serde_json::to_string(value)?)
 }
+fn token_hash(secret: &str) -> String {
+    hex::encode(Sha256::digest(secret.as_bytes()))
+}
+/// The token file the Hub was started with: full access, kept for existing single-token pools.
+fn pool_principal() -> Principal {
+    Principal {
+        name: "pool".into(),
+        role: Role::Admin,
+        token_id: None,
+        worker_id: None,
+    }
+}
+fn audit_key(principal: &Principal) -> String {
+    principal
+        .token_id
+        .clone()
+        .unwrap_or_else(|| format!("name:{}", principal.name))
+}
 
 impl Store {
     fn open(data: PathBuf, token: String) -> Result<Self> {
@@ -134,13 +168,33 @@ impl Store {
             CREATE TABLE IF NOT EXISTS environments (id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS environment_revisions (id TEXT NOT NULL, revision TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(id, revision));
             CREATE TABLE IF NOT EXISTS environment_status (worker TEXT NOT NULL, environment TEXT NOT NULL, revision TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(worker, environment, revision));
-            CREATE TABLE IF NOT EXISTS logs (job TEXT NOT NULL, attempt TEXT NOT NULL, seq INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(job, attempt, seq));")?;
+            CREATE TABLE IF NOT EXISTS logs (job TEXT NOT NULL, attempt TEXT NOT NULL, seq INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(job, attempt, seq));
+            CREATE TABLE IF NOT EXISTS tokens (id TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS audit (seq INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL);")?;
         let mut store = Self {
             db,
             blobs: data.join("blobs"),
             token,
             sessions: HashMap::new(),
+            tokens: HashMap::new(),
+            token_used: HashMap::new(),
+            worker_audit: HashMap::new(),
+            connect_seen: HashMap::new(),
+            audit_inserts: 0,
         };
+        {
+            let mut statement = store.db.prepare("SELECT hash, data FROM tokens")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (hash, data) = row?;
+                let info: TokenInfo = serde_json::from_str(&data)?;
+                if info.revoked_at.is_none() {
+                    store.tokens.insert(hash, info);
+                }
+            }
+        }
         for mut worker in store.workers()? {
             worker.online = false;
             let settings = store.worker_settings(&worker)?;
@@ -242,6 +296,217 @@ impl Store {
         Ok(())
     }
 
+    /// Maps a bearer secret to its identity; the pool token is compared in constant time and
+    /// scoped tokens are found by the SHA-256 of the secret, which reveals nothing by timing.
+    fn resolve(&mut self, bearer: &str) -> Option<Principal> {
+        if bearer.len() == self.token.len()
+            && bearer
+                .bytes()
+                .zip(self.token.bytes())
+                .fold(0u8, |acc, (left, right)| acc | left ^ right)
+                == 0
+        {
+            return Some(pool_principal());
+        }
+        let hash = token_hash(bearer);
+        let info = self.tokens.get_mut(&hash)?;
+        let principal = Principal {
+            name: info.name.clone(),
+            role: info.role,
+            token_id: Some(info.id.clone()),
+            worker_id: info.worker_id.clone(),
+        };
+        let time = now();
+        info.last_used_at = Some(time);
+        if self
+            .token_used
+            .get(&info.id)
+            .is_none_or(|written| time.saturating_sub(*written) >= 60)
+        {
+            self.token_used.insert(info.id.clone(), time);
+            if let Ok(data) = encode(&*info)
+                && let Err(error) = self.db.execute(
+                    "UPDATE tokens SET data=?2 WHERE id=?1",
+                    params![info.id, data],
+                )
+            {
+                eprintln!("hub: token last-used update failed: {error:#}");
+            }
+        }
+        Some(principal)
+    }
+    fn create_token(&mut self, request: TokenRequest, by: &Principal) -> ApiResult<CreatedToken> {
+        identifier(&request.name).map_err(invalid)?;
+        if request.name == "pool" {
+            return Err(invalid("token name pool is reserved for the Hub's token file"));
+        }
+        match (request.role, &request.worker_id) {
+            (Role::Worker, Some(worker)) => identifier(worker).map_err(invalid)?,
+            (Role::Worker, None) => return Err(invalid("worker tokens require worker_id")),
+            (_, Some(_)) => return Err(invalid("only worker tokens are bound to a worker_id")),
+            (_, None) => {}
+        }
+        if self.tokens.values().any(|token| token.name == request.name) {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "an active token already has this name; revoke it or choose another".into(),
+            ));
+        }
+        let secret = format!(
+            "ylcc_{}{}",
+            Uuid::new_v4().simple(),
+            Uuid::new_v4().simple()
+        );
+        let info = TokenInfo {
+            id: format!("t{}", &Uuid::new_v4().simple().to_string()[..12]),
+            name: request.name,
+            role: request.role,
+            worker_id: request.worker_id,
+            created_at: now(),
+            created_by: by.name.clone(),
+            last_used_at: None,
+            revoked_at: None,
+        };
+        let hash = token_hash(&secret);
+        self.db
+            .execute(
+                "INSERT INTO tokens(id,hash,data) VALUES(?1,?2,?3)",
+                params![info.id, hash, encode(&info)?],
+            )
+            .map_err(anyhow::Error::from)?;
+        self.tokens.insert(hash, info.clone());
+        self.audit(
+            by,
+            "token.create",
+            &info.id,
+            Some(format!(
+                "{} {}{}",
+                info.name,
+                info.role,
+                info.worker_id
+                    .as_deref()
+                    .map(|worker| format!(" worker={worker}"))
+                    .unwrap_or_default()
+            )),
+        )?;
+        Ok(CreatedToken { token: info, secret })
+    }
+    fn list_tokens(&self) -> Result<Vec<TokenInfo>> {
+        let mut tokens: Vec<TokenInfo> = self.rows("SELECT data FROM tokens ORDER BY rowid")?;
+        // In-memory use times are fresher than the throttled database copy.
+        for token in &mut tokens {
+            if let Some(active) = self.tokens.values().find(|active| active.id == token.id) {
+                token.last_used_at = active.last_used_at;
+            }
+        }
+        Ok(tokens)
+    }
+    /// Revokes a token and closes worker sessions opened with it; repeating it is harmless.
+    fn revoke_token(&mut self, id: &str, by: &Principal) -> ApiResult<TokenInfo> {
+        let mut info = self
+            .one::<TokenInfo>("SELECT data FROM tokens WHERE id=?1", id)?
+            .ok_or_else(|| missing("token"))?;
+        if info.revoked_at.is_some() {
+            return Ok(info);
+        }
+        info.revoked_at = Some(now());
+        self.db
+            .execute(
+                "UPDATE tokens SET data=?2 WHERE id=?1",
+                params![info.id, encode(&info)?],
+            )
+            .map_err(anyhow::Error::from)?;
+        self.tokens.retain(|_, token| token.id != id);
+        self.token_used.remove(id);
+        self.worker_audit.remove(id);
+        let sessions: Vec<(String, Uuid)> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.token.as_deref() == Some(id))
+            .map(|(worker, session)| (worker.clone(), session.id))
+            .collect();
+        for (worker, session) in sessions {
+            self.disconnect(&worker, session)?;
+        }
+        self.audit(by, "token.revoke", &info.id, Some(info.name.clone()))?;
+        Ok(info)
+    }
+    fn audit(
+        &mut self,
+        principal: &Principal,
+        action: &str,
+        target: &str,
+        detail: Option<String>,
+    ) -> Result<()> {
+        let event = AuditEvent {
+            seq: 0,
+            at: now(),
+            actor: principal.name.clone(),
+            actor_token_id: principal.token_id.clone(),
+            role: principal.role,
+            action: action.into(),
+            target: target.into(),
+            detail,
+        };
+        self.db
+            .execute("INSERT INTO audit(data) VALUES(?1)", [encode(&event)?])?;
+        self.audit_inserts += 1;
+        if self.audit_inserts.is_multiple_of(100) {
+            self.db.execute(
+                "DELETE FROM audit WHERE seq <= (SELECT MAX(seq) FROM audit) - ?1",
+                [AUDIT_RETENTION],
+            )?;
+        }
+        Ok(())
+    }
+    /// Audits an event a worker connection can trigger at will, within a per-token hourly budget,
+    /// so one worker token cannot push older events out of the retention window.
+    fn audit_worker(
+        &mut self,
+        principal: &Principal,
+        action: &str,
+        target: &str,
+        detail: Option<String>,
+    ) -> Result<()> {
+        let time = now();
+        let budget = self
+            .worker_audit
+            .entry(audit_key(principal))
+            .or_insert((time, 0, false));
+        if time.saturating_sub(budget.0) >= 3600 {
+            *budget = (time, 0, false);
+        }
+        if budget.1 >= WORKER_AUDIT_PER_HOUR {
+            if !budget.2 {
+                budget.2 = true;
+                return self.audit(
+                    principal,
+                    "worker.audit_suppressed",
+                    target,
+                    Some(format!("more than {WORKER_AUDIT_PER_HOUR} worker events this hour")),
+                );
+            }
+            return Ok(());
+        }
+        budget.1 += 1;
+        self.audit(principal, action, target, detail)
+    }
+    fn audit_events(&self, limit: usize, before: Option<i64>) -> Result<Vec<AuditEvent>> {
+        let mut statement = self.db.prepare(
+            "SELECT seq, data FROM audit WHERE seq < ?1 ORDER BY seq DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            params![before.unwrap_or(i64::MAX), limit.clamp(1, 1000) as i64],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        rows.map(|row| {
+            let (seq, data) = row?;
+            let mut event: AuditEvent = serde_json::from_str(&data)?;
+            event.seq = seq;
+            Ok(event)
+        })
+        .collect()
+    }
     fn worker_settings(&self, worker: &WorkerInfo) -> Result<WorkerSettings> {
         Ok(self
             .one("SELECT data FROM worker_settings WHERE id=?1", &worker.id)?
@@ -343,7 +608,7 @@ impl Store {
         }
         Ok(())
     }
-    fn add_job(&mut self, spec: JobSpec) -> ApiResult<Job> {
+    fn add_job(&mut self, spec: JobSpec, submitted_by: Option<String>) -> ApiResult<Job> {
         spec.validate().map_err(invalid)?;
         self.validate_files(&spec.inputs).map_err(invalid)?;
         if let Some(image) = &spec.container {
@@ -389,6 +654,7 @@ impl Store {
             exit_code: None,
             error: None,
             results: vec![],
+            submitted_by,
         };
         self.db
             .execute(
@@ -680,8 +946,24 @@ impl Store {
         environments: Vec<EnvironmentStatus>,
         version: String,
         tx: mpsc::UnboundedSender<HubMessage>,
+        principal: &Principal,
     ) -> Result<Uuid> {
         identifier(&id)?;
+        match principal.role {
+            Role::Requester => bail!("requester tokens cannot connect workers"),
+            Role::Worker if principal.worker_id.as_deref() != Some(id.as_str()) => bail!(
+                "worker token is bound to worker {}",
+                principal.worker_id.as_deref().unwrap_or("(none)")
+            ),
+            _ => {}
+        }
+        // The token was valid at the upgrade; re-check under the lock in case it was revoked
+        // while the hello was pending.
+        if let Some(token) = &principal.token_id
+            && !self.tokens.values().any(|active| &active.id == token)
+        {
+            bail!("token was revoked")
+        }
         if max_jobs == 0 || max_jobs > 256 {
             bail!("max_jobs must be between 1 and 256")
         }
@@ -700,8 +982,14 @@ impl Store {
         };
         settings.capacity = max_jobs;
         self.save_worker_settings(&id, &settings)?;
-        self.sessions
-            .insert(id.clone(), Session { id: session, tx });
+        self.sessions.insert(
+            id.clone(),
+            Session {
+                id: session,
+                tx,
+                token: principal.token_id.clone(),
+            },
+        );
         self.save_worker(&WorkerInfo {
             id: id.clone(),
             capabilities,
@@ -976,13 +1264,20 @@ pub async fn run(listen: String, data_dir: PathBuf, token_file: PathBuf) -> Resu
     Ok(())
 }
 fn router(state: Shared) -> Router {
-    let protected = Router::new()
-        .route("/v1/workers", get(workers))
+    // Every /v1 route belongs to exactly one role group; a route outside these groups would be
+    // unauthenticated, so add new routes to the narrowest group that fits.
+    let admin = Router::new()
         .route("/v1/workers/{id}", axum::routing::delete(delete_worker))
         .route("/v1/workers/{id}/control", post(control_worker))
         .route("/v1/workers/{id}/update", post(update_worker))
+        .route("/v1/environments/{id}", axum::routing::delete(delete_environment))
+        .route("/v1/tokens", get(tokens).post(create_token))
+        .route("/v1/tokens/{id}", axum::routing::delete(revoke_token))
+        .route("/v1/audit", get(audit))
+        .route_layer(middleware::from_fn_with_state(state.clone(), admin_only));
+    let requester = Router::new()
+        .route("/v1/workers", get(workers))
         .route("/v1/blobs/missing", post(missing_blobs))
-        .route("/v1/blobs/{hash}", put(put_blob).get(get_blob))
         .route("/v1/jobs", post(submit).get(jobs))
         .route("/v1/jobs/{id}", get(job))
         .route("/v1/jobs/{id}/logs", get(logs))
@@ -993,11 +1288,17 @@ fn router(state: Shared) -> Router {
             get(environments).post(upsert_environment),
         )
         .route("/v1/environments/status", get(statuses))
-        .route("/v1/environments/{id}", axum::routing::delete(delete_environment))
         .route("/v1/environments/{id}/prepare", post(prepare))
         .route("/v1/environments/{id}/logs", get(environment_logs))
+        .route_layer(middleware::from_fn_with_state(state.clone(), requester_only));
+    let blobs = Router::new()
+        .route("/v1/blobs/{hash}", put(put_blob).get(get_blob))
+        .route("/v1/whoami", get(whoami))
+        .route_layer(middleware::from_fn_with_state(state.clone(), any_role));
+    let worker = Router::new()
         .route("/v1/worker/ws", get(worker_socket))
-        .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
+        .route_layer(middleware::from_fn_with_state(state.clone(), worker_only));
+    let protected = admin.merge(requester).merge(blobs).merge(worker);
     Router::new()
         .route("/", get(dashboard_index))
         .route("/{*path}", get(dashboard_asset))
@@ -1007,7 +1308,7 @@ fn router(state: Shared) -> Router {
                 Json(serde_json::json!({
                     "status":"ok",
                     "version":crate::VERSION,
-                    "capabilities":["job_priority", "worker_control"]
+                    "capabilities":["job_priority", "worker_control", "scoped_tokens", "audit_log"]
                 }))
             }),
         )
@@ -1062,13 +1363,28 @@ async fn dashboard_asset(Path(path): Path<String>) -> Response {
     );
     response
 }
-async fn authenticate(
-    State(state): State<Shared>,
-    request: axum::extract::Request,
+async fn admin_only(State(state): State<Shared>, request: axum::extract::Request, next: Next) -> Response {
+    authorize(state, request, next, &[Role::Admin]).await
+}
+async fn requester_only(State(state): State<Shared>, request: axum::extract::Request, next: Next) -> Response {
+    authorize(state, request, next, &[Role::Admin, Role::Requester]).await
+}
+async fn worker_only(State(state): State<Shared>, request: axum::extract::Request, next: Next) -> Response {
+    authorize(state, request, next, &[Role::Admin, Role::Worker]).await
+}
+async fn any_role(State(state): State<Shared>, request: axum::extract::Request, next: Next) -> Response {
+    authorize(state, request, next, &[Role::Admin, Role::Requester, Role::Worker]).await
+}
+/// Resolves the bearer token to a `Principal` for handlers, or answers 401 (unknown token) or
+/// 403 (known token whose role cannot use this route).
+async fn authorize(
+    state: Shared,
+    mut request: axum::extract::Request,
     next: Next,
+    allowed: &[Role],
 ) -> Response {
-    let valid = {
-        let Ok(store) = state.lock() else {
+    let principal = {
+        let Ok(mut store) = state.lock() else {
             return ApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "hub store unavailable".into(),
@@ -1080,28 +1396,67 @@ async fn authenticate(
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
-            .is_some_and(|value| {
-                value.len() == store.token.len()
-                    && value
-                        .bytes()
-                        .zip(store.token.bytes())
-                        .fold(0u8, |acc, (left, right)| acc | left ^ right)
-                        == 0
-            })
+            .and_then(|value| store.resolve(value))
     };
-    if !valid {
+    let Some(principal) = principal else {
         return ApiError(
             StatusCode::UNAUTHORIZED,
             "valid Bearer token required".into(),
         )
         .into_response();
+    };
+    if !allowed.contains(&principal.role) {
+        return ApiError(
+            StatusCode::FORBIDDEN,
+            format!("this token's role ({}) cannot use this endpoint", principal.role),
+        )
+        .into_response();
     }
+    request.extensions_mut().insert(principal);
     next.run(request).await
+}
+async fn whoami(Extension(principal): Extension<Principal>) -> Json<Principal> {
+    Json(principal)
+}
+async fn tokens(State(state): State<Shared>) -> ApiResult<Json<Vec<TokenInfo>>> {
+    Ok(Json(lock(&state)?.list_tokens()?))
+}
+async fn create_token(
+    State(state): State<Shared>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<TokenRequest>,
+) -> ApiResult<Json<CreatedToken>> {
+    Ok(Json(lock(&state)?.create_token(request, &principal)?))
+}
+async fn revoke_token(
+    State(state): State<Shared>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<TokenInfo>> {
+    Ok(Json(lock(&state)?.revoke_token(&id, &principal)?))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditQuery {
+    limit: Option<usize>,
+    before: Option<i64>,
+}
+async fn audit(
+    State(state): State<Shared>,
+    Query(query): Query<AuditQuery>,
+) -> ApiResult<Json<Vec<AuditEvent>>> {
+    Ok(Json(
+        lock(&state)?.audit_events(query.limit.unwrap_or(200), query.before)?,
+    ))
 }
 async fn workers(State(state): State<Shared>) -> ApiResult<Json<Vec<WorkerInfo>>> {
     Ok(Json(lock(&state)?.workers()?))
 }
-async fn delete_worker(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+async fn delete_worker(
+    State(state): State<Shared>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
     let mut guard = lock(&state)?;
     // Deleting a missing worker succeeds so retries are idempotent.
     if guard.jobs().unwrap_or_default().into_iter().any(|job| {
@@ -1110,18 +1465,25 @@ async fn delete_worker(State(state): State<Shared>, Path(id): Path<String>) -> A
         return Err(invalid("worker has active jobs; drain it first"));
     }
     guard.delete_worker(&id)?;
+    guard.audit(&principal, "worker.delete", &id, None)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn control_worker(
     State(state): State<Shared>,
+    Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
     Json(control): Json<WorkerControl>,
 ) -> ApiResult<Json<WorkerInfo>> {
-    Ok(Json(lock(&state)?.control_worker(&id, control)?))
+    let mut store = lock(&state)?;
+    let detail = encode(&control)?;
+    let worker = store.control_worker(&id, control)?;
+    store.audit(&principal, "worker.control", &id, Some(detail))?;
+    Ok(Json(worker))
 }
 async fn update_worker(
     State(state): State<Shared>,
+    Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
     Json(request): Json<UpdateRequest>,
 ) -> ApiResult<Json<WorkerInfo>> {
@@ -1145,19 +1507,24 @@ async fn update_worker(
     let Some(session) = store.sessions.get(&id).filter(|_| worker.online) else {
         return Err(ApiError(StatusCode::CONFLICT, "worker is offline".into()));
     };
-    if session.tx.send(HubMessage::Update { version }).is_err() {
+    if session.tx.send(HubMessage::Update { version: version.clone() }).is_err() {
         return Err(ApiError(StatusCode::CONFLICT, "worker connection closed".into()));
     }
     worker.update_error = None;
     store.save_worker(&worker)?;
+    store.audit(&principal, "worker.update", &id, Some(version))?;
     Ok(Json(worker))
 }
 async fn set_priority(
     State(state): State<Shared>,
+    Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
     Json(request): Json<PriorityRequest>,
 ) -> ApiResult<Json<Job>> {
-    Ok(Json(lock(&state)?.set_priority(&id, request.priority)?))
+    let mut store = lock(&state)?;
+    let job = store.set_priority(&id, request.priority)?;
+    store.audit(&principal, "job.priority", &id, Some(request.priority.to_string()))?;
+    Ok(Json(job))
 }
 async fn jobs(State(state): State<Shared>) -> ApiResult<Json<Vec<Job>>> {
     Ok(Json(lock(&state)?.jobs()?))
@@ -1165,8 +1532,22 @@ async fn jobs(State(state): State<Shared>) -> ApiResult<Json<Vec<Job>>> {
 async fn job(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult<Json<Job>> {
     Ok(Json(lock(&state)?.job(&id)?.ok_or_else(|| missing("job"))?))
 }
-async fn submit(State(state): State<Shared>, Json(spec): Json<JobSpec>) -> ApiResult<Json<Job>> {
-    Ok(Json(lock(&state)?.add_job(spec)?))
+async fn submit(
+    State(state): State<Shared>,
+    Extension(principal): Extension<Principal>,
+    Json(spec): Json<JobSpec>,
+) -> ApiResult<Json<Job>> {
+    let mut store = lock(&state)?;
+    let job = store.add_job(spec, Some(principal.name.clone()))?;
+    let mut detail = job.spec.command.first().cloned().unwrap_or_default();
+    if let Some(image) = &job.spec.container {
+        detail.push_str(&format!(" container={image}"));
+    }
+    if let Some(environment) = &job.spec.environment {
+        detail.push_str(&format!(" environment={environment}"));
+    }
+    store.audit(&principal, "job.submit", &job.id, Some(detail))?;
+    Ok(Json(job))
 }
 async fn logs(
     State(state): State<Shared>,
@@ -1192,7 +1573,11 @@ async fn logs(
     }
     Ok(Json(entries))
 }
-async fn cancel(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult<Json<Job>> {
+async fn cancel(
+    State(state): State<Shared>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Job>> {
     let mut store = lock(&state)?;
     let mut job = store.job(&id)?.ok_or_else(|| missing("job"))?;
     if !terminal(&job.state) {
@@ -1226,6 +1611,7 @@ async fn cancel(State(state): State<Shared>, Path(id): Path<String>) -> ApiResul
         job.updated_at = now();
         store.save_job(&job)?;
         store.schedule()?;
+        store.audit(&principal, "job.cancel", &id, None)?;
     }
     Ok(Json(job))
 }
@@ -1299,10 +1685,15 @@ async fn environments(State(state): State<Shared>) -> ApiResult<Json<Vec<Environ
 async fn statuses(State(state): State<Shared>) -> ApiResult<Json<Vec<EnvironmentStatus>>> {
     Ok(Json(lock(&state)?.statuses()?))
 }
-async fn delete_environment(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+async fn delete_environment(
+    State(state): State<Shared>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
     identifier(&id).map_err(invalid)?;
     let mut store = lock(&state)?;
     store.delete_environment(&id)?;
+    store.audit(&principal, "environment.delete", &id, None)?;
     // Offline workers miss this and reclaim the files through their unused-age collection.
     for session in store.sessions.values() {
         let _ = session.tx.send(HubMessage::Evict { environment_id: id.clone() });
@@ -1336,6 +1727,7 @@ async fn environment_logs(
 }
 async fn upsert_environment(
     State(state): State<Shared>,
+    Extension(principal): Extension<Principal>,
     Json(environment): Json<Environment>,
 ) -> ApiResult<Json<Environment>> {
     identifier(&environment.id).map_err(invalid)?;
@@ -1370,19 +1762,28 @@ async fn upsert_environment(
             "environment revisions are immutable; choose a new revision".into(),
         ));
     }
-    store
+    let inserted = store
         .db
         .execute(
             "INSERT OR IGNORE INTO environment_revisions(id,revision,data) VALUES(?1,?2,?3)",
             params![environment.id, environment.revision, encode(&environment)?],
         )
         .map_err(anyhow::Error::from)?;
+    if inserted > 0 {
+        store.audit(
+            &principal,
+            "environment.upsert",
+            &format!("{}@{}", environment.id, environment.revision),
+            None,
+        )?;
+    }
     store.db.execute("INSERT INTO environments(id,data) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET data=excluded.data", params![environment.id, encode(&environment)?]).map_err(anyhow::Error::from)?;
     store.schedule()?;
     Ok(Json(environment))
 }
 async fn prepare(
     State(state): State<Shared>,
+    Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
     Json(request): Json<PrepareRequest>,
 ) -> ApiResult<Json<Vec<EnvironmentStatus>>> {
@@ -1430,6 +1831,18 @@ async fn prepare(
         )));
     }
     store.schedule()?;
+    store.audit(
+        &principal,
+        "environment.prepare",
+        &format!("{id}@{}", environment.revision),
+        Some(
+            result
+                .iter()
+                .map(|status| status.worker_id.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+    )?;
     for status in &mut result {
         *status = store
             .status(&status.worker_id, &environment)?
@@ -1437,45 +1850,85 @@ async fn prepare(
     }
     Ok(Json(result))
 }
-async fn worker_socket(State(state): State<Shared>, ws: WebSocketUpgrade) -> Response {
+async fn worker_socket(
+    State(state): State<Shared>,
+    Extension(principal): Extension<Principal>,
+    ws: WebSocketUpgrade,
+) -> Response {
     ws.max_message_size(2 * 1024 * 1024)
-        .on_upgrade(move |socket| socket_loop(state, socket))
+        .on_upgrade(move |socket| socket_loop(state, socket, principal))
 }
-async fn socket_loop(state: Shared, mut socket: WebSocket) {
+async fn socket_loop(state: Shared, mut socket: WebSocket, principal: Principal) {
     let hello = tokio::time::timeout(Duration::from_secs(15), socket.recv()).await;
     let Ok(Some(Ok(Message::Text(text)))) = hello else {
         return;
     };
-    let Ok(WorkerMessage::Hello {
-        worker_id,
-        capabilities,
-        max_jobs,
-        attempts,
-        environments,
-        version,
-    }) = serde_json::from_str(&text)
-    else {
-        return;
-    };
+    let (worker_id, capabilities, max_jobs, attempts, environments, version) =
+        match serde_json::from_str(&text) {
+            Ok(WorkerMessage::Hello {
+                worker_id,
+                capabilities,
+                max_jobs,
+                attempts,
+                environments,
+                version,
+            }) => (worker_id, capabilities, max_jobs, attempts, environments, version),
+            Ok(_) => {
+                eprintln!("worker connection rejected: first message was not hello");
+                return;
+            }
+            Err(error) => {
+                eprintln!("worker hello rejected: {error:#}");
+                return;
+            }
+        };
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let connected = match state.lock() {
-        Ok(mut store) => store.connect(
+    let session = {
+        let Ok(mut store) = state.lock() else { return };
+        let signature = format!(
+            "{}|{}|{version}",
+            principal.name,
+            principal.token_id.as_deref().unwrap_or("")
+        );
+        let session = match store.connect(
             worker_id.clone(),
             capabilities,
             max_jobs,
             attempts,
             environments,
-            version,
+            version.clone(),
             tx,
-        ),
-        Err(_) => return,
-    };
-    let session = match connected {
-        Ok(session) => session,
-        Err(error) => {
-            eprintln!("worker hello rejected: {error:#}");
-            return;
-        }
+            &principal,
+        ) {
+            Ok(session) => {
+                if store.connect_seen.get(&worker_id) != Some(&signature) {
+                    store.connect_seen.insert(worker_id.clone(), signature);
+                    let mut detail = format!("version={version}");
+                    if principal.role == Role::Admin {
+                        detail.push_str(" (admin token used as a worker credential)");
+                    }
+                    if let Err(error) =
+                        store.audit_worker(&principal, "worker.connect", &worker_id, Some(detail))
+                    {
+                        eprintln!("hub: audit failed: {error:#}");
+                    }
+                }
+                session
+            }
+            Err(error) => {
+                eprintln!("worker hello rejected: {error:#}");
+                if let Err(error) = store.audit_worker(
+                    &principal,
+                    "worker.rejected",
+                    &worker_id,
+                    Some(format!("{error:#}")),
+                ) {
+                    eprintln!("hub: audit failed: {error:#}");
+                }
+                return;
+            }
+        };
+        session
     };
     let (mut sink, mut stream) = socket.split();
     let mut ticker = tokio::time::interval(Duration::from_secs(15));
@@ -1543,7 +1996,7 @@ mod tests {
     fn worker(store: &mut Store, id: &str) -> (Uuid, mpsc::UnboundedReceiver<HubMessage>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let session = store
-            .connect(id.into(), caps(), 1, vec![], vec![], String::new(), tx)
+            .connect(id.into(), caps(), 1, vec![], vec![], String::new(), tx, &pool_principal())
             .unwrap();
         (session, rx)
     }
@@ -1653,7 +2106,7 @@ mod tests {
                 image: None,
                 env: BTreeMap::from([(key.into(), "value".into())]),
             };
-            let error = upsert_environment(State(state.clone()), Json(environment))
+            let error = upsert_environment(State(state.clone()), Extension(pool_principal()), Json(environment))
                 .await
                 .unwrap_err();
             assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
@@ -1668,7 +2121,7 @@ mod tests {
             env: BTreeMap::from([("PATH".into(), "tools".into())]),
         };
         assert!(
-            upsert_environment(State(state), Json(environment))
+            upsert_environment(State(state), Extension(pool_principal()), Json(environment))
                 .await
                 .is_ok()
         );
@@ -1689,7 +2142,7 @@ mod tests {
             env: BTreeMap::new(),
         };
         assert!(
-            upsert_environment(State(state.clone()), Json(environment.clone()))
+            upsert_environment(State(state.clone()), Extension(pool_principal()), Json(environment.clone()))
                 .await
                 .is_ok()
         );
@@ -1698,18 +2151,18 @@ mod tests {
             .add_job(JobSpec {
                 environment: Some("native".into()),
                 ..spec()
-            })
+            }, None)
             .unwrap();
-        let blocked = delete_environment(State(state.clone()), Path("native".into()))
+        let blocked = delete_environment(State(state.clone()), Extension(pool_principal()), Path("native".into()))
             .await
             .unwrap_err();
         assert_eq!(blocked.0, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(job.state, "queued");
-        let cancelled = cancel(State(state.clone()), Path(job.id.clone())).await.unwrap();
+        let cancelled = cancel(State(state.clone()), Extension(pool_principal()), Path(job.id.clone())).await.unwrap();
         assert_eq!(cancelled.0.state, "cancelled");
         for _ in 0..2 {
             assert_eq!(
-                delete_environment(State(state.clone()), Path("native".into()))
+                delete_environment(State(state.clone()), Extension(pool_principal()), Path("native".into()))
                     .await
                     .unwrap(),
                 StatusCode::NO_CONTENT
@@ -1747,14 +2200,14 @@ mod tests {
             assert!(store.statuses().unwrap().is_empty());
         }
         // A deleted id can be registered again.
-        assert!(upsert_environment(State(state), Json(environment)).await.is_ok());
+        assert!(upsert_environment(State(state), Extension(pool_principal()), Json(environment)).await.is_ok());
     }
 
     #[test]
     fn pause_drains_active_jobs_and_resume_assigns_queued_work() {
         let (_dir, mut store) = test_store();
         let (_session, mut rx) = worker(&mut store, "one");
-        let first = store.add_job(spec()).unwrap();
+        let first = store.add_job(spec(), None).unwrap();
         assert!(matches!(rx.try_recv().unwrap(), HubMessage::Run { .. }));
         let paused = store
             .control_worker(
@@ -1766,7 +2219,7 @@ mod tests {
             )
             .unwrap();
         assert!(paused.paused);
-        let second = store.add_job(spec()).unwrap();
+        let second = store.add_job(spec(), None).unwrap();
         assert_eq!(second.state, "queued");
         assert_eq!(store.job(&first.id).unwrap().unwrap().state, "assigned");
         assert!(rx.try_recv().is_err());
@@ -1825,7 +2278,7 @@ mod tests {
             .add_job(JobSpec {
                 environment: Some(environment.id.clone()),
                 ..spec()
-            })
+            }, None)
             .unwrap();
         assert_eq!(job.state, "queued");
         assert_eq!(
@@ -1850,7 +2303,7 @@ mod tests {
         let (dir, mut store) = test_store();
         let (tx, _rx) = mpsc::unbounded_channel();
         store
-            .connect("one".into(), caps(), 4, vec![], vec![], String::new(), tx)
+            .connect("one".into(), caps(), 4, vec![], vec![], String::new(), tx, &pool_principal())
             .unwrap();
         let info = store
             .control_worker(
@@ -1871,7 +2324,7 @@ mod tests {
         for (advertised, expected) in [(4, 3), (2, 2), (4, 3)] {
             let (tx, _rx) = mpsc::unbounded_channel();
             store
-                .connect("one".into(), caps(), advertised, vec![], vec![], String::new(), tx)
+                .connect("one".into(), caps(), advertised, vec![], vec![], String::new(), tx, &pool_principal())
                 .unwrap();
             let info = store.workers().unwrap().remove(0);
             assert!(info.paused);
@@ -1919,10 +2372,10 @@ mod tests {
         let (_dir, mut store) = test_store();
         let (tx, mut rx) = mpsc::unbounded_channel();
         store
-            .connect("one".into(), caps(), 2, vec![], vec![], String::new(), tx)
+            .connect("one".into(), caps(), 2, vec![], vec![], String::new(), tx, &pool_principal())
             .unwrap();
-        let first = store.add_job(spec()).unwrap();
-        let second = store.add_job(spec()).unwrap();
+        let first = store.add_job(spec(), None).unwrap();
+        let second = store.add_job(spec(), None).unwrap();
         rx.try_recv().unwrap();
         rx.try_recv().unwrap();
         store
@@ -1934,7 +2387,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let third = store.add_job(spec()).unwrap();
+        let third = store.add_job(spec(), None).unwrap();
         assert_eq!(third.state, "queued");
         assert_eq!(store.job(&first.id).unwrap().unwrap().state, "assigned");
         assert_eq!(store.job(&second.id).unwrap().unwrap().state, "assigned");
@@ -1953,7 +2406,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(store.add_job(spec()).unwrap().state, "assigned");
+        assert_eq!(store.add_job(spec(), None).unwrap().state, "assigned");
     }
 
     #[test]
@@ -1969,20 +2422,20 @@ mod tests {
                 },
             )
             .unwrap();
-        let first = store.add_job(spec()).unwrap();
+        let first = store.add_job(spec(), None).unwrap();
         let second = store
             .add_job(JobSpec {
                 priority: 10,
                 ..spec()
-            })
+            }, None)
             .unwrap();
         let third = store
             .add_job(JobSpec {
                 priority: 10,
                 ..spec()
-            })
+            }, None)
             .unwrap();
-        let fourth = store.add_job(spec()).unwrap();
+        let fourth = store.add_job(spec(), None).unwrap();
         store.set_priority(&fourth.id, 20).unwrap();
         assert_eq!(
             store.set_priority(&first.id, 101).unwrap_err().0,
@@ -2070,7 +2523,7 @@ mod tests {
                 vec![],
                 vec![],
                 String::new(),
-                tx,
+                tx, &pool_principal()
             )
             .unwrap_err();
         assert!(error.to_string().contains("unsupported worker OS"));
@@ -2089,7 +2542,7 @@ mod tests {
                 vec![],
                 vec![],
                 String::new(),
-                tx,
+                tx, &pool_principal()
             )
             .unwrap();
         let job = store
@@ -2100,7 +2553,7 @@ mod tests {
                     ..Default::default()
                 },
                 ..spec()
-            })
+            }, None)
             .unwrap_or_else(|e| panic!("{}", e.1));
         assert_eq!(job.worker_id.as_deref(), Some("windows"));
         assert_eq!(job.state, "assigned");
@@ -2110,12 +2563,12 @@ mod tests {
     fn queues_busy_worker_and_rejects_incompatible_platform() {
         let (_dir, mut store) = test_store();
         let (_session, mut rx) = worker(&mut store, "one");
-        let first = store.add_job(spec()).unwrap_or_else(|e| panic!("{}", e.1));
+        let first = store.add_job(spec(), None).unwrap_or_else(|e| panic!("{}", e.1));
         assert_eq!(first.state, "assigned");
         assert!(matches!(rx.try_recv().unwrap(), HubMessage::Run { .. }));
         assert_eq!(
             store
-                .add_job(spec())
+                .add_job(spec(), None)
                 .unwrap_or_else(|e| panic!("{}", e.1))
                 .state,
             "queued"
@@ -2128,7 +2581,7 @@ mod tests {
             ..spec()
         };
         assert_eq!(
-            store.add_job(bad).err().unwrap().0,
+            store.add_job(bad, None).err().unwrap().0,
             StatusCode::UNPROCESSABLE_ENTITY
         );
     }
@@ -2136,7 +2589,7 @@ mod tests {
     fn disconnect_never_requeues_and_old_session_cannot_disconnect_replacement() {
         let (_dir, mut store) = test_store();
         let (old, _rx) = worker(&mut store, "one");
-        let job = store.add_job(spec()).unwrap_or_else(|e| panic!("{}", e.1));
+        let job = store.add_job(spec(), None).unwrap_or_else(|e| panic!("{}", e.1));
         store.disconnect("one", old).unwrap();
         assert_eq!(store.job(&job.id).unwrap().unwrap().state, "unknown");
         let (new, _rx) = worker(&mut store, "one");
@@ -2165,7 +2618,7 @@ mod tests {
     fn logs_are_deduplicated_and_foreign_attempts_rejected() {
         let (_dir, mut store) = test_store();
         let (session, _rx) = worker(&mut store, "one");
-        let job = store.add_job(spec()).unwrap_or_else(|e| panic!("{}", e.1));
+        let job = store.add_job(spec(), None).unwrap_or_else(|e| panic!("{}", e.1));
         let entry = LogEntry {
             job_id: job.id.clone(),
             attempt_id: job.attempt_id.clone(),
@@ -2209,7 +2662,7 @@ mod tests {
     fn restarts_preserve_assignment_and_environment_snapshot() {
         let (dir, mut store) = test_store();
         let (_session, _rx) = worker(&mut store, "one");
-        let job = store.add_job(spec()).unwrap_or_else(|e| panic!("{}", e.1));
+        let job = store.add_job(spec(), None).unwrap_or_else(|e| panic!("{}", e.1));
         drop(store);
         let store = Store::open(dir.path().into(), "test-token-long-enough".into()).unwrap();
         let restored = store.job(&job.id).unwrap().unwrap();
@@ -2269,13 +2722,13 @@ mod tests {
                 params![environment.id, encode(&environment).unwrap()],
             )
             .unwrap();
-        let first = store.add_job(spec()).unwrap_or_else(|e| panic!("{}", e.1));
+        let first = store.add_job(spec(), None).unwrap_or_else(|e| panic!("{}", e.1));
         rx.try_recv().unwrap();
         let second = store
             .add_job(JobSpec {
                 environment: Some(environment.id.clone()),
                 ..spec()
-            })
+            }, None)
             .unwrap_or_else(|e| panic!("{}", e.1));
         assert_eq!(second.state, "queued");
         assert!(rx.try_recv().is_err());
@@ -2315,8 +2768,8 @@ mod tests {
     fn queued_cancel_survives_crash_before_state_update() {
         let (_dir, mut store) = test_store();
         let (_session, _rx) = worker(&mut store, "one");
-        let _running = store.add_job(spec()).unwrap();
-        let queued = store.add_job(spec()).unwrap();
+        let _running = store.add_job(spec(), None).unwrap();
+        let queued = store.add_job(spec(), None).unwrap();
         store
             .db
             .execute(
@@ -2407,6 +2860,209 @@ mod tests {
             .unwrap();
         assert!(missing.hashes.is_empty());
         task.abort();
+    }
+
+    fn requester() -> TokenRequest {
+        TokenRequest { name: "laptop".into(), role: Role::Requester, worker_id: None }
+    }
+    fn bound(worker: &str) -> TokenRequest {
+        TokenRequest { name: format!("{worker}-token"), role: Role::Worker, worker_id: Some(worker.into()) }
+    }
+
+    #[test]
+    fn scoped_tokens_resolve_until_revoked_and_store_only_hashes() {
+        let (dir, mut store) = test_store();
+        assert_eq!(store.resolve("test-token-long-enough"), Some(pool_principal()));
+        assert_eq!(store.resolve("nope"), None);
+        let created = store.create_token(requester(), &pool_principal()).unwrap();
+        assert!(created.secret.starts_with("ylcc_") && created.secret.len() == 69);
+        let principal = store.resolve(&created.secret).unwrap();
+        assert_eq!(principal.role, Role::Requester);
+        assert_eq!(principal.token_id.as_deref(), Some(created.token.id.as_str()));
+        let stored: String = store
+            .db
+            .query_row("SELECT hash || data FROM tokens", [], |row| row.get(0))
+            .unwrap();
+        assert!(!stored.contains(&created.secret));
+        assert!(store.create_token(requester(), &pool_principal()).is_err(), "duplicate active name");
+        store.revoke_token(&created.token.id, &pool_principal()).unwrap();
+        assert_eq!(store.resolve(&created.secret), None);
+        assert!(store.revoke_token(&created.token.id, &pool_principal()).is_ok(), "idempotent");
+        // Revocation survives a Hub restart.
+        drop(store);
+        let mut store = Store::open(dir.path().into(), "test-token-long-enough".into()).unwrap();
+        assert_eq!(store.resolve(&created.secret), None);
+        assert!(store.list_tokens().unwrap()[0].revoked_at.is_some());
+    }
+
+    #[test]
+    fn token_requests_are_validated_and_pool_is_reserved() {
+        let (_dir, mut store) = test_store();
+        let by = pool_principal();
+        let reserved = TokenRequest { name: "pool".into(), ..requester() };
+        assert!(store.create_token(reserved, &by).is_err());
+        let unbound = TokenRequest { worker_id: None, ..bound("w") };
+        assert!(store.create_token(unbound, &by).is_err());
+        let misbound = TokenRequest { worker_id: Some("w".into()), ..requester() };
+        assert!(store.create_token(misbound, &by).is_err());
+        let invalid_name = TokenRequest { name: "../x".into(), ..requester() };
+        assert!(store.create_token(invalid_name, &by).is_err());
+    }
+
+    #[test]
+    fn worker_tokens_connect_only_as_their_worker() {
+        let (_dir, mut store) = test_store();
+        let created = store.create_token(bound("builder"), &pool_principal()).unwrap();
+        let principal = store.resolve(&created.secret).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let error = store
+            .connect("other".into(), caps(), 1, vec![], vec![], String::new(), tx, &principal)
+            .unwrap_err();
+        assert!(error.to_string().contains("bound to worker builder"));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        store
+            .connect("builder".into(), caps(), 1, vec![], vec![], String::new(), tx, &principal)
+            .unwrap();
+        let laptop = store.create_token(requester(), &pool_principal()).unwrap();
+        let laptop = store.resolve(&laptop.secret).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        assert!(store
+            .connect("x".into(), caps(), 1, vec![], vec![], String::new(), tx, &laptop)
+            .is_err());
+    }
+
+    #[test]
+    fn revoking_a_worker_token_disconnects_it_and_blocks_a_pending_hello() {
+        let (_dir, mut store) = test_store();
+        let created = store.create_token(bound("builder"), &pool_principal()).unwrap();
+        let principal = store.resolve(&created.secret).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        store
+            .connect("builder".into(), caps(), 1, vec![], vec![], String::new(), tx, &principal)
+            .unwrap();
+        let job = store.add_job(spec(), None).unwrap();
+        assert!(matches!(rx.try_recv(), Ok(HubMessage::Run { .. })));
+        store.revoke_token(&created.token.id, &pool_principal()).unwrap();
+        assert!(!store.sessions.contains_key("builder"));
+        assert!(!store.workers().unwrap()[0].online);
+        assert_eq!(store.job(&job.id).unwrap().unwrap().state, "unknown");
+        // A socket authenticated before the revoke cannot complete its hello afterwards.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let error = store
+            .connect("builder".into(), caps(), 1, vec![], vec![], String::new(), tx, &principal)
+            .unwrap_err();
+        assert!(error.to_string().contains("revoked"));
+    }
+
+    #[test]
+    fn audit_records_actions_and_throttles_worker_events_per_token() {
+        let (_dir, mut store) = test_store();
+        let by = pool_principal();
+        let created = store.create_token(bound("builder"), &by).unwrap();
+        let principal = store.resolve(&created.secret).unwrap();
+        for attempt in 0..(WORKER_AUDIT_PER_HOUR + 10) {
+            store
+                .audit_worker(&principal, "worker.rejected", &format!("id-{attempt}"), None)
+                .unwrap();
+        }
+        let events = store.audit_events(1000, None).unwrap();
+        let rejected = events.iter().filter(|e| e.action == "worker.rejected").count();
+        assert_eq!(rejected, WORKER_AUDIT_PER_HOUR as usize);
+        assert_eq!(events.iter().filter(|e| e.action == "worker.audit_suppressed").count(), 1);
+        let created_event = events.iter().find(|e| e.action == "token.create").unwrap();
+        assert_eq!(created_event.actor, "pool");
+        assert_eq!(created_event.target, created.token.id);
+        assert_eq!(events[0].seq, events.iter().map(|e| e.seq).max().unwrap(), "newest first");
+        let older = store.audit_events(5, Some(events[0].seq)).unwrap();
+        assert!(older.iter().all(|e| e.seq < events[0].seq) && older.len() == 5);
+    }
+
+    #[test]
+    fn audit_prunes_to_retention() {
+        let (_dir, mut store) = test_store();
+        for _ in 0..(AUDIT_RETENTION + 150) {
+            store.audit(&pool_principal(), "job.cancel", "x", None).unwrap();
+        }
+        let count: i64 = store.db.query_row("SELECT COUNT(*) FROM audit", [], |r| r.get(0)).unwrap();
+        assert!(count <= AUDIT_RETENTION + 100, "{count}");
+    }
+
+    async fn call(app: &Router, method: &str, uri: &str, token: Option<&str>, body: &str) -> (StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let mut request = axum::http::Request::builder().method(method).uri(uri);
+        if let Some(token) = token {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        if !body.is_empty() {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+        }
+        let response = app.clone().oneshot(request.body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    #[tokio::test]
+    async fn roles_gate_endpoints_and_submissions_record_the_token_name() {
+        let (_dir, mut store) = test_store();
+        let laptop = store.create_token(requester(), &pool_principal()).unwrap().secret;
+        let builder = store.create_token(bound("builder"), &pool_principal()).unwrap().secret;
+        worker(&mut store, "w1");
+        let state = Arc::new(Mutex::new(store));
+        let app = router(state.clone());
+        let pool = Some("test-token-long-enough");
+        let hash = "0".repeat(64);
+        let blob = format!("/v1/blobs/{hash}");
+        for (method, uri, token, expected) in [
+            ("GET", "/v1/workers", None, StatusCode::UNAUTHORIZED),
+            ("GET", "/v1/workers", Some("wrong"), StatusCode::UNAUTHORIZED),
+            ("GET", "/v1/workers", pool, StatusCode::OK),
+            ("GET", "/v1/workers", Some(laptop.as_str()), StatusCode::OK),
+            ("GET", "/v1/workers", Some(builder.as_str()), StatusCode::FORBIDDEN),
+            ("GET", "/v1/jobs", Some(builder.as_str()), StatusCode::FORBIDDEN),
+            ("DELETE", "/v1/workers/w1", Some(laptop.as_str()), StatusCode::FORBIDDEN),
+            ("DELETE", "/v1/environments/x", Some(laptop.as_str()), StatusCode::FORBIDDEN),
+            ("GET", "/v1/tokens", Some(laptop.as_str()), StatusCode::FORBIDDEN),
+            ("GET", "/v1/audit", Some(laptop.as_str()), StatusCode::FORBIDDEN),
+            ("GET", "/v1/tokens", pool, StatusCode::OK),
+            ("GET", "/v1/audit?limit=5", pool, StatusCode::OK),
+            ("GET", "/v1/audit?bogus=1", pool, StatusCode::BAD_REQUEST),
+            ("GET", blob.as_str(), Some(builder.as_str()), StatusCode::NOT_FOUND),
+            ("GET", blob.as_str(), Some(laptop.as_str()), StatusCode::NOT_FOUND),
+            ("GET", "/v1/worker/ws", Some(laptop.as_str()), StatusCode::FORBIDDEN),
+            ("GET", "/v1/whoami", Some(builder.as_str()), StatusCode::OK),
+        ] {
+            let (status, body) = call(&app, method, uri, token, "").await;
+            assert_eq!(status, expected, "{method} {uri} with {token:?}: {body}");
+        }
+        let (status, body) = call(&app, "GET", "/v1/whoami", Some(&laptop), "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["name"], "laptop");
+        assert_eq!(body["role"], "requester");
+        let (status, body) = call(&app, "GET", "/v1/workers", Some(&builder), "").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body["error"].as_str().unwrap().contains("role (worker)"));
+
+        // The submitter comes from the token, never from the request body.
+        let (status, job) = call(&app, "POST", "/v1/jobs", Some(&laptop), r#"{"command":["true"],"environment":null,"container":null,"timeout_secs":null,"submitted_by":"someone-else"}"#).await;
+        assert_eq!(status, StatusCode::OK, "{job}");
+        assert_eq!(job["submitted_by"], "laptop");
+        let events = state.lock().unwrap().audit_events(10, None).unwrap();
+        let submit = events.iter().find(|e| e.action == "job.submit").unwrap();
+        assert_eq!((submit.actor.as_str(), submit.target.as_str()), ("laptop", job["id"].as_str().unwrap()));
+
+        // Token management round trip through the API.
+        let (status, created) = call(&app, "POST", "/v1/tokens", pool, r#"{"name":"ci","role":"requester"}"#).await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let secret = created["secret"].as_str().unwrap().to_string();
+        let id = created["token"]["id"].as_str().unwrap().to_string();
+        assert_eq!(call(&app, "GET", "/v1/jobs", Some(&secret), "").await.0, StatusCode::OK);
+        let (status, revoked) = call(&app, "DELETE", &format!("/v1/tokens/{id}"), pool, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(revoked["revoked_at"].is_u64());
+        assert_eq!(call(&app, "GET", "/v1/jobs", Some(&secret), "").await.0, StatusCode::UNAUTHORIZED);
+        let (_, listed) = call(&app, "GET", "/v1/tokens", pool, "").await;
+        assert!(listed.as_array().unwrap().iter().all(|t| t.get("secret").is_none() && t.get("hash").is_none()));
     }
 }
 

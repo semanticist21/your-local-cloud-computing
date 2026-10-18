@@ -108,6 +108,9 @@ impl Client {
         Ok((missing.hashes.len(), bytes))
     }
 
+    pub async fn delete_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        Self::decode(self.request(Method::DELETE, path).send().await?).await
+    }
     pub async fn delete(&self, path: &str) -> Result<()> {
         let response = self
             .http
@@ -117,7 +120,8 @@ impl Client {
             .await?;
         let status = response.status();
         if !status.is_success() {
-            bail!("HTTP {}: {}", status, path)
+            let text = response.text().await.unwrap_or_default();
+            bail!("HTTP {}: {}: {}", status, path, text)
         }
         Ok(())
     }

@@ -20,7 +20,9 @@ import {
   Clock3,
   Cpu,
   FileText,
+  KeyRound,
   LayoutDashboard,
+  ScrollText,
   LockKeyhole,
   LogOut,
   Radio,
@@ -34,7 +36,9 @@ import {
 import { Badge, Button } from './components/ui'
 import {
   AuthError,
+  auditQuery,
   clearToken,
+  ForbiddenError,
   errorMessage,
   formatBytes,
   formatDuration,
@@ -45,9 +49,12 @@ import {
   readToken,
   snapshotQuery,
   storeToken,
+  tokensQuery,
   useNow,
+  whoamiQuery,
   type EnvironmentStatus,
   type Job,
+  type Role,
   type WorkerInfo,
 } from './lib/api'
 
@@ -77,8 +84,10 @@ const jobsRoute = createRoute({
 })
 const jobRoute = createRoute({ getParentRoute: () => rootRoute, path: '/jobs/$jobId', component: JobPage })
 const environmentsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/environments', component: EnvironmentsPage })
+const auditRoute = createRoute({ getParentRoute: () => rootRoute, path: '/audit', component: AuditPage })
+const tokensRoute = createRoute({ getParentRoute: () => rootRoute, path: '/tokens', component: TokensPage })
 
-const routeTree = rootRoute.addChildren([overviewRoute, workersRoute, workerRoute, jobsRoute, jobRoute, environmentsRoute])
+const routeTree = rootRoute.addChildren([overviewRoute, workersRoute, workerRoute, jobsRoute, jobRoute, environmentsRoute, auditRoute, tokensRoute])
 
 // Hash history: deep links survive any static host and never depend on server-side route fallback.
 const createAppRouter = () =>
@@ -145,10 +154,10 @@ function ConnectScreen({ error, onConnect }: { error: string; onConnect: (token:
         <div className="connect-brand"><span className="brand-mark"><Workflow size={19} /></span><span>YLCC</span></div>
         <div className="connect-icon"><LockKeyhole size={21} /></div>
         <h1>Connect to your Hub</h1>
-        <p className="connect-description">Enter the pool token configured for this Hub. Find its local file path with `ylcc dashboard`; it is never displayed by ylcc. Your dashboard reads status from this address.</p>
+        <p className="connect-description">Enter the pool token or a requester token issued with `ylcc tokens create`. Find its local file path with `ylcc dashboard`; it is never displayed by ylcc. Your dashboard reads status from this address.</p>
         <div className="endpoint-field"><span className="online-dot" />{window.location.origin}</div>
         <form onSubmit={submit} className="connect-form">
-          <label htmlFor="pool-token">Pool token</label>
+          <label htmlFor="pool-token">Hub token</label>
           <input
             id="pool-token"
             type="password"
@@ -174,18 +183,33 @@ function ConnectScreen({ error, onConnect }: { error: string; onConnect: (token:
 
 // ---------- Shell ----------
 
-const sectionLabels: Record<string, string> = { '': 'Overview', workers: 'Workers', jobs: 'Jobs', environments: 'Environments' }
+const sectionLabels: Record<string, string> = { '': 'Overview', workers: 'Workers', jobs: 'Jobs', environments: 'Environments', audit: 'Audit log', tokens: 'Tokens' }
+const roleLabels: Record<Role, string> = { admin: 'Admin', requester: 'Requester', worker: 'Worker' }
 
 function Shell() {
   const { disconnect } = rootRoute.useRouteContext()
-  const snapshot = useQuery(snapshotQuery)
+  const whoami = useQuery(whoamiQuery)
+  const principal = whoami.data
+  const workerToken = principal?.role === 'worker'
+  // Resolve the role first so a worker token gets an explanation instead of a generic error.
+  const snapshot = useQuery({ ...snapshotQuery, enabled: !whoami.isPending && !workerToken })
   const now = useNow()
   const pathname = useRouterState({ select: (state) => state.location.pathname })
   const [section = '', detail] = pathname.split('/').filter(Boolean)
 
   useEffect(() => {
     if (snapshot.error instanceof AuthError) disconnect(snapshot.error.message)
-  }, [snapshot.error, disconnect])
+    else if (whoami.error instanceof AuthError) disconnect(whoami.error.message)
+  }, [snapshot.error, whoami.error, disconnect])
+  if (workerToken) {
+    return (
+      <main className="connect-screen">
+        <EmptyState icon={<KeyRound />} title="This is a worker token" detail={`It lets worker ${principal.worker_id ?? ''} connect to the Hub but cannot view the pool. Use a requester or admin token for the dashboard.`}>
+          <Button variant="outline" size="sm" onClick={() => disconnect()}>Use another token</Button>
+        </EmptyState>
+      </main>
+    )
+  }
 
   const data = snapshot.data
   const failed = snapshot.isError && !(snapshot.error instanceof AuthError)
@@ -204,6 +228,12 @@ function Shell() {
           <NavLink to="/workers" icon={<Server />} label="Workers" count={data?.workers.length} />
           <NavLink to="/jobs" icon={<Activity />} label="Jobs" count={data?.jobs.length} />
           <NavLink to="/environments" icon={<Boxes />} label="Environments" count={data?.environments.length} />
+          {principal?.role === 'admin' && (
+            <>
+              <NavLink to="/audit" icon={<ScrollText />} label="Audit log" />
+              <NavLink to="/tokens" icon={<KeyRound />} label="Tokens" />
+            </>
+          )}
         </nav>
         <div className="sidebar-bottom">
           <div className="hub-card">
@@ -215,8 +245,8 @@ function Shell() {
             <span className={failed ? 'online-dot online-dot-error' : 'online-dot'} aria-label={failed ? 'Unreachable' : 'Connected'} />
           </div>
           <button className="account-button" onClick={() => disconnect()}>
-            <span className="account-avatar">Y</span>
-            <span className="account-copy"><strong>Pool session</strong><small>Disconnect and clear token</small></span>
+            <span className="account-avatar">{(principal?.name ?? 'Y').slice(0, 1).toUpperCase()}</span>
+            <span className="account-copy"><strong>{principal ? `${principal.name} · ${roleLabels[principal.role]}` : 'Hub session'}</strong><small>Disconnect and clear token</small></span>
             <LogOut size={15} aria-hidden="true" />
           </button>
         </div>
@@ -278,7 +308,7 @@ function Shell() {
   )
 }
 
-function NavLink({ to, icon, label, count, exact }: { to: '/' | '/workers' | '/jobs' | '/environments'; icon: ReactNode; label: string; count?: number; exact?: boolean }) {
+function NavLink({ to, icon, label, count, exact }: { to: '/' | '/workers' | '/jobs' | '/environments' | '/audit' | '/tokens'; icon: ReactNode; label: string; count?: number; exact?: boolean }) {
   return (
     <Link to={to} className="nav-button" activeProps={{ className: 'nav-button-active' }} activeOptions={{ exact, includeSearch: false }}>
       {icon}<span>{label}</span>{count !== undefined && <small>{count}</small>}
@@ -512,7 +542,7 @@ function JobsPage() {
       if (search.state && (search.state === 'active' ? !activeJobStates.has(job.state) : job.state !== search.state)) return false
       if (search.worker && job.worker_id !== search.worker) return false
       if (!needle) return true
-      return [job.id, job.state, job.worker_id ?? '', job.spec.environment ?? '', ...job.spec.command].join(' ').toLowerCase().includes(needle)
+      return [job.id, job.state, job.worker_id ?? '', job.spec.environment ?? '', job.submitted_by ?? '', ...job.spec.command].join(' ').toLowerCase().includes(needle)
     })
     .sort((a, b) => b.created_at - a.created_at)
   const filtering = Boolean(search.q || search.state || search.worker)
@@ -527,7 +557,7 @@ function JobsPage() {
             className="field field-search"
             type="search"
             aria-label="Search jobs"
-            placeholder="Search job, command, worker, environment"
+            placeholder="Search job, command, worker, environment, submitter"
             value={query}
             onChange={(event) => setQuery(event.target.value)}
           />
@@ -604,6 +634,7 @@ function JobPage() {
           <Detail label="Priority">{spec.priority ?? 0}</Detail>
           <Detail label="Timeout">{spec.timeout_secs ? `${spec.timeout_secs}s` : <span className="muted-text">None</span>}</Detail>
           <Detail label="Container">{spec.container ?? <span className="muted-text">None</span>}</Detail>
+          <Detail label="Submitted by">{job.submitted_by ?? <span className="muted-text">Not recorded</span>}</Detail>
         </dl>
       </section>
 
@@ -653,7 +684,7 @@ function JobsTable({ jobs }: { jobs: Job[] }) {
   const navigate = useNavigate()
   return (
     <div className="table-scroll"><table className="data-table jobs-table">
-      <thead><tr><th>Job</th><th>State</th><th>Command</th><th>Worker</th><th>Environment</th><th>Updated</th></tr></thead>
+      <thead><tr><th>Job</th><th>State</th><th>Command</th><th>Worker</th><th>Environment</th><th>Submitted by</th><th>Updated</th></tr></thead>
       <tbody>{jobs.map((job) => (
         <tr key={job.id} className="clickable-row" onClick={() => navigate({ to: '/jobs/$jobId', params: { jobId: job.id } })}>
           <td><Link className="table-link" to="/jobs/$jobId" params={{ jobId: job.id }}><code className="job-id">{job.id.slice(0, 8)}</code></Link></td>
@@ -663,6 +694,7 @@ function JobsTable({ jobs }: { jobs: Job[] }) {
             ? <Link className="table-link" to="/workers/$workerId" params={{ workerId: job.worker_id }} onClick={(event) => event.stopPropagation()}>{job.worker_id}</Link>
             : <span className="muted-text">Unassigned</span>}</td>
           <td>{job.spec.environment ?? <span className="muted-text">Native</span>}</td>
+          <td>{job.submitted_by ?? <span className="muted-text">—</span>}</td>
           <td className="time-cell"><RelativeTime timestamp={job.updated_at} /></td>
         </tr>
       ))}</tbody>
@@ -715,6 +747,73 @@ function InstallItem({ status }: { status: EnvironmentStatus }) {
       <StatusBadge state={status.state} />
       <Link className="table-link" to="/workers/$workerId" params={{ workerId: status.worker_id }}>{status.worker_id}</Link>
     </span>
+  )
+}
+
+// ---------- Access ----------
+
+function AdminOnly({ error }: { error: unknown }) {
+  return <EmptyState icon={<LockKeyhole />} title="Requires an admin token" detail={error instanceof ForbiddenError ? error.message : errorMessage(error)} />
+}
+
+function AuditPage() {
+  const audit = useQuery(auditQuery)
+  const events = audit.data ?? []
+  return (
+    <>
+      <PageHeading title="Audit log" description="Who changed what in the pool, newest first. Reads are not recorded." />
+      <section className="content-section">
+        <SectionHeading title="Recent events" detail={audit.data ? `${events.length} shown` : audit.isError ? 'Unavailable' : 'Loading'} />
+        {audit.isError ? <AdminOnly error={audit.error} /> : !audit.data ? <LoadingState compact /> : events.length ? (
+          <div className="table-scroll"><table className="data-table">
+            <thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Target</th><th>Detail</th></tr></thead>
+            <tbody>{events.map((event) => (
+              <tr key={event.seq}>
+                <td className="time-cell"><RelativeTime timestamp={event.at} /></td>
+                <td><strong>{event.actor}</strong> <Badge variant={event.role === 'admin' ? 'warning' : 'muted'}>{roleLabels[event.role]}</Badge></td>
+                <td><code>{event.action}</code></td>
+                <td><AuditTarget action={event.action} target={event.target} /></td>
+                <td className="truncate-cell" title={event.detail}>{event.detail ?? <span className="muted-text">—</span>}</td>
+              </tr>
+            ))}</tbody>
+          </table></div>
+        ) : <EmptyState icon={<ScrollText />} title="No events yet" detail="Token, job, worker and environment changes will appear here." />}
+      </section>
+    </>
+  )
+}
+
+function AuditTarget({ action, target }: { action: string; target: string }) {
+  if (action.startsWith('job.')) return <Link className="table-link" to="/jobs/$jobId" params={{ jobId: target }}><code>{target.slice(0, 8)}</code></Link>
+  if (action.startsWith('worker.')) return <Link className="table-link" to="/workers/$workerId" params={{ workerId: target }}>{target}</Link>
+  return <code>{target}</code>
+}
+
+function TokensPage() {
+  const tokens = useQuery(tokensQuery)
+  const list = [...(tokens.data ?? [])].sort((a, b) => Number(Boolean(a.revoked_at)) - Number(Boolean(b.revoked_at)) || b.created_at - a.created_at)
+  return (
+    <>
+      <PageHeading title="Tokens" description="Per-machine tokens. Create and revoke them with `ylcc tokens`; this page is read-only." />
+      <section className="content-section">
+        <SectionHeading title="Issued tokens" detail={tokens.data ? `${list.filter((token) => !token.revoked_at).length} active` : tokens.isError ? 'Unavailable' : 'Loading'} />
+        {tokens.isError ? <AdminOnly error={tokens.error} /> : !tokens.data ? <LoadingState compact /> : list.length ? (
+          <div className="table-scroll"><table className="data-table">
+            <thead><tr><th>Name</th><th>Role</th><th>Worker</th><th>Created</th><th>Last used</th><th>State</th></tr></thead>
+            <tbody>{list.map((token) => (
+              <tr key={token.id}>
+                <td><strong>{token.name}</strong> <code className="muted-text">{token.id}</code></td>
+                <td>{roleLabels[token.role]}</td>
+                <td>{token.worker_id ?? <span className="muted-text">—</span>}</td>
+                <td className="time-cell"><RelativeTime timestamp={token.created_at} /> <span className="muted-text">by {token.created_by}</span></td>
+                <td className="time-cell">{token.last_used_at ? <RelativeTime timestamp={token.last_used_at} /> : <span className="muted-text">Never</span>}</td>
+                <td>{token.revoked_at ? <Badge variant="muted">Revoked</Badge> : <Badge variant="success">Active</Badge>}</td>
+              </tr>
+            ))}</tbody>
+          </table></div>
+        ) : <EmptyState icon={<KeyRound />} title="No tokens issued" detail="Everyone uses the pool token. Run `ylcc tokens create` to issue per-machine tokens." />}
+      </section>
+    </>
   )
 }
 

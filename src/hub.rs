@@ -224,6 +224,23 @@ impl Store {
         self.db.execute("DELETE FROM workers WHERE id=?1", [id])?;
         Ok(())
     }
+    /// Removes an environment with its revisions, worker statuses and preparation logs.
+    /// Deleting a missing id succeeds so retries are idempotent; jobs that still use it block deletion.
+    fn delete_environment(&mut self, id: &str) -> Result<(), ApiError> {
+        if self.jobs()?.iter().any(|job| {
+            matches!(job.state.as_str(), "queued" | "assigned" | "running" | "cancelling")
+                && job.spec.environment.as_deref() == Some(id)
+        }) {
+            return Err(invalid("environment is used by queued or active jobs; wait or cancel them first"));
+        }
+        let tx = self.db.transaction().map_err(anyhow::Error::from)?;
+        tx.execute("DELETE FROM environments WHERE id=?1", [id]).map_err(anyhow::Error::from)?;
+        tx.execute("DELETE FROM environment_revisions WHERE id=?1", [id]).map_err(anyhow::Error::from)?;
+        tx.execute("DELETE FROM environment_status WHERE environment=?1", [id]).map_err(anyhow::Error::from)?;
+        tx.execute("DELETE FROM logs WHERE substr(job, 1, length(?1)) = ?1", [format!("environment:{id}:")]).map_err(anyhow::Error::from)?;
+        tx.commit().map_err(anyhow::Error::from)?;
+        Ok(())
+    }
 
     fn worker_settings(&self, worker: &WorkerInfo) -> Result<WorkerSettings> {
         Ok(self
@@ -942,6 +959,7 @@ fn router(state: Shared) -> Router {
             get(environments).post(upsert_environment),
         )
         .route("/v1/environments/status", get(statuses))
+        .route("/v1/environments/{id}", axum::routing::delete(delete_environment))
         .route("/v1/environments/{id}/prepare", post(prepare))
         .route("/v1/environments/{id}/logs", get(environment_logs))
         .route("/v1/worker/ws", get(worker_socket))
@@ -1051,9 +1069,7 @@ async fn workers(State(state): State<Shared>) -> ApiResult<Json<Vec<WorkerInfo>>
 }
 async fn delete_worker(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult<StatusCode> {
     let mut guard = lock(&state)?;
-    if guard.one::<WorkerInfo>("SELECT data FROM workers WHERE id=?1", &id)?.is_none() {
-        return Err(missing("worker").into());
-    }
+    // Deleting a missing worker succeeds so retries are idempotent.
     if guard.jobs().unwrap_or_default().into_iter().any(|job| {
         (job.state == "assigned" || job.state == "running") && job.worker_id.as_deref() == Some(&id)
     }) {
@@ -1216,6 +1232,11 @@ async fn environments(State(state): State<Shared>) -> ApiResult<Json<Vec<Environ
 }
 async fn statuses(State(state): State<Shared>) -> ApiResult<Json<Vec<EnvironmentStatus>>> {
     Ok(Json(lock(&state)?.statuses()?))
+}
+async fn delete_environment(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    identifier(&id).map_err(invalid)?;
+    lock(&state)?.delete_environment(&id)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 async fn environment_logs(
     State(state): State<Shared>,
@@ -1578,6 +1599,52 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn environment_delete_is_idempotent_and_waits_for_jobs() {
+        let (_dir, mut store) = test_store();
+        let (_session, _rx) = worker(&mut store, "one");
+        let state = Arc::new(Mutex::new(store));
+        let environment = Environment {
+            id: "native".into(),
+            revision: "v1".into(),
+            requirements: Requirements::default(),
+            setup: vec![],
+            verify: vec![],
+            image: None,
+            env: BTreeMap::new(),
+        };
+        assert!(
+            upsert_environment(State(state.clone()), Json(environment.clone()))
+                .await
+                .is_ok()
+        );
+        let job = lock(&state)
+            .unwrap()
+            .add_job(JobSpec {
+                environment: Some("native".into()),
+                ..spec()
+            })
+            .unwrap();
+        let blocked = delete_environment(State(state.clone()), Path("native".into()))
+            .await
+            .unwrap_err();
+        assert_eq!(blocked.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(job.state, "queued");
+        let cancelled = cancel(State(state.clone()), Path(job.id.clone())).await.unwrap();
+        assert_eq!(cancelled.0.state, "cancelled");
+        for _ in 0..2 {
+            assert_eq!(
+                delete_environment(State(state.clone()), Path("native".into()))
+                    .await
+                    .unwrap(),
+                StatusCode::NO_CONTENT
+            );
+        }
+        assert!(lock(&state).unwrap().environments().unwrap().is_empty());
+        // Re-registering the same recipe works; job history keeps revisions immutable for retries.
+        assert!(upsert_environment(State(state), Json(environment)).await.is_ok());
     }
 
     #[test]

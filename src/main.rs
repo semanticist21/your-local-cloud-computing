@@ -310,6 +310,10 @@ enum Envs {
     },
     /// List built-in presets usable as `uses: NAME@VERSION` in ylcc.yaml.
     Presets,
+    /// Remove an environment from the Hub catalogue; succeeds if it is already gone.
+    Delete {
+        id: String,
+    },
 }
 #[derive(Subcommand)]
 enum Services {
@@ -1031,6 +1035,11 @@ async fn execute() -> Result<()> {
                         .await?,
                     )
                 }
+                Envs::Delete { id } => {
+                    ylcc::client::segment(&id)?;
+                    c()?.delete(&format!("/v1/environments/{id}")).await?;
+                    print(&serde_json::json!({"deleted": id}))
+                }
                 Envs::Presets => print(
                     &ylcc::project::PRESETS
                         .iter()
@@ -1039,10 +1048,11 @@ async fn execute() -> Result<()> {
                 ),
                 Envs::Ensure { id, worker } => {
                     ylcc::client::segment(&id)?;
+                    let revision = c()?.get::<Vec<Environment>>("/v1/environments").await?.into_iter().find(|e| e.id == id).map(|e| e.revision);
                     let statuses = c()?.get::<Vec<EnvironmentStatus>>("/v1/environments/status").await?;
-                    let current = statuses.into_iter().find(|s| s.environment_id == *id);
-                    if current.as_ref().is_none_or(|s| s.state != "ready") {
-                        ylcc::client::segment(&id)?;
+                    // Reuse only the current revision already ready on the requested worker.
+                    let current = statuses.into_iter().find(|s| s.environment_id == id && s.worker_id == worker && Some(&s.revision) == revision.as_ref() && s.state == "ready");
+                    if current.is_none() {
                         let prepared = c()?.post::<_, Vec<EnvironmentStatus>>(&format!("/v1/environments/{id}/prepare"), &PrepareRequest { worker_id: Some(worker.clone()) }).await?;
                         print(&serde_json::json!({"environment": id, "action": "prepared", "statuses": prepared}))
                     } else {

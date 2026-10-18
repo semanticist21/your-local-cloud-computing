@@ -64,7 +64,7 @@ try {
     Invoke-Ylcc -Arguments @('jobs', 'cancel', $cancel.id) | Out-Null
     Wait-Until { (Invoke-Ylcc -Arguments @('jobs', 'show', $cancel.id)).state -eq 'cancelled' } 'cancelled job state' | Out-Null
     Wait-Until { -not (Get-Process -Id $childPid -ErrorAction SilentlyContinue) } 'owned child process termination' | Out-Null
-    @{sum=$answer.sum; job=$job.id; attempt=$job.attempt_id; inputHash=$job.spec.inputs[0].hash; resultHash=$job.results[0].hash; cancellation='passed'; worker='windows-container-test'} | ConvertTo-Json | Set-Content -LiteralPath 'C:\ylcc-data\proof.json' -Encoding UTF8
+    @{sum=$answer.sum; job=$job.id; attempt=$job.attempt_id; inputHash=$job.spec.inputs[0].hash; cancellation='passed'; worker='windows-container-test'} | ConvertTo-Json | Set-Content -LiteralPath 'C:\ylcc-data\proof.json' -Encoding UTF8
     Write-Host 'Windows container checks passed: ContainerUser, initialized token, real job, fetched result, source preservation, and descendant cancellation.'
 } catch {
     foreach ($name in @('hub.err', 'worker.err', 'cli.err')) {

@@ -2588,9 +2588,11 @@ fn rocm_accessible() -> bool {
 const LAST_USED: &str = "last-used";
 /// Retention follows common CI and cluster practice: GitHub Actions evicts caches unused for
 /// 7 days, and the kubelet frees images least recently used first once disk use passes 85%,
-/// until it is back under 80%.
+/// until it is back under 80%, sparing anything used within a minimum age so consecutive
+/// jobs on a disk filled by something else do not thrash.
 const ATTEMPT_RETENTION: Duration = Duration::from_secs(3 * 24 * 3600);
 const UNUSED_RETENTION: Duration = Duration::from_secs(7 * 24 * 3600);
+const MINIMUM_AGE: Duration = Duration::from_secs(3600);
 const DISK_HIGH: f64 = 0.85;
 const DISK_LOW: f64 = 0.80;
 /// A self-updated worker exits with this status so its service manager starts the new binary.
@@ -2733,7 +2735,8 @@ fn collect_garbage(state: &State, now: SystemTime, usage: &dyn Fn(&State) -> Res
     candidates.sort_by_key(|candidate| candidate.0);
     let mut pressure = usage(state)? > DISK_HIGH;
     for (used, path, kind) in candidates {
-        if !pressure && age(used) <= UNUSED_RETENTION {
+        let unused = age(used);
+        if unused <= MINIMUM_AGE || (!pressure && unused <= UNUSED_RETENTION) {
             break;
         }
         remove_tree(&path)?;
@@ -3046,7 +3049,7 @@ mod tests {
         let state = state_at(temp.path());
         let blobs = temp.path().join("blobs");
         let now = SystemTime::now();
-        for (name, hours) in [("old", 3), ("mid", 2), ("new", 1)] {
+        for (name, hours) in [("old", 4), ("mid", 3), ("new", 2)] {
             let file = File::create(blobs.join(name)).unwrap();
             file.set_modified(now - Duration::from_secs(hours * 3600)).unwrap();
         }
@@ -3054,6 +3057,11 @@ mod tests {
         collect_garbage(&state, now, &usage).unwrap();
         assert!(!blobs.join("old").exists());
         assert!(blobs.join("mid").exists() && blobs.join("new").exists());
+        let full = |_: &State| Ok(0.99);
+        let fresh = blobs.join("fresh");
+        fs::write(&fresh, "").unwrap();
+        collect_garbage(&state, now, &full).unwrap();
+        assert!(fresh.exists(), "anything used within the minimum age is spared");
     }
     #[tokio::test]
     async fn restart_marks_unfinished_unknown_and_duplicate_does_not_run() {

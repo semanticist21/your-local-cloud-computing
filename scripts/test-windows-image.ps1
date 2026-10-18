@@ -60,8 +60,8 @@ $journal = Get-Content -LiteralPath (Join-Path $attempt 'journal.json') -Raw | C
 if ($journal.report.job_id -ne $proof.job -or $journal.report.state -ne 'succeeded') { throw 'The completed attempt journal was lost.' }
 $inputBlob = Join-Path C:\ylcc-data\worker\blobs $proof.inputHash
 if ((Get-FileHash -LiteralPath $inputBlob -Algorithm SHA256).Hash -ne $proof.inputHash) { throw 'The cached input was lost or changed.' }
-if ((Get-FileHash -LiteralPath (Join-Path $attempt 'work\result.json') -Algorithm SHA256).Hash -ne $proof.resultHash) { throw 'The retained result was lost or changed.' }
-Write-Host 'Recreated Windows container retained the completed journal, input cache and result hashes.'
+if (Test-Path -LiteralPath (Join-Path $attempt 'work')) { throw 'The finished attempt checkout was not released.' }
+Write-Host 'Recreated Windows container retained the completed journal and input cache and released the checkout.'
 '@
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($proof))
     Invoke-Docker -Arguments (@('run', '--rm', '--isolation=process') + $mounts + @('--entrypoint', 'powershell.exe', $RuntimeImage, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded))

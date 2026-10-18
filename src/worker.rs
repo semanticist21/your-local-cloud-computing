@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -209,6 +209,7 @@ impl State {
                 .values()
                 .cloned()
                 .collect(),
+            version: crate::VERSION.into(),
         }
     }
 }
@@ -270,6 +271,19 @@ pub async fn run(
         events,
     });
     load_state(&state).await?;
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = fs::remove_file(previous_binary(&exe)); // left by the last self-update
+    }
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                collect_in_background(&state).await;
+            }
+        });
+    }
     let mut retry = 1;
     loop {
         match connection(state.clone()).await {
@@ -517,14 +531,28 @@ async fn connection(state: Arc<State>) -> Result<()> {
     loop {
         tokio::select! {
             value = source.next() => match value {
-                Some(Ok(Message::Text(text))) => match serde_json::from_str::<HubMessage>(&text)? {
-                    HubMessage::Run { job, environment } => accept(state.clone(), *job, environment)?,
-                    HubMessage::Cancel { job_id, attempt_id } => {
+                Some(Ok(Message::Text(text))) => match serde_json::from_str::<HubMessage>(&text) {
+                    Err(error) => eprintln!("ignored unsupported hub message: {error}"),
+                    Ok(HubMessage::Run { job, environment }) => accept(state.clone(), *job, environment)?,
+                    Ok(HubMessage::Cancel { job_id, attempt_id }) => {
                         let state = state.clone();
                         tokio::spawn(async move { if let Err(error) = request_cancel(&state, &job_id, &attempt_id).await { eprintln!("cancel reconciliation: {error:#}"); } });
                     }
-                    HubMessage::Prepare { environment } => {
+                    Ok(HubMessage::Prepare { environment }) => {
                         let state = state.clone(); tokio::spawn(async move { if let Err(e) = prepare(&state, &environment, true).await { eprintln!("environment preparation: {e:#}"); } });
+                    }
+                    Ok(HubMessage::Evict { environment_id }) => {
+                        let state = state.clone();
+                        tokio::spawn(async move { if let Err(e) = evict_environment(&state, &environment_id).await { eprintln!("environment eviction: {e:#}"); } });
+                    }
+                    Ok(HubMessage::Update { version }) => {
+                        let state = state.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = self_update(&state, &version).await {
+                                eprintln!("self-update to {version}: {error:#}");
+                                state.emit(WorkerMessage::UpdateFailed { error: format!("{error:#}") });
+                            }
+                        });
                     }
                 },
                 Some(Ok(Message::Ping(bytes))) => sink.send(Message::Pong(bytes)).await?,
@@ -631,7 +659,16 @@ fn accept(state: Arc<State>, job: Job, environment: Option<Environment>) -> Resu
             }
         });
         match outcome {
-            Ok(report) => state.emit(WorkerMessage::Finished { report }),
+            Ok(report) => {
+                let finished = report.state != "unknown";
+                state.emit(WorkerMessage::Finished { report });
+                // Outputs are uploaded and caches moved back; an unknown attempt may still run.
+                if finished {
+                    let dir = attempt.dir.clone();
+                    let _ = tokio::task::spawn_blocking(move || release_attempt_files(&dir)).await;
+                }
+                collect_in_background(&state).await;
+            }
             Err(error) => eprintln!("cannot persist attempt outcome: {error:#}"),
         }
     });
@@ -1228,8 +1265,18 @@ async fn run_attempt(
             prepare(state, environment, false).await?;
         }
     }
-    let _slot = tokio::select! { slot = state.slots.acquire() => slot?, _ = cancel.changed() => bail!("job cancelled") };
-    let _drain = tokio::select! { guard = state.drain.read() => guard, _ = cancel.changed() => bail!("job cancelled") };
+    let (_slot, _drain) = loop {
+        let slot = tokio::select! { slot = state.slots.acquire() => slot?, _ = cancel.changed() => bail!("job cancelled") };
+        let drain = tokio::select! { guard = state.drain.read() => guard, _ = cancel.changed() => bail!("job cancelled") };
+        // Garbage collection may have evicted the environment while this attempt waited.
+        match environment {
+            Some(environment) if !state.environments.lock().unwrap().contains_key(&env_key(&environment.id, &environment.revision)) => {
+                drop((drain, slot));
+                prepare(state, environment, false).await?;
+            }
+            _ => break (slot, drain),
+        }
+    };
     cancelled(&cancel)?;
     let env_dir = if let Some(environment) = environment {
         state.environment_dir(environment)?
@@ -1276,6 +1323,7 @@ async fn run_attempt(
             }
             return Err(error).context("environment drift detected before execution");
         }
+        let _ = fs::write(env_dir.join(LAST_USED), b"");
     }
     let workdir = attempt.dir.join("work");
     fs::create_dir(&workdir).context("create fresh attempt checkout")?;
@@ -1298,6 +1346,15 @@ async fn run_attempt(
     let mut values = expanded_env(environment, Some(&job.spec), &env_dir, path.as_deref());
     values.insert("YLCC_JOB_ID".into(), job.id.clone());
     values.insert("YLCC_ATTEMPT_ID".into(), job.attempt_id.clone());
+    if image.is_none() {
+        // A per-attempt temp directory is removed with the checkout, like a CI runner's temp.
+        let temp = attempt.dir.join("tmp");
+        private_dir(&temp)?;
+        let temp = temp.to_string_lossy().into_owned();
+        for name in ["TMPDIR", "TMP", "TEMP"] {
+            values.insert(name.into(), temp.clone());
+        }
+    }
     if let Some(image) = image.as_deref() {
         ensure!(
             job.spec
@@ -1494,6 +1551,7 @@ impl Drop for CacheLease<'_> {
             {
                 eprintln!("save cache {path}: {error}");
             }
+            let _ = fs::write(cache_marker(&stored), b"");
             self.state.caches.lock().unwrap().remove(key);
         }
     }
@@ -2478,6 +2536,246 @@ fn rocm_accessible() -> bool {
     }
 }
 
+const LAST_USED: &str = "last-used";
+/// Retention follows common CI and cluster practice: GitHub Actions evicts caches unused for
+/// 7 days, and the kubelet frees images least recently used first once disk use passes 85%,
+/// until it is back under 80%.
+const ATTEMPT_RETENTION: Duration = Duration::from_secs(3 * 24 * 3600);
+const UNUSED_RETENTION: Duration = Duration::from_secs(7 * 24 * 3600);
+const DISK_HIGH: f64 = 0.85;
+const DISK_LOW: f64 = 0.80;
+/// A self-updated worker exits with this status so its service manager starts the new binary.
+pub const RESTART_EXIT_CODE: i32 = 75;
+const RELEASES: &str = "https://github.com/semanticist21/your-local-cloud-computing/releases/download";
+
+fn cache_marker(stored: &Path) -> PathBuf {
+    stored.with_extension("used")
+}
+fn previous_binary(exe: &Path) -> PathBuf {
+    exe.with_extension("old")
+}
+fn modified(path: &Path) -> Option<SystemTime> {
+    fs::symlink_metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Removes a file or tree, including one a job left read-only (Go module caches, read-only
+/// Windows files). Links are removed, never followed.
+fn remove_tree(path: &Path) -> Result<()> {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if !metadata.is_dir() || crate::platform::is_link(&metadata) {
+        return match fs::remove_file(path).or_else(|_| fs::remove_dir(path)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error).with_context(|| format!("remove {}", path.display())),
+            _ => Ok(()),
+        };
+    }
+    if fs::remove_dir_all(path).is_ok() {
+        return Ok(());
+    }
+    make_writable(path);
+    match fs::remove_dir_all(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error).with_context(|| format!("remove {}", path.display())),
+        _ => Ok(()),
+    }
+}
+fn make_writable(path: &Path) {
+    let Ok(metadata) = fs::symlink_metadata(path) else { return };
+    if crate::platform::is_link(&metadata) {
+        return;
+    }
+    let mut permissions = metadata.permissions();
+    #[cfg(unix)]
+    if metadata.is_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(permissions.mode() | 0o700);
+        let _ = fs::set_permissions(path, permissions);
+    }
+    #[cfg(windows)]
+    {
+        permissions.set_readonly(false);
+        let _ = fs::set_permissions(path, permissions);
+    }
+    if metadata.is_dir() && let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            make_writable(&entry.path());
+        }
+    }
+}
+
+/// A finished attempt keeps only its journal, job spec and logs.
+fn release_attempt_files(dir: &Path) {
+    for name in ["work", "tmp", "environment"] {
+        if let Err(error) = remove_tree(&dir.join(name)) {
+            eprintln!("attempt cleanup: {error:#}");
+        }
+    }
+}
+
+async fn collect_in_background(state: &Arc<State>) {
+    let state = state.clone();
+    let usage = |state: &State| crate::platform::disk_usage(&state.data);
+    match tokio::task::spawn_blocking(move || collect_garbage(&state, SystemTime::now(), &usage)).await {
+        Ok(Err(error)) => eprintln!("garbage collection: {error:#}"),
+        Err(error) => eprintln!("garbage collection: {error}"),
+        Ok(Ok(())) => {}
+    }
+}
+
+enum Reclaimable {
+    Blob,
+    Cache,
+    Environment(Option<EnvironmentStatus>),
+}
+
+/// Runs only while the worker is idle (it holds the exclusive drain lock), so nothing it
+/// removes is in use. Expired entries always go; under disk pressure, oldest first.
+fn collect_garbage(state: &State, now: SystemTime, usage: &dyn Fn(&State) -> Result<f64>) -> Result<()> {
+    let Ok(_drain) = state.drain.try_write() else {
+        return Ok(());
+    };
+    let attempts: Vec<_> = state.attempts.lock().unwrap().iter().map(|(id, attempt)| (id.clone(), attempt.clone())).collect();
+    if attempts.iter().any(|(_, attempt)| matches!(attempt.report().state.as_str(), "assigned" | "running")) {
+        return Ok(());
+    }
+    let age = |time: Option<SystemTime>| time.and_then(|time| now.duration_since(time).ok()).unwrap_or_default();
+    for (id, attempt) in &attempts {
+        // An unknown attempt keeps its records so it can still be reconciled or cancelled.
+        if !matches!(attempt.report().state.as_str(), "succeeded" | "failed" | "cancelled") {
+            continue;
+        }
+        release_attempt_files(&attempt.dir);
+        if age(modified(&attempt.dir.join("journal.json"))) > ATTEMPT_RETENTION {
+            remove_tree(&attempt.dir)?;
+            state.attempts.lock().unwrap().remove(id);
+        }
+    }
+    let mut candidates = vec![];
+    for entry in fs::read_dir(state.data.join("blobs"))? {
+        let path = entry?.path();
+        candidates.push((modified(&path), path, Reclaimable::Blob));
+    }
+    for entry in fs::read_dir(state.data.join("caches"))? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|e| e == "used") {
+            if !path.with_extension("").exists() {
+                let _ = fs::remove_file(&path);
+            }
+            continue;
+        }
+        candidates.push((modified(&cache_marker(&path)).or(modified(&path)), path, Reclaimable::Cache));
+    }
+    for environment in fs::read_dir(state.data.join("environments"))? {
+        let environment = environment?.path();
+        if !environment.is_dir() {
+            continue;
+        }
+        for revision in fs::read_dir(&environment)? {
+            let path = revision?.path();
+            let used = modified(&path.join(LAST_USED)).max(modified(&path.join("status.json"))).or(modified(&path));
+            let key = path.strip_prefix(state.data.join("environments"))?.to_string_lossy().replace('\\', "/");
+            let status = state.environments.lock().unwrap().get(&key).cloned();
+            candidates.push((used, path, Reclaimable::Environment(status)));
+        }
+    }
+    candidates.sort_by_key(|candidate| candidate.0);
+    let mut pressure = usage(state)? > DISK_HIGH;
+    for (used, path, kind) in candidates {
+        if !pressure && age(used) <= UNUSED_RETENTION {
+            break;
+        }
+        remove_tree(&path)?;
+        match kind {
+            Reclaimable::Blob => {}
+            Reclaimable::Cache => {
+                let _ = fs::remove_file(cache_marker(&path));
+            }
+            Reclaimable::Environment(status) => {
+                if let Some(parent) = path.parent() {
+                    let _ = fs::remove_dir(parent); // only once its last revision is gone
+                }
+                if let Some(mut status) = status {
+                    state.environments.lock().unwrap().remove(&env_key(&status.environment_id, &status.revision));
+                    status.state = "evicted".into();
+                    status.error = None;
+                    state.emit(WorkerMessage::Environment { status });
+                }
+            }
+        }
+        eprintln!("reclaimed {}", path.display());
+        if pressure {
+            pressure = usage(state)? > DISK_LOW;
+        }
+    }
+    Ok(())
+}
+
+async fn evict_environment(state: &Arc<State>, id: &str) -> Result<()> {
+    identifier(id)?;
+    let _drain = state.drain.write().await;
+    state.environments.lock().unwrap().retain(|_, status| status.environment_id != id);
+    let dir = state.data.join("environments").join(id);
+    tokio::task::spawn_blocking(move || remove_tree(&dir)).await?
+}
+
+async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
+    let response = client.get(url).send().await?.error_for_status().with_context(|| format!("download {url}"))?;
+    Ok(response.bytes().await?.to_vec())
+}
+
+/// Replaces this worker's binary with a published release verified against its SHA256SUMS,
+/// waits until no attempt is active, and exits so the service manager restarts it.
+async fn self_update(state: &Arc<State>, version: &str) -> Result<()> {
+    ensure!(
+        version.len() <= 64 && version.strip_prefix('v').is_some_and(|v| !v.is_empty() && v.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'.' || c == b'-')),
+        "invalid release tag"
+    );
+    ensure!(!state.capabilities.containerized, "container workers update by recreating the container from the new image");
+    let exe = crate::platform::command_path(&std::env::current_exe()?.canonicalize()?);
+    let dir = exe.parent().context("worker binary has no directory")?;
+    let staging = tempfile::Builder::new().prefix(".ylcc-update-").tempdir_in(dir).with_context(|| {
+        format!("the worker account cannot write {}; install the worker binary in a directory it owns", dir.display())
+    })?;
+    let (os, arch) = (&state.capabilities.os, &state.capabilities.arch);
+    let (archive, binary) = if os == "windows" { (format!("ylcc-{os}-{arch}.zip"), "ylcc.exe") } else { (format!("ylcc-{os}-{arch}.tar.gz"), "ylcc") };
+    let base = std::env::var("YLCC_RELEASE_BASE_URL").unwrap_or_else(|_| RELEASES.into());
+    let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(20)).build()?;
+    let sums = String::from_utf8(download(&client, &format!("{base}/{version}/SHA256SUMS")).await?)?;
+    let expected = sums
+        .lines()
+        .find_map(|line| line.split_once(char::is_whitespace).filter(|(_, name)| name.trim_start_matches([' ', '*']) == archive).map(|(hash, _)| hash.to_owned()))
+        .with_context(|| format!("SHA256SUMS of {version} lists no {archive}"))?;
+    let bytes = download(&client, &format!("{base}/{version}/{archive}")).await?;
+    ensure!(hex::encode(Sha256::digest(&bytes)) == expected, "{archive} does not match SHA256SUMS");
+    let archive_path = staging.path().join(&archive);
+    fs::write(&archive_path, &bytes)?;
+    let extracted = Command::new("tar").arg("-xf").arg(&archive_path).arg("-C").arg(staging.path()).status().await?;
+    ensure!(extracted.success(), "cannot extract {archive}");
+    let new = staging.path().join(binary);
+    let output = Command::new(&new).arg("--version").output().await.context("run the downloaded binary")?;
+    let reported = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    ensure!(output.status.success() && reported == format!("ylcc {}", &version[1..]), "downloaded binary reports {reported:?}, not {version}");
+    // The Hub stops assigning work to a paused worker; wait out anything already accepted.
+    let _drain = loop {
+        let drain = state.drain.write().await;
+        if !state.attempts.lock().unwrap().values().any(|a| matches!(a.report().state.as_str(), "assigned" | "running")) {
+            break drain;
+        }
+        drop(drain);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    };
+    let previous = previous_binary(&exe);
+    let _ = fs::remove_file(&previous);
+    fs::rename(&exe, &previous).context("move the running binary aside")?;
+    if let Err(error) = fs::rename(&new, &exe) {
+        let _ = fs::rename(&previous, &exe);
+        return Err(error).context("install the new binary");
+    }
+    drop(staging);
+    eprintln!("updated to {version}; exiting for the service manager to restart");
+    std::process::exit(RESTART_EXIT_CODE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2629,6 +2927,79 @@ mod tests {
             journal: Mutex::new(journal),
             cancel,
         })
+    }
+    #[test]
+    fn garbage_collection_frees_finished_and_unused_files_only_when_idle() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = state_at(temp.path());
+        let mut events = state.events.subscribe();
+        let attempt = attempt_at(temp.path(), "done");
+        attempt.update(|journal| journal.report.state = "succeeded".into()).unwrap();
+        state.attempts.lock().unwrap().insert("done".into(), attempt.clone());
+        let locked = attempt.dir.join("work/locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("file"), "x").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        fs::create_dir(attempt.dir.join("tmp")).unwrap();
+        let blob = temp.path().join("blobs").join("a".repeat(64));
+        fs::write(&blob, "blob").unwrap();
+        let cache = temp.path().join("caches/key");
+        fs::create_dir(&cache).unwrap();
+        fs::write(cache_marker(&cache), "").unwrap();
+        let environment = temp.path().join("environments/env/rev");
+        fs::create_dir_all(&environment).unwrap();
+        fs::write(environment.join(LAST_USED), "").unwrap();
+        let status = EnvironmentStatus {
+            worker_id: "test".into(),
+            environment_id: "env".into(),
+            revision: "rev".into(),
+            state: "ready".into(),
+            error: None,
+        };
+        state.environments.lock().unwrap().insert(env_key("env", "rev"), status);
+
+        let idle = |_: &State| Ok(0.5);
+        collect_garbage(&state, SystemTime::now(), &idle).unwrap();
+        assert!(!attempt.dir.join("work").exists() && !attempt.dir.join("tmp").exists());
+        assert!(attempt.dir.join("journal.json").exists());
+        assert!(blob.exists() && cache.exists() && environment.exists());
+
+        let later = SystemTime::now() + Duration::from_secs(8 * 24 * 3600);
+        let busy = attempt_at(temp.path(), "busy");
+        state.attempts.lock().unwrap().insert("busy".into(), busy.clone());
+        collect_garbage(&state, later, &idle).unwrap();
+        assert!(blob.exists() && attempt.dir.exists(), "an active attempt blocks collection");
+
+        busy.update(|journal| journal.report.state = "unknown".into()).unwrap();
+        collect_garbage(&state, later, &idle).unwrap();
+        assert!(!attempt.dir.exists() && !state.attempts.lock().unwrap().contains_key("done"));
+        assert!(busy.dir.exists(), "an unknown attempt stays reconcilable");
+        assert!(!blob.exists() && !cache.exists() && !cache_marker(&cache).exists());
+        assert!(!temp.path().join("environments/env").exists());
+        assert!(state.environments.lock().unwrap().is_empty());
+        let WorkerMessage::Environment { status } = events.try_recv().unwrap() else {
+            panic!("expected an eviction status")
+        };
+        assert_eq!(status.state, "evicted");
+    }
+    #[test]
+    fn disk_pressure_evicts_least_recently_used_until_below_the_low_mark() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = state_at(temp.path());
+        let blobs = temp.path().join("blobs");
+        let now = SystemTime::now();
+        for (name, hours) in [("old", 3), ("mid", 2), ("new", 1)] {
+            let file = File::create(blobs.join(name)).unwrap();
+            file.set_modified(now - Duration::from_secs(hours * 3600)).unwrap();
+        }
+        let usage = |state: &State| Ok(if fs::read_dir(state.data.join("blobs")).unwrap().count() == 3 { 0.9 } else { 0.79 });
+        collect_garbage(&state, now, &usage).unwrap();
+        assert!(!blobs.join("old").exists());
+        assert!(blobs.join("mid").exists() && blobs.join("new").exists());
     }
     #[tokio::test]
     async fn restart_marks_unfinished_unknown_and_duplicate_does_not_run() {

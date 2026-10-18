@@ -651,6 +651,14 @@ impl Store {
         }
         identifier(&status.environment_id)?;
         identifier(&status.revision)?;
+        if status.state == "evicted" {
+            // The worker reclaimed the revision's disk space; the next job prepares it again.
+            self.db.execute(
+                "DELETE FROM environment_status WHERE worker=?1 AND environment=?2 AND revision=?3",
+                params![worker, status.environment_id, status.revision],
+            )?;
+            return Ok(());
+        }
         if !matches!(status.state.as_str(), "ready" | "failed" | "preparing") {
             bail!("invalid worker environment state")
         }
@@ -662,6 +670,7 @@ impl Store {
         }
         self.save_status(&status)
     }
+    #[allow(clippy::too_many_arguments)]
     fn connect(
         &mut self,
         id: String,
@@ -669,6 +678,7 @@ impl Store {
         max_jobs: usize,
         attempts: Vec<AttemptReport>,
         environments: Vec<EnvironmentStatus>,
+        version: String,
         tx: mpsc::UnboundedSender<HubMessage>,
     ) -> Result<Uuid> {
         identifier(&id)?;
@@ -699,6 +709,8 @@ impl Store {
             paused: settings.paused,
             online: true,
             last_seen: now(),
+            version,
+            update_error: None,
         })?;
         let reported: BTreeSet<_> = attempts
             .iter()
@@ -818,6 +830,12 @@ impl Store {
             WorkerMessage::Finished { report } => self.report(worker, report)?,
             WorkerMessage::Environment { status } => self.receive_status(worker, status)?,
             WorkerMessage::Heartbeat => {}
+            WorkerMessage::UpdateFailed { error } => {
+                if let Some(mut info) = self.one::<WorkerInfo>("SELECT data FROM workers WHERE id=?1", worker)? {
+                    info.update_error = Some(error);
+                    self.save_worker(&info)?;
+                }
+            }
         }
         if reschedule {
             self.schedule()?;
@@ -962,6 +980,7 @@ fn router(state: Shared) -> Router {
         .route("/v1/workers", get(workers))
         .route("/v1/workers/{id}", axum::routing::delete(delete_worker))
         .route("/v1/workers/{id}/control", post(control_worker))
+        .route("/v1/workers/{id}/update", post(update_worker))
         .route("/v1/blobs/missing", post(missing_blobs))
         .route("/v1/blobs/{hash}", put(put_blob).get(get_blob))
         .route("/v1/jobs", post(submit).get(jobs))
@@ -987,7 +1006,7 @@ fn router(state: Shared) -> Router {
             get(|| async {
                 Json(serde_json::json!({
                     "status":"ok",
-                    "version":env!("CARGO_PKG_VERSION"),
+                    "version":crate::VERSION,
                     "capabilities":["job_priority", "worker_control"]
                 }))
             }),
@@ -1100,6 +1119,38 @@ async fn control_worker(
     Json(control): Json<WorkerControl>,
 ) -> ApiResult<Json<WorkerInfo>> {
     Ok(Json(lock(&state)?.control_worker(&id, control)?))
+}
+async fn update_worker(
+    State(state): State<Shared>,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateRequest>,
+) -> ApiResult<Json<WorkerInfo>> {
+    let version = request.version;
+    if !version.starts_with('v')
+        || version.len() > 64
+        || !version[1..].bytes().all(|c| c.is_ascii_alphanumeric() || c == b'.' || c == b'-')
+    {
+        return Err(invalid("version must be a release tag such as v0.4.6"));
+    }
+    let mut store = lock(&state)?;
+    let mut worker = store
+        .one::<WorkerInfo>("SELECT data FROM workers WHERE id=?1", &id)?
+        .ok_or_else(|| missing("worker"))?;
+    if worker.capabilities.containerized {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "container workers update by recreating the container from the new release image".into(),
+        ));
+    }
+    let Some(session) = store.sessions.get(&id).filter(|_| worker.online) else {
+        return Err(ApiError(StatusCode::CONFLICT, "worker is offline".into()));
+    };
+    if session.tx.send(HubMessage::Update { version }).is_err() {
+        return Err(ApiError(StatusCode::CONFLICT, "worker connection closed".into()));
+    }
+    worker.update_error = None;
+    store.save_worker(&worker)?;
+    Ok(Json(worker))
 }
 async fn set_priority(
     State(state): State<Shared>,
@@ -1250,7 +1301,12 @@ async fn statuses(State(state): State<Shared>) -> ApiResult<Json<Vec<Environment
 }
 async fn delete_environment(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult<StatusCode> {
     identifier(&id).map_err(invalid)?;
-    lock(&state)?.delete_environment(&id)?;
+    let mut store = lock(&state)?;
+    store.delete_environment(&id)?;
+    // Offline workers miss this and reclaim the files through their unused-age collection.
+    for session in store.sessions.values() {
+        let _ = session.tx.send(HubMessage::Evict { environment_id: id.clone() });
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 async fn environment_logs(
@@ -1396,6 +1452,7 @@ async fn socket_loop(state: Shared, mut socket: WebSocket) {
         max_jobs,
         attempts,
         environments,
+        version,
     }) = serde_json::from_str(&text)
     else {
         return;
@@ -1408,6 +1465,7 @@ async fn socket_loop(state: Shared, mut socket: WebSocket) {
             max_jobs,
             attempts,
             environments,
+            version,
             tx,
         ),
         Err(_) => return,
@@ -1485,7 +1543,7 @@ mod tests {
     fn worker(store: &mut Store, id: &str) -> (Uuid, mpsc::UnboundedReceiver<HubMessage>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let session = store
-            .connect(id.into(), caps(), 1, vec![], vec![], tx)
+            .connect(id.into(), caps(), 1, vec![], vec![], String::new(), tx)
             .unwrap();
         (session, rx)
     }
@@ -1619,7 +1677,7 @@ mod tests {
     #[tokio::test]
     async fn environment_delete_is_idempotent_and_waits_for_jobs() {
         let (_dir, mut store) = test_store();
-        let (_session, _rx) = worker(&mut store, "one");
+        let (_session, mut rx) = worker(&mut store, "one");
         let state = Arc::new(Mutex::new(store));
         let environment = Environment {
             id: "native".into(),
@@ -1667,7 +1725,14 @@ mod tests {
                 state: "ready".into(),
                 error: None,
             };
-            assert!(store.receive_status("one", stale).is_err());
+            assert!(store.receive_status("one", stale.clone()).is_err());
+            let evicted = EnvironmentStatus { state: "evicted".into(), ..stale };
+            assert!(store.receive_status("one", evicted).is_ok());
+            let mut evicts = 0;
+            while let Ok(message) = rx.try_recv() {
+                evicts += matches!(message, HubMessage::Evict { ref environment_id } if environment_id == "native") as usize;
+            }
+            assert_eq!(evicts, 2, "each delete tells connected workers to free the files");
             let session = store.sessions["one"].id;
             let replayed = LogEntry {
                 job_id: "environment:native:v1".into(),
@@ -1785,7 +1850,7 @@ mod tests {
         let (dir, mut store) = test_store();
         let (tx, _rx) = mpsc::unbounded_channel();
         store
-            .connect("one".into(), caps(), 4, vec![], vec![], tx)
+            .connect("one".into(), caps(), 4, vec![], vec![], String::new(), tx)
             .unwrap();
         let info = store
             .control_worker(
@@ -1806,7 +1871,7 @@ mod tests {
         for (advertised, expected) in [(4, 3), (2, 2), (4, 3)] {
             let (tx, _rx) = mpsc::unbounded_channel();
             store
-                .connect("one".into(), caps(), advertised, vec![], vec![], tx)
+                .connect("one".into(), caps(), advertised, vec![], vec![], String::new(), tx)
                 .unwrap();
             let info = store.workers().unwrap().remove(0);
             assert!(info.paused);
@@ -1854,7 +1919,7 @@ mod tests {
         let (_dir, mut store) = test_store();
         let (tx, mut rx) = mpsc::unbounded_channel();
         store
-            .connect("one".into(), caps(), 2, vec![], vec![], tx)
+            .connect("one".into(), caps(), 2, vec![], vec![], String::new(), tx)
             .unwrap();
         let first = store.add_job(spec()).unwrap();
         let second = store.add_job(spec()).unwrap();
@@ -2004,6 +2069,7 @@ mod tests {
                 1,
                 vec![],
                 vec![],
+                String::new(),
                 tx,
             )
             .unwrap_err();
@@ -2022,6 +2088,7 @@ mod tests {
                 1,
                 vec![],
                 vec![],
+                String::new(),
                 tx,
             )
             .unwrap();
@@ -2164,6 +2231,8 @@ mod tests {
             paused: false,
             online: true,
             last_seen: now(),
+            version: String::new(),
+            update_error: None,
         };
         let mut job = spec();
         job.container = Some("example/image@sha256:abc".into());

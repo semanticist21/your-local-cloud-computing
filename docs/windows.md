@@ -62,7 +62,7 @@ Docker's restart policy manages the worker while the Windows container engine is
 
 ## Windows CLI and worker
 
-Windows support is new in the source checkout. Published **v0.2.0 has no Windows binary**; use a checkout containing this support until a Windows release is published. Native Windows x86_64 is supported; Windows arm64 release artifacts and a Windows Hub background service are not provided. The Hub can stay on Linux/macOS, but update it from this support checkout before connecting a Windows worker: the v0.2.0 Hub rejects Windows worker registrations. Windows uses the same outward HTTPS/WebSocket connection and shared token; SSH, WSL and Docker are not required.
+Releases include `ylcc-windows-x86_64.zip`. Native Windows x86_64 is supported; Windows arm64 release artifacts and a Windows Hub background service are not provided, so keep the Hub on Linux/macOS. Windows uses the same outward HTTPS/WebSocket connection and shared token; SSH, WSL and Docker are not required.
 
 To build from source, install [Rust's MSVC toolchain](https://rust-lang.org/tools/install/) and Visual Studio Build Tools with the C++ desktop workload and Windows SDK (SQLite is bundled). In PowerShell, from this checkout:
 
@@ -72,13 +72,13 @@ $ylcc = (Resolve-Path .\target\release\ylcc.exe).Path
 & $ylcc --version
 ```
 
-For a published Windows release, the installer detects x86_64, checks `SHA256SUMS` and validates the ZIP before installing to `$env:LOCALAPPDATA\Programs\ylcc\bin`. From the matching support checkout, replace `RELEASE_TAG` below with a published tag that includes the Windows ZIP (Windows assets are still pending):
+The installer detects x86_64, checks `SHA256SUMS` and validates the ZIP before installing to `$env:LOCALAPPDATA\Programs\ylcc\bin`. Replace `RELEASE_TAG` below with a published tag:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Version RELEASE_TAG
 ```
 
-`-ExecutionPolicy Bypass` applies only to that child process; it does not change your user or machine execution policy. Organization Group Policy can still restrict execution. The installer places the executable and licenses without changing PATH. Choose a release whose assets actually include `ylcc-windows-x86_64.zip`; the v0.2.0 assets do not. Keep the executable at its installed location after registering a background worker. Windows prevents replacing a running executable: drain jobs and stop/uninstall the worker task before upgrading, then reinstall it with the same ID/data directory.
+`-ExecutionPolicy Bypass` applies only to that child process; it does not change your user or machine execution policy. Organization Group Policy can still restrict execution. The installer places the executable and licenses without changing PATH. Keep the executable at its installed location after registering a background worker; upgrade it with `ylcc workers update` (see [Background services](services.md#updating-workers)).
 
 Transfer your existing pool token through your secure administration channel to `$env:APPDATA\ylcc\token`. Restrict its ACL to your user, SYSTEM and Administrators; `ylcc init` creates a protected token only when setting up a **new** pool. Do not generate a different token on a joining worker. Then configure and start:
 

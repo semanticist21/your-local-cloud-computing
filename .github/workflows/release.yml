@@ -1,11 +1,43 @@
 name: Release
+# Cargo.toml's version is the only release input: a commit on main that changes it to an
+# unreleased version gets tagged and published here (scripts/release.py makes that commit).
 on:
   push:
-    tags: ['v[0-9]*']
+    branches: [main]
+    paths: [Cargo.toml]
+  workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: release
+  cancel-in-progress: false
+env:
+  YLCC_RELEASE: '1'
 jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Select an unreleased package version
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 scripts/release.py --check
+          tag="v$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          tagged="$(git ls-remote origin "refs/tags/$tag" "refs/tags/$tag^{}" | awk '{print $1}' | tail -n 1)"
+          if [ -n "$tagged" ] && [ "$tagged" != "$GITHUB_SHA" ]; then
+            echo "$tag already tags $tagged; bump Cargo.toml with scripts/release.py" >&2; exit 1
+          fi
+          if [ "$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null)" = false ]; then
+            echo "$tag is already published"; exit 0
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
   build:
+    needs: version
+    if: needs.version.outputs.tag != ''
     strategy:
       fail-fast: false
       matrix:
@@ -33,12 +65,6 @@ jobs:
         run: rustup update stable --no-self-update && rustup default stable && rustup target add '${{ matrix.target }}' && rustup component add rust-docs
       - name: Build dashboard assets
         run: npm ci --prefix dashboard && npm run build --prefix dashboard
-      - name: Check release tag matches package version
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
-          test "$RELEASE_TAG" = "v$version"
       - name: Test and build on the target architecture
         env:
           CC: ${{ matrix.os == 'linux' && 'gcc' || 'clang' }}
@@ -62,6 +88,8 @@ jobs:
           path: ylcc-*.tar.gz
           if-no-files-found: error
   build-windows:
+    needs: version
+    if: needs.version.outputs.tag != ''
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -76,13 +104,6 @@ jobs:
           rustup component add rust-docs
       - name: Build dashboard assets
         run: npm ci --prefix dashboard; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; npm run build --prefix dashboard; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Check release tag matches package version
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if ($env:RELEASE_TAG -ne "v$($metadata.packages[0].version)") { throw 'Release tag does not match the package version.' }
       - run: cargo fetch --locked
       - run: python scripts/generate-notices.py --output THIRD_PARTY_NOTICES.txt
       - run: cargo test --locked --target x86_64-pc-windows-msvc
@@ -183,7 +204,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           docker push ghcr.io/semanticist21/your-local-cloud-computing:sha-${{ github.sha }}-windows-ltsc2022
   publish:
-    needs: [build, build-windows, image, image-windows]
+    needs: [version, build, build-windows, image, image-windows]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -204,7 +225,7 @@ jobs:
       - name: Publish immutable-version image manifest and draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
         run: |
           test "${RELEASE_TAG#v}" != "$RELEASE_TAG"
           version="${RELEASE_TAG#v}"
@@ -214,5 +235,8 @@ jobs:
           docker buildx imagetools create --prefer-index=false -t "ghcr.io/semanticist21/your-local-cloud-computing:$version-windows-ltsc2022" \
             'ghcr.io/semanticist21/your-local-cloud-computing:sha-${{ github.sha }}-windows-ltsc2022'
           (cd dist && sha256sum ylcc-*.tar.gz ylcc-*.zip > SHA256SUMS)
+          if [ "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>/dev/null)" = true ]; then
+            gh release delete "$RELEASE_TAG" --yes
+          fi
           gh release create "$RELEASE_TAG" dist/ylcc-*.tar.gz dist/ylcc-*.zip dist/SHA256SUMS \
-            --draft --verify-tag --title "$RELEASE_TAG" --generate-notes
+            --target "$GITHUB_SHA" --title "$RELEASE_TAG" --generate-notes

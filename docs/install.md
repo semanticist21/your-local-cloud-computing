@@ -31,4 +31,4 @@ install -m 755 "$YLCC_SUPPORT_DIR/target/release/ylcc" "$HOME/.local/bin/ylcc"
 
 ## Updating an existing installation
 
-Run installer with desired version; config/token/data are preserved.
+Run installer with desired version; config/token/data are preserved. Update background workers with [`ylcc workers update`](services.md#updating-workers).

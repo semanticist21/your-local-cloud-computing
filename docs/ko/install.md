@@ -31,4 +31,4 @@ install -m 755 "$YLCC_SUPPORT_DIR/target/release/ylcc" "$HOME/.local/bin/ylcc"
 
 ## 기존 설치 업데이트
 
-원하는 버전으로 설치 스크립트를 다시 실행하세요. 설정/토큰/데이터는 보존됩니다.
+원하는 버전으로 설치 스크립트를 다시 실행하세요. 설정/토큰/데이터는 보존됩니다. 백그라운드 워커는 [`ylcc workers update`](services.md#워커-업데이트)로 업데이트하세요.

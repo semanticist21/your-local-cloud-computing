@@ -11,7 +11,7 @@ use ylcc::{client::Client, model::*, platform, project::Project, snapshot};
 
 #[derive(Parser)]
 #[command(
-    version,
+    version = ylcc::VERSION,
     about = "Run workloads across your own Linux, macOS and Windows machines"
 )]
 struct Cli {
@@ -249,6 +249,20 @@ enum Workers {
     Delete {
         id: String,
     },
+    /// Replace native workers' binaries with a published release, one worker at a time.
+    /// Each worker is paused, finishes its running jobs, restarts on the new binary and is resumed.
+    Update {
+        ids: Vec<String>,
+        /// Every online native worker; container workers are skipped (recreate them from the new image).
+        #[arg(long, conflicts_with = "ids")]
+        all: bool,
+        /// Release tag such as v0.4.6; defaults to the newest published release.
+        #[arg(long)]
+        version: Option<String>,
+        /// Seconds to wait for each worker to drain, update and reconnect.
+        #[arg(long, default_value_t = 3600)]
+        timeout_secs: u64,
+    },
 }
 fn parse_max_jobs(value: &str) -> std::result::Result<usize, String> {
     let value = value
@@ -388,7 +402,7 @@ async fn resolve_latest_release_version() -> Result<String> {
     let response = client
         .get(&api_url)
         .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", format!("ylcc/{}", env!("CARGO_PKG_VERSION")))
+        .header("User-Agent", format!("ylcc/{}", ylcc::VERSION))
         .send()
         .await
         .context("failed to query GitHub releases")?;
@@ -401,6 +415,92 @@ async fn resolve_latest_release_version() -> Result<String> {
         .context("GitHub did not return tag_name")?
         .to_string();
     Ok(tag)
+}
+
+async fn update_workers(client: &Client, ids: Vec<String>, all: bool, version: Option<String>, timeout_secs: u64) -> Result<()> {
+    if ids.is_empty() && !all {
+        bail!("name worker IDs or pass --all")
+    }
+    let version = match version {
+        Some(version) => version,
+        None => resolve_latest_release_version().await?,
+    };
+    if !valid_release_version(&version) {
+        bail!("invalid release version; expected a tag such as v0.4.6")
+    }
+    let target = version.trim_start_matches('v');
+    let workers = client.get::<Vec<WorkerInfo>>("/v1/workers").await?;
+    let selected: Vec<_> = if all {
+        workers.iter().filter(|w| w.online).collect()
+    } else {
+        ids.iter()
+            .map(|id| workers.iter().find(|w| &w.id == id).with_context(|| format!("unknown worker {id}")))
+            .collect::<Result<_>>()?
+    };
+    let mut results = vec![];
+    let mut failed = false;
+    for worker in selected {
+        let mut result = serde_json::json!({"worker": worker.id, "from": worker.version, "to": target});
+        let outcome = if worker.version == target {
+            Ok("current")
+        } else if worker.capabilities.containerized {
+            Ok("skipped: container worker; recreate it from the new release image")
+        } else {
+            eprintln!("updating {} to {version}", worker.id);
+            update_worker(client, worker, &version, std::time::Duration::from_secs(timeout_secs)).await.map(|()| "updated")
+        };
+        match outcome {
+            Ok(state) => result["state"] = state.into(),
+            Err(error) => {
+                failed = true;
+                result["state"] = "failed".into();
+                result["error"] = format!("{error:#}").into();
+            }
+        }
+        results.push(result);
+        if failed {
+            break; // a rolling update stops at the first failure
+        }
+    }
+    print(&results)?;
+    if failed {
+        bail!("worker update failed")
+    }
+    Ok(())
+}
+
+async fn update_worker(client: &Client, worker: &WorkerInfo, version: &str, timeout: std::time::Duration) -> Result<()> {
+    ylcc::client::segment(&worker.id)?;
+    let control = |paused| WorkerControl { paused: Some(paused), max_jobs: None };
+    let path = format!("/v1/workers/{}", worker.id);
+    if !worker.paused {
+        client.post::<_, WorkerInfo>(&format!("{path}/control"), &control(true)).await?;
+    }
+    let result = async {
+        client
+            .post::<_, WorkerInfo>(&format!("{path}/update"), &UpdateRequest { version: version.into() })
+            .await
+            .context("request the update; the Hub must run ylcc 0.4.6 or newer")?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let current = client.get::<Vec<WorkerInfo>>("/v1/workers").await?.into_iter().find(|w| w.id == worker.id).context("worker disappeared")?;
+            if let Some(error) = current.update_error {
+                bail!("{error}")
+            }
+            if current.online && current.version == version.trim_start_matches('v') {
+                return Ok(());
+            }
+            if std::time::Instant::now() > deadline {
+                bail!("timed out; the worker reports version {:?}", current.version)
+            }
+        }
+    }
+    .await;
+    if !worker.paused {
+        client.post::<_, WorkerInfo>(&format!("{path}/control"), &control(false)).await?;
+    }
+    result
 }
 
 async fn update_release(
@@ -468,7 +568,7 @@ async fn update_release(
                 }
             }
             print(&serde_json::json!({
-                "current_version": env!("CARGO_PKG_VERSION"),
+                "current_version": ylcc::VERSION,
                 "target_version": version.trim_start_matches('v'),
                 "preserved": ["config.json", "token file", "results_dir", "worker data", "hub data", "background service IDs unless you reinstall"],
                 "command": command,
@@ -939,6 +1039,9 @@ async fn execute() -> Result<()> {
                     client.delete(&format!("/v1/workers/{}", id)).await?;
                     return print(&serde_json::json!({"deleted": id}));
                 }
+                Some(Workers::Update { ids, all, version, timeout_secs }) => {
+                    return update_workers(&client, ids, all, version, timeout_secs).await;
+                }
             };
             ylcc::client::segment(&id)?;
             print(
@@ -1145,7 +1248,7 @@ async fn execute() -> Result<()> {
         Commands::Doctor => {
             let mut diag = diagnostics(&hub, &token, ylcc::worker::probe().await?).await?;
             if let serde_json::Value::Object(map) = &mut diag {
-                map.insert("ylcc_version".into(), serde_json::Value::String(env!("CARGO_PKG_VERSION").into()));
+                map.insert("ylcc_version".into(), serde_json::Value::String(ylcc::VERSION.into()));
                 map.insert("config_file".into(), serde_json::Value::String(config_path().display().to_string()));
                 map.insert("token_file".into(), serde_json::Value::String(token.display().to_string()));
                 map.insert("results_dir".into(), serde_json::Value::String(results.display().to_string()));

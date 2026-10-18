@@ -131,4 +131,4 @@ Next, see [Running jobs](docs/jobs.md) for detached jobs, results and input rule
 
 ## License
 
-YLCC is independently implemented under the [MIT license](LICENSE). It does not incorporate RCH code. v0.2.0 does not include MCP, a registry, peer-to-peer data transfer, an automatic retry engine, or scheduling reservations for unrelated CI jobs.
+YLCC is independently implemented under the [MIT license](LICENSE). It does not incorporate RCH code. YLCC does not include MCP, a registry, peer-to-peer data transfer, an automatic retry engine, or scheduling reservations for unrelated CI jobs.

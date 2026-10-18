@@ -243,6 +243,11 @@ pub struct WorkerInfo {
     pub paused: bool,
     pub online: bool,
     pub last_seen: u64,
+    /// The worker binary's `ylcc --version`, empty for workers older than 0.4.6.
+    #[serde(default)]
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_error: Option<String>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -310,6 +315,8 @@ pub enum WorkerMessage {
         max_jobs: usize,
         attempts: Vec<AttemptReport>,
         environments: Vec<EnvironmentStatus>,
+        #[serde(default)]
+        version: String,
     },
     Started {
         job_id: String,
@@ -325,6 +332,10 @@ pub enum WorkerMessage {
         status: EnvironmentStatus,
     },
     Heartbeat,
+    /// A requested self-update did not replace the binary; the worker keeps running.
+    UpdateFailed {
+        error: String,
+    },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -340,6 +351,19 @@ pub enum HubMessage {
     Prepare {
         environment: Environment,
     },
+    /// The environment was deleted from the catalogue; remove every local revision.
+    Evict {
+        environment_id: String,
+    },
+    /// Replace the worker binary with this published release tag, then restart.
+    Update {
+        version: String,
+    },
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateRequest {
+    pub version: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MissingBlobs {

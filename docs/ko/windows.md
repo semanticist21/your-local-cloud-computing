@@ -62,7 +62,7 @@ Windows 컨테이너 엔진이 실행 중인 동안에는 Docker의 재시작 �
 
 ## Windows CLI와 워커
 
-Windows 지원은 소스 체크아웃에 새로 추가되었습니다. 게시된 **v0.2.0에는 Windows 바이너리가 없습니다**. Windows 릴리스가 게시될 때까지 이 지원이 포함된 체크아웃을 쓰세요. 네이티브 Windows x86_64를 지원하며, Windows arm64 릴리스 아티팩트와 Windows 허브 백그라운드 서비스는 제공하지 않습니다. 허브는 Linux/macOS에 그대로 둘 수 있지만, Windows 워커를 연결하기 전에 이 지원 체크아웃으로 허브를 업데이트하세요. v0.2.0 허브는 Windows 워커 등록을 거부합니다. Windows도 같은 바깥 방향 HTTPS/WebSocket 연결과 공유 토큰을 쓰며, SSH, WSL, Docker는 필요하지 않습니다.
+릴리스에는 `ylcc-windows-x86_64.zip`이 포함됩니다. 네이티브 Windows x86_64를 지원하며, Windows arm64 릴리스 아티팩트와 Windows 허브 백그라운드 서비스는 제공하지 않으므로 허브는 Linux/macOS에 두세요. Windows도 같은 바깥 방향 HTTPS/WebSocket 연결과 공유 토큰을 쓰며, SSH, WSL, Docker는 필요하지 않습니다.
 
 소스에서 빌드하려면 [Rust MSVC 툴체인](https://rust-lang.org/tools/install/)과, C++ 데스크톱 워크로드 및 Windows SDK가 포함된 Visual Studio Build Tools를 설치하세요(SQLite는 번들로 포함됩니다). PowerShell에서 이 체크아웃 위치에서:
 
@@ -72,13 +72,13 @@ $ylcc = (Resolve-Path .\target\release\ylcc.exe).Path
 & $ylcc --version
 ```
 
-게시된 Windows 릴리스의 경우, 설치 스크립트가 x86_64를 감지하고 `SHA256SUMS`를 확인하며 ZIP을 검증한 뒤 `$env:LOCALAPPDATA\Programs\ylcc\bin`에 설치합니다. 버전이 맞는 지원 체크아웃에서, 아래 `RELEASE_TAG`를 Windows ZIP이 포함된 게시 태그로 바꾸세요(Windows 에셋은 아직 게시 전입니다).
+설치 스크립트는 x86_64를 감지하고 `SHA256SUMS`를 확인하며 ZIP을 검증한 뒤 `$env:LOCALAPPDATA\Programs\ylcc\bin`에 설치합니다. 아래 `RELEASE_TAG`를 게시된 태그로 바꾸세요.
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Version RELEASE_TAG
 ```
 
-`-ExecutionPolicy Bypass`는 그 자식 프로세스에만 적용되며 사용자나 머신의 실행 정책을 바꾸지 않습니다. 조직의 그룹 정책은 여전히 실행을 제한할 수 있습니다. 설치 스크립트는 PATH를 바꾸지 않고 실행 파일과 라이선스만 배치합니다. 에셋에 실제로 `ylcc-windows-x86_64.zip`이 포함된 릴리스를 고르세요. v0.2.0 에셋에는 없습니다. 백그라운드 워커를 등록한 뒤에는 실행 파일을 설치된 위치에 그대로 두세요. Windows는 실행 중인 실행 파일의 교체를 막습니다. 업그레이드 전에는 잡을 비우고 워커 태스크를 중지/제거한 다음, 같은 ID와 데이터 디렉터리로 다시 설치하세요.
+`-ExecutionPolicy Bypass`는 그 자식 프로세스에만 적용되며 사용자나 머신의 실행 정책을 바꾸지 않습니다. 조직의 그룹 정책은 여전히 실행을 제한할 수 있습니다. 설치 스크립트는 PATH를 바꾸지 않고 실행 파일과 라이선스만 배치합니다. 백그라운드 워커를 등록한 뒤에는 실행 파일을 설치된 위치에 그대로 두고, 업그레이드는 `ylcc workers update`로 하세요([백그라운드 서비스](services.md#워커-업데이트) 참고).
 
 기존 풀 토큰을 안전한 관리 채널로 `$env:APPDATA\ylcc\token`에 옮깁니다. ACL은 본인 사용자, SYSTEM, Administrators로 제한하세요. `ylcc init`은 **새** 풀을 설정할 때만 보호된 토큰을 만듭니다. 합류하는 워커에서 다른 토큰을 생성하지 마세요. 그다음 설정하고 시작합니다.
 

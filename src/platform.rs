@@ -227,6 +227,26 @@ pub fn replace_file(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Fraction (0..=1) of the filesystem holding `path` that is in use, as `df` reports it.
+pub fn disk_usage(path: &Path) -> Result<f64> {
+    #[cfg(unix)]
+    let (available, total) = {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        ensure!(
+            unsafe { libc::statvfs(path.as_ptr(), &mut stat) } == 0,
+            "statvfs: {}",
+            std::io::Error::last_os_error()
+        );
+        (stat.f_bavail as f64 * stat.f_frsize as f64, stat.f_blocks as f64 * stat.f_frsize as f64)
+    };
+    #[cfg(windows)]
+    let (available, total) = windows::disk_space(path)?;
+    ensure!(total > 0.0, "filesystem reports no capacity");
+    Ok(1.0 - available / total)
+}
+
 pub fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     File::open(path)?.sync_all()?;
@@ -566,6 +586,16 @@ mod windows {
             info.nFileIndexHigh,
             info.nFileIndexLow,
         ))
+    }
+    pub(super) fn disk_space(path: &Path) -> Result<(f64, f64)> {
+        let (mut available, mut total) = (0u64, 0u64);
+        ensure!(
+            unsafe { GetDiskFreeSpaceExW(wide(path)?.as_ptr(), &mut available, &mut total, null_mut()) } != 0,
+            "disk space of {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+        Ok((available as f64, total as f64))
     }
     pub(super) fn replace_file(source: &Path, destination: &Path) -> Result<()> {
         ensure!(

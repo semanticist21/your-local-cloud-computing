@@ -942,11 +942,12 @@ fn windows_runner(args: &[String], directory: &Path, path: &str, log: &Path) -> 
         .collect::<Result<Vec<_>>>()?
         .join(", ");
     Ok(format!(
-        "$ErrorActionPreference = 'Stop'\r\n$env:PATH = {}\r\nSet-Location -LiteralPath {}\r\n$ylccArgs = @({args})\r\n$ErrorActionPreference = 'Continue'\r\n& {} @ylccArgs >> {} 2>&1\r\nexit $LASTEXITCODE\r\n",
+        "$ErrorActionPreference = 'Stop'\r\n$env:PATH = {}\r\nSet-Location -LiteralPath {}\r\n$ylccArgs = @({args})\r\n$ErrorActionPreference = 'Continue'\r\ndo {{ & {} @ylccArgs >> {} 2>&1 }} while ($LASTEXITCODE -eq {restart})\r\nexit $LASTEXITCODE\r\n",
         powershell_literal(path)?,
         powershell_literal(&directory.to_string_lossy())?,
         powershell_literal(executable)?,
         powershell_literal(&log.to_string_lossy())?,
+        restart = crate::worker::RESTART_EXIT_CODE,
     ))
 }
 

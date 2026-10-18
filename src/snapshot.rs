@@ -165,7 +165,11 @@ pub fn create(root: &Path, inputs: &[PathBuf], whole: bool) -> Result<Snapshot> 
     if whole {
         dirs.push(PathBuf::new());
     }
+    let mut expanded = Vec::new();
     for p in inputs {
+        expanded.extend(expand_wildcard(&root, p)?);
+    }
+    for p in &expanded {
         let abs = if p.is_absolute() {
             platform::command_path(p)
         } else {
@@ -295,6 +299,41 @@ pub fn create(root: &Path, inputs: &[PathBuf], whole: bool) -> Result<Snapshot> 
     })
 }
 
+/// `dir/*.dylib`: a `*` in the last component selects the matching regular files in `dir`
+/// (not recursively). Like a named file, a match is included even when Git ignores it.
+fn expand_wildcard(root: &Path, input: &Path) -> Result<Vec<PathBuf>> {
+    let pattern = input.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let abs = if input.is_absolute() { input.to_path_buf() } else { root.join(input) };
+    if !pattern.contains('*') || fs::symlink_metadata(&abs).is_ok() {
+        return Ok(vec![input.to_path_buf()]);
+    }
+    let parent = input.parent().unwrap_or(Path::new(""));
+    let mut matches = vec![];
+    for entry in fs::read_dir(root.join(parent)).with_context(|| format!("input {}", input.display()))? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() && entry.file_name().to_str().is_some_and(|name| wildcard(pattern, name)) {
+            matches.push(parent.join(entry.file_name()));
+        }
+    }
+    anyhow::ensure!(!matches.is_empty(), "input {} matches no files", input.display());
+    matches.sort();
+    Ok(matches)
+}
+fn wildcard(pattern: &str, name: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let first = parts.next().unwrap_or_default();
+    let Some(mut rest) = name.strip_prefix(first) else { return false };
+    let mut parts: Vec<_> = parts.collect();
+    let last = parts.pop().unwrap_or_default();
+    for part in parts {
+        match rest.find(part) {
+            Some(index) => rest = &rest[index + part.len()..],
+            None => return false,
+        }
+    }
+    rest.len() >= last.len() && rest.ends_with(last)
+}
+
 pub fn hash_file(path: &Path) -> Result<String> {
     let mut f = File::open(path)?;
     let mut h = Sha256::new();
@@ -408,6 +447,11 @@ mod tests {
         );
         let explicit = create(d.path(), &["ignored".into()], false).unwrap();
         assert_eq!(explicit.files.len(), 1);
+        let pattern = create(d.path(), &["ign*d".into()], false).unwrap();
+        assert_eq!(pattern.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["ignored"]);
+        assert!(create(d.path(), &["*.none".into()], false).is_err());
+        assert!(wildcard("lib*.dylib", "libavcodec.63.dylib") && wildcard("*-arm64", "x-arm64"));
+        assert!(!wildcard("lib*.dylib", "libx.so") && !wildcard("a*a", "a"));
     }
     #[test]
     fn no_stale_deleted_file_or_symlink() {

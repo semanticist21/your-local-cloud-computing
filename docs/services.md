@@ -23,7 +23,7 @@ sudo /absolute/path/to/ylcc --hub https://HUB.example.ts.net:10000 \
   --data-dir /absolute/persistent-volume/ylcc/worker
 ```
 
-Service installation captures the current executable location and native user's `PATH`; keep the binary there. System-user macOS installs set a user-specific `HOME` and a standard tool path. After changing tool paths, reinstall the service and verify capabilities under the service account. Updates should wait until active jobs finish before restarting a worker. Never replace running environments mid-job.
+Service installation captures the current executable location and native user's `PATH`; keep the binary there. System-user macOS installs set a user-specific `HOME` and a standard tool path. After changing tool paths, reinstall the service and verify capabilities under the service account.
 
 Keep launchd stdout/stderr logs on the internal system volume, separate from external job data. macOS can reject opening log paths on removable volumes before starting the executable, producing `posix_spawn: Operation not permitted` or `EX_CONFIG` (78) without a worker log. Check the plist's `StandardOutPath`/`StandardErrorPath` and `launchctl print` when diagnosing this failure; readable external tokens and a valid working directory do not establish that launchd can open those log paths.
 
@@ -36,3 +36,23 @@ macOS [file-access privacy controls](https://support.apple.com/en-nz/guide/secur
 For a standalone native worker denied removable-volume access, a Mac administrator can open **System Settings → Privacy & Security → Full Disk Access**, click **+**, add the installed `ylcc` executable at the fixed path used by the service plist (for example `/usr/local/bin/ylcc`), and enable it. Restart the worker and verify external-data writes and a real job through that LaunchDaemon. Use the macOS approval UI; leave TCC databases and SIP settings untouched. After updating an unsigned or ad-hoc-signed executable, re-check access in the actual service context.
 
 Remove the user service with `ylcc service uninstall --role worker` (or `hub`). This retains tokens and workload data; remove those explicitly only when no longer needed. System-user LaunchDaemon removal uses `service uninstall --role worker --system-user SERVICE_USER` as an administrator.
+
+## Updating workers
+
+```bash
+ylcc workers update --all                      # newest published release, one worker at a time
+ylcc workers update mac-build --version v0.4.6
+```
+
+Each worker is paused, finishes its running jobs, downloads the release archive for its OS/architecture, checks it against the release's `SHA256SUMS` and the new binary's `--version`, swaps it in place of its own executable and exits with status 75. systemd (`Restart=on-failure`), launchd (`KeepAlive`) and the Windows task runner restart it on the new binary; the command then resumes it (unless it was already paused) and moves to the next worker, stopping at the first failure. The executable's directory must be writable by the worker account, so install the worker binary under that account (for example `~/.local/bin`), not in a root-owned directory. Container workers are skipped: recreate them from the new release image. Update the Hub first with `ylcc update --apply` on its host; `workers` shows each worker's `version`.
+
+## Worker disk cleanup
+
+Workers follow the usual CI/cluster retention rules, without configuration:
+
+- An attempt's checkout, `TMPDIR`/`TMP`/`TEMP` directory and private environment are removed as soon as it finishes and its outputs are uploaded. Its journal and logs stay for 3 days; `unknown` attempts stay until reconciled.
+- Input blobs, task caches and environment revisions unused for 7 days are removed, like GitHub Actions cache eviction.
+- When the data filesystem is over 85% full, the least recently used of those go first until it is under 80%, as the kubelet does for images.
+- Deleting an environment from the catalogue removes its files from connected workers immediately; offline workers drop them by age.
+
+Collection runs hourly, after each attempt and at startup, and only while the worker is idle. An evicted environment is prepared again by the next job that needs it.

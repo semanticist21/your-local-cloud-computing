@@ -21,6 +21,7 @@ jobs:
         run: rustup update stable --no-self-update && rustup default stable
       - name: Build dashboard assets
         run: npm ci --prefix dashboard && npm run build --prefix dashboard
+      - run: python3 scripts/release.py --check
       - run: cargo test --locked
       - run: cargo build --locked
       - run: python3 tests/e2e.py target/debug/ylcc

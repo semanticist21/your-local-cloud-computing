@@ -912,6 +912,20 @@ async fn container_absent(runtime: &str, name: &str) -> Result<bool> {
 async fn request_cancel(state: &Arc<State>, job_id: &str, attempt_id: &str) -> Result<()> {
     let attempt = state.attempts.lock().unwrap().get(attempt_id).cloned();
     let Some(attempt) = attempt else {
+        // `accept` journals every attempt before it runs and attempts are never pruned, so an
+        // unrecorded attempt never ran here. Confirm the cancel so the Hub releases its slot.
+        identifier(job_id)?;
+        identifier(attempt_id)?;
+        state.emit(WorkerMessage::Finished {
+            report: AttemptReport {
+                job_id: job_id.into(),
+                attempt_id: attempt_id.into(),
+                state: "cancelled".into(),
+                exit_code: None,
+                error: Some("cancelled; this worker never accepted the attempt".into()),
+                results: vec![],
+            },
+        });
         return Ok(());
     };
     ensure!(
@@ -3040,6 +3054,19 @@ mod tests {
         let persisted: Journal =
             serde_json::from_reader(File::open(attempt.dir.join("journal.json")).unwrap()).unwrap();
         assert_eq!(persisted.report.state, "cancelled");
+    }
+    #[tokio::test]
+    async fn cancel_for_never_accepted_attempt_confirms_cancellation() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = state_at(temp.path());
+        let mut events = state.events.subscribe();
+        request_cancel(&state, "job", "lost-attempt").await.unwrap();
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            WorkerMessage::Finished { report }
+                if report.state == "cancelled" && report.job_id == "job" && report.attempt_id == "lost-attempt"
+        ));
+        assert!(state.attempts.lock().unwrap().is_empty());
     }
     #[cfg(unix)]
     #[tokio::test]

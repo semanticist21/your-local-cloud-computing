@@ -549,6 +549,11 @@ impl Store {
         Ok(())
     }
     fn environment_revision(&self, id: &str, revision: &str) -> Result<Option<Environment>> {
+        // A deleted id has no catalogue entry and no job can use it again, so stale worker statuses
+        // and replayed logs are rejected here before the job-history scan below.
+        if self.environment(id)?.is_none() {
+            return Ok(None);
+        }
         let stored: Option<String> = self
             .db
             .query_row(
@@ -1642,8 +1647,20 @@ mod tests {
                 StatusCode::NO_CONTENT
             );
         }
-        assert!(lock(&state).unwrap().environments().unwrap().is_empty());
-        // Re-registering the same recipe works; job history keeps revisions immutable for retries.
+        {
+            let mut store = lock(&state).unwrap();
+            assert!(store.environments().unwrap().is_empty());
+            let stale = EnvironmentStatus {
+                worker_id: "one".into(),
+                environment_id: "native".into(),
+                revision: "v1".into(),
+                state: "ready".into(),
+                error: None,
+            };
+            assert!(store.receive_status("one", stale).is_err());
+            assert!(store.statuses().unwrap().is_empty());
+        }
+        // A deleted id can be registered again.
         assert!(upsert_environment(State(state), Json(environment)).await.is_ok());
     }
 

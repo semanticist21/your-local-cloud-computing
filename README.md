@@ -306,12 +306,55 @@ tasks:
     priority: 0
 ```
 
-Use your project's actual inputs and command. Add `outputs` for files to download, `environment` for a registered tool environment, or use `project: true` instead of `inputs` to select the whole project. A command without source inputs must explicitly set `no_input: true`. Project files define executable commands; inspect a new file before running it.
+Use your project's actual inputs and command. Add `outputs` for files to download, `environment` for a tool environment, or use `project: true` instead of `inputs` to select the whole project. A command without source inputs must explicitly set `no_input: true`. Project files define executable commands; inspect a new file before running it.
 
 ```bash
 ylcc task list
 ylcc task run test
 ylcc task run test --file /path/to/application/ylcc.yaml --detach
+```
+
+### Repeatable workflows
+
+A project file can carry everything a run needs, like a CI workflow: shared defaults, the toolchain, per-OS targets and worker-side caches.
+
+```yaml
+version: 1
+environments:
+  bun: {uses: bun@1.3.14}          # Built-in preset; `environment: bun@1.3.14` also works inline.
+  tools:                           # Or a full recipe (setup/verify/env, or an image digest).
+    setup: ['curl -fsSL https://example.com/tool.tar.gz | tar -xz -C "$YLCC_ENV_DIR/bin"']
+    verify: [tool --version]
+defaults:
+  requirements: {os: linux, arch: x86_64}
+  environment: bun
+  timeout_secs: 1800
+  cache: [node_modules]
+tasks:
+  test:
+    command: [sh, -c, 'bun install --frozen-lockfile && bun test']
+    inputs: [package.json, bun.lock, src]
+  cargo-test:
+    command: [cargo, test, --locked]
+    inputs: [Cargo.toml, Cargo.lock, src]
+    environment: rust-native       # A name not declared above refers to a Hub-registered environment.
+    cache: [target]
+    targets:                       # One job per target; each overrides the requirements.
+      - {os: linux, arch: x86_64}
+      - {os: macos, arch: aarch64}
+```
+
+- **Environments** declared in the file are registered when `task run` uses them. Each worker installs one on first use and keeps it, so later runs start immediately. The revision is a hash of the recipe: editing it prepares a new revision, while an unchanged recipe is reused. Presets (`bun`, `node`, `rust`, `go`, `uv`) install into the worker's environment directory using Linux/macOS shell commands; on Windows, write a recipe.
+- **Defaults** apply to every task that does not set the field itself; `env` maps merge.
+- **Targets** submit one job per entry. The snapshot uploads once. `task run` prints one object for one target or an array for several, and fails if any job fails.
+- **Cache** directories are moved out of the checkout after the job and back into the next one with the same project `name` (default: the YAML directory's name) and path, on the same worker. They are kept after failures too. If another attempt is using a cache, the job runs without it rather than waiting. Caches live under the worker's `caches/` data directory; delete that directory to clear them. A path already present in the inputs is never replaced.
+
+Turn a working ad-hoc run into a task with `--save-task NAME`. It appends to `./ylcc.yaml` (creating it if needed, keeping existing comments) after the job succeeds, or at submission with `--detach`. Inputs and commands stay relative to the current directory:
+
+```bash
+ylcc run --input package.json --input bun.lock --input src --os linux --environment bun@1.3.14 \
+  --cache node_modules --save-task test -- sh -c 'bun install && bun test'
+ylcc task run test
 ```
 
 YAML version 1 rejects unknown fields and invalid selections. CPU/memory percentage limits are not supported by this schema; configure actual resource caps in the container runtime or operating system. `max_jobs` limits simultaneous jobs, not their CPU or memory consumption.
@@ -511,7 +554,7 @@ ylcc setup
 ylcc examples
 ```
 
-Create a project task file in the current application repository:
+Create a project task file in the current application repository. Runtime templates declare a preset environment and cache:
 
 ```bash
 ylcc task init --runtime bun --name test --file ylcc.yaml

@@ -170,6 +170,7 @@ struct RunArgs {
     cpu_feature: Vec<String>,
     #[arg(long)]
     build_target: Option<String>,
+    /// Registered environment id, or a preset such as bun@1.3.14 (see `ylcc env presets`).
     #[arg(long)]
     environment: Option<String>,
     #[arg(long)]
@@ -180,6 +181,12 @@ struct RunArgs {
     priority: i32,
     #[arg(long)]
     env: Vec<String>,
+    /// Keep this workspace-relative directory on the worker between runs (for example target).
+    #[arg(long)]
+    cache: Vec<String>,
+    /// Save this run as a task in ./ylcc.yaml (after success, or at submission with --detach).
+    #[arg(long, value_name = "NAME")]
+    save_task: Option<String>,
     #[arg(long)]
     detach: bool,
     #[arg(long)]
@@ -301,6 +308,8 @@ enum Envs {
         #[arg(long, required = true)]
         worker: String,
     },
+    /// List built-in presets usable as `uses: NAME@VERSION` in ylcc.yaml.
+    Presets,
 }
 #[derive(Subcommand)]
 enum Services {
@@ -525,16 +534,19 @@ fn resolve_settings(cli: &Cli, cfg: Config, cfg_path: &Path) -> (String, PathBuf
     (hub, token, results)
 }
 
+/// Uploads the snapshot once and submits one job per spec. Returns final jobs, or submitted ones with `detach`.
 async fn submit(
     client: &Client,
     snap: snapshot::Snapshot,
-    spec: JobSpec,
+    specs: Vec<JobSpec>,
     results: &Path,
     detach: bool,
     no_download: bool,
-) -> Result<()> {
-    spec.validate()?;
-    if spec.priority != 0 {
+) -> Result<Vec<Job>> {
+    for spec in &specs {
+        spec.validate()?;
+    }
+    if specs.iter().any(|spec| spec.priority != 0) {
         let health: serde_json::Value = client.get("/health").await?;
         let supported = health["capabilities"]
             .as_array()
@@ -554,18 +566,48 @@ async fn submit(
         "uploaded {count} missing blobs ({bytes} bytes); {} selected files",
         snap.files.len()
     );
-    let job: Job = client.post("/v1/jobs", &spec).await?;
-    if detach {
-        print(&job)
-    } else {
+    let mut jobs = Vec::new();
+    for spec in &specs {
+        let job: Job = client.post("/v1/jobs", spec).await?;
         eprintln!("job {} ({})", job.id, job.state);
-        let j = client.wait(&job.id, results, !no_download).await?;
-        print(&j)?;
-        if j.state != "succeeded" {
-            bail!("job {} ended {}", j.id, j.state)
-        }
-        Ok(())
+        jobs.push(job);
     }
+    if detach {
+        return Ok(jobs);
+    }
+    let mut done = Vec::new();
+    for job in jobs {
+        done.push(client.wait(&job.id, results, !no_download).await?);
+    }
+    Ok(done)
+}
+
+/// Idempotent: an unchanged recipe keeps its revision; workers prepare it on first use.
+async fn register(client: &Client, environment: &Environment) -> Result<()> {
+    client
+        .post::<_, Environment>("/v1/environments", environment)
+        .await
+        .with_context(|| format!("register environment {}", environment.id))?;
+    Ok(())
+}
+
+/// Prints one job as an object (the single-target shape) or several as an array, failing on any unsuccessful job.
+fn report(jobs: &[Job], detach: bool) -> Result<()> {
+    match jobs {
+        [job] => print(job)?,
+        _ => print(&jobs)?,
+    }
+    if !detach {
+        let failed: Vec<_> = jobs
+            .iter()
+            .filter(|job| job.state != "succeeded")
+            .map(|job| format!("job {} ended {}", job.id, job.state))
+            .collect();
+        if !failed.is_empty() {
+            bail!("{}", failed.join("; "))
+        }
+    }
+    Ok(())
 }
 
 async fn diagnostics(hub: &str, token: &Path, local: Capabilities) -> Result<serde_json::Value> {
@@ -582,33 +624,28 @@ async fn diagnostics(hub: &str, token: &Path, local: Capabilities) -> Result<ser
 }
 
 fn task_template(runtime: &str, name: &str, os: &str, arch: &str) -> Result<String> {
-    let (command, inputs, trust_command) = match runtime {
-        "rust" => (r#"    command: [cargo, test, --locked]"#, r#"    inputs: [Cargo.toml, Cargo.lock, src, tests]"#, "Rust"),
-        "node" => (r#"    command: [npm, test]"#, r#"    inputs: [package.json, package-lock.json, src, test]"#, "Node"),
-        "python" => (r#"    command: [python, -m, pytest, -q]"#, r#"    inputs: [pyproject.toml, src, tests]"#, "Python"),
-        "bun" => (r#"    command: [bun, test]"#, r#"    inputs: [package.json, bun.lock, src, tests]"#, "Bun"),
-        "go" => (r#"    command: [go, test, ./...]"#, r#"    inputs: [go.mod, go.sum, .]"#, "Go"),
-        _ => (r#"    command: [true]"#, r#"    no_input: true"#, "smoke-test"),
+    // Preset versions are known-good starting points; bump them in the generated file.
+    let (command, inputs, preset, cache) = match runtime {
+        "rust" => ("[cargo, test, --locked]", "inputs: [Cargo.toml, Cargo.lock, src, tests]", Some("rust@1.96.0"), "[target]"),
+        "node" => ("[npm, test]", "inputs: [package.json, package-lock.json, src, test]", Some("node@22.12.0"), "[node_modules]"),
+        "python" => ("[python, -m, pytest, -q]", "inputs: [pyproject.toml, src, tests]", None, ""),
+        "bun" => ("[bun, test]", "inputs: [package.json, bun.lock, src, tests]", Some("bun@1.3.14"), "[node_modules]"),
+        "go" => ("[go, test, ./...]", "inputs: [go.mod, go.sum, .]", Some("go@1.23.4"), ""),
+        _ => ("[true]", "no_input: true", None, ""),
     };
-    let _ = trust_command;
-    Ok(format!(
-        r#"version: 1
-tasks:
-  {name}:
-{command}
-{inputs}
-    requirements:
-      os: {os}
-      arch: {arch}
-      tools: {{}}
-    outputs: []
-    timeout_secs: 1800
-    priority: 0
-"#,
-        name = name,
-        os = os,
-        arch = arch
-    ))
+    let mut text = String::from("version: 1\n");
+    if let Some(preset) = preset {
+        text += &format!("environments:\n  {runtime}: {{uses: {preset}}}\n");
+    }
+    text += &format!("defaults:\n  requirements: {{os: {os}, arch: {arch}}}\n  timeout_secs: 1800\n");
+    if preset.is_some() {
+        text += &format!("  environment: {runtime}\n");
+    }
+    text += &format!("tasks:\n  {name}:\n    command: {command}\n    {inputs}\n");
+    if !cache.is_empty() {
+        text += &format!("    cache: {cache}\n");
+    }
+    Ok(text)
 }
 
 #[tokio::main]
@@ -698,27 +735,71 @@ async fn execute() -> Result<()> {
         Commands::Run(r) => {
             let client = Client::new(&hub, &token)?;
             let snap = r.selection.snapshot()?;
+            let requirements = Requirements {
+                os: r.os,
+                arch: r.arch.map(|v| normalize_arch(&v)),
+                abi: r.abi,
+                tools: pairs(r.tool)?,
+                gpu: r.gpu,
+                cpu_features: r.cpu_feature,
+                build_target: r.build_target,
+                emulation: false,
+            };
+            let cwd = std::env::current_dir()?;
+            let preset = r
+                .environment
+                .as_deref()
+                .map(ylcc::project::preset_environment)
+                .transpose()?
+                .flatten();
             let spec = JobSpec {
-                command: r.command,
+                command: r.command.clone(),
                 inputs: snap.files.clone(),
-                outputs: r.output,
-                requirements: Requirements {
-                    os: r.os,
-                    arch: r.arch.map(|v| normalize_arch(&v)),
-                    abi: r.abi,
-                    tools: pairs(r.tool)?,
-                    gpu: r.gpu,
-                    cpu_features: r.cpu_feature,
-                    build_target: r.build_target,
-                    emulation: false,
-                },
-                environment: r.environment,
-                container: r.container,
+                outputs: r.output.clone(),
+                requirements: requirements.clone(),
+                environment: preset.as_ref().map(|e| e.id.clone()).or(r.environment.clone()),
+                container: r.container.clone(),
                 env: pairs(r.env)?,
                 timeout_secs: r.timeout,
                 priority: r.priority,
+                cache_scope: (!r.cache.is_empty())
+                    .then(|| cwd.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .flatten(),
+                cache: r.cache.clone(),
             };
-            submit(&client, snap, spec, &results, r.detach, r.no_download).await
+            let saved = r.save_task.map(|name| {
+                let task = ylcc::project::Task {
+                    command: r.command,
+                    inputs: r.selection.input,
+                    project: r.selection.project,
+                    no_input: r.selection.no_input,
+                    outputs: r.output,
+                    requirements: Some(requirements),
+                    environment: r.environment,
+                    container: r.container,
+                    env: spec.env.clone(),
+                    timeout_secs: r.timeout,
+                    priority: (r.priority != 0).then_some(r.priority),
+                    cache: (!r.cache.is_empty()).then_some(r.cache),
+                    ..Default::default()
+                };
+                (name, task)
+            });
+            if let Some(environment) = &preset {
+                register(&client, environment).await?;
+            }
+            let jobs = submit(&client, snap, vec![spec], &results, r.detach, r.no_download).await?;
+            let mut save = Ok(());
+            if let Some((name, task)) = saved
+                && (r.detach || jobs.iter().all(|job| job.state == "succeeded"))
+            {
+                save = Project::save_task(&cwd.join("ylcc.yaml"), &name, task);
+                if save.is_ok() {
+                    eprintln!("saved task {name} to ylcc.yaml; rerun with: ylcc task run {name}");
+                }
+            }
+            report(&jobs, r.detach)?;
+            save.context("save task")
         }
         Commands::Task { command } => match command {
             Tasks::List { file } => {
@@ -756,9 +837,13 @@ async fn execute() -> Result<()> {
                     )
                 })?;
                 let snap = task.snapshot(&root)?;
-                let spec = task.spec(snap.files.clone());
+                let plan = project.plan(&name, &root, snap.files.clone())?;
                 let client = Client::new(&hub, &token)?;
-                submit(&client, snap, spec, &results, detach, no_download).await
+                if let Some(environment) = &plan.environment {
+                    register(&client, environment).await?;
+                }
+                let jobs = submit(&client, snap, plan.specs, &results, detach, no_download).await?;
+                report(&jobs, detach)
             }
         },
         Commands::Workers { command } => {
@@ -869,41 +954,47 @@ async fn execute() -> Result<()> {
             }
         }
         Commands::Env { command } => {
-            let c = Client::new(&hub, &token)?;
+            let c = || Client::new(&hub, &token);
             match command {
-                Envs::List => print(&c.get::<Vec<Environment>>("/v1/environments").await?),
+                Envs::List => print(&c()?.get::<Vec<Environment>>("/v1/environments").await?),
                 Envs::Status => print(
-                    &c.get::<Vec<EnvironmentStatus>>("/v1/environments/status")
+                    &c()?.get::<Vec<EnvironmentStatus>>("/v1/environments/status")
                         .await?,
                 ),
                 Envs::Add { file } => {
                     let e: Environment = serde_json::from_slice(&fs::read(file)?)?;
-                    print(&c.post::<_, Environment>("/v1/environments", &e).await?)
+                    print(&c()?.post::<_, Environment>("/v1/environments", &e).await?)
                 }
                 Envs::Logs { id } => {
                     ylcc::client::segment(&id)?;
                     print(
-                        &c.get::<Vec<LogEntry>>(&format!("/v1/environments/{id}/logs"))
+                        &c()?.get::<Vec<LogEntry>>(&format!("/v1/environments/{id}/logs"))
                             .await?,
                     )
                 }
                 Envs::Prepare { id, worker } => {
                     ylcc::client::segment(&id)?;
                     print(
-                        &c.post::<_, Vec<EnvironmentStatus>>(
+                        &c()?.post::<_, Vec<EnvironmentStatus>>(
                             &format!("/v1/environments/{id}/prepare"),
                             &PrepareRequest { worker_id: Some(worker) },
                         )
                         .await?,
                     )
                 }
+                Envs::Presets => print(
+                    &ylcc::project::PRESETS
+                        .iter()
+                        .map(|name| serde_json::json!({"name": name, "uses": format!("{name}@VERSION")}))
+                        .collect::<Vec<_>>(),
+                ),
                 Envs::Ensure { id, worker } => {
                     ylcc::client::segment(&id)?;
-                    let statuses = c.get::<Vec<EnvironmentStatus>>("/v1/environments/status").await?;
+                    let statuses = c()?.get::<Vec<EnvironmentStatus>>("/v1/environments/status").await?;
                     let current = statuses.into_iter().find(|s| s.environment_id == *id);
                     if current.as_ref().is_none_or(|s| s.state != "ready") {
                         ylcc::client::segment(&id)?;
-                        let prepared = c.post::<_, Vec<EnvironmentStatus>>(&format!("/v1/environments/{id}/prepare"), &PrepareRequest { worker_id: Some(worker.clone()) }).await?;
+                        let prepared = c()?.post::<_, Vec<EnvironmentStatus>>(&format!("/v1/environments/{id}/prepare"), &PrepareRequest { worker_id: Some(worker.clone()) }).await?;
                         print(&serde_json::json!({"environment": id, "action": "prepared", "statuses": prepared}))
                     } else {
                         print(&serde_json::json!({"environment": id, "action": "reused", "status": current}))
@@ -1288,7 +1379,7 @@ mod tests {
             priority: 1,
             ..Default::default()
         };
-        let error = submit(&client, snap, spec, results.path(), true, false)
+        let error = submit(&client, snap, vec![spec], results.path(), true, false)
             .await
             .unwrap_err();
         server.abort();

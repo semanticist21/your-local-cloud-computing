@@ -7,7 +7,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -56,6 +56,8 @@ struct State {
     attempts: Mutex<HashMap<String, Arc<Attempt>>>,
     environments: Mutex<BTreeMap<String, EnvironmentStatus>>,
     image_paths: Mutex<HashMap<String, String>>,
+    /// Cache keys currently moved into a running attempt.
+    caches: Mutex<HashSet<String>>,
     events: broadcast::Sender<WorkerMessage>,
 }
 
@@ -243,7 +245,7 @@ pub async fn run(
             "another worker is using this data directory"
         );
     }
-    for child in ["attempts", "blobs", "environments"] {
+    for child in ["attempts", "blobs", "caches", "environments"] {
         private_dir(&data.join(child))?;
     }
     let capabilities = probe().await?;
@@ -264,6 +266,7 @@ pub async fn run(
         attempts: Mutex::new(HashMap::new()),
         environments: Mutex::new(BTreeMap::new()),
         image_paths: Mutex::new(HashMap::new()),
+        caches: Mutex::new(HashSet::new()),
         events,
     });
     load_state(&state).await?;
@@ -1350,6 +1353,8 @@ async fn run_attempt(
         );
     }
     cancelled(&cancel)?;
+    // Held until outputs are uploaded, so outputs inside a cached directory are collected first.
+    let _cache = CacheLease::claim(state, &job.spec, &workdir)?;
     let mut container = None;
     let command = if let Some(image) = image.as_ref() {
         let name = format!("ylcc-{}", job.attempt_id);
@@ -1405,6 +1410,70 @@ async fn run_attempt(
         results.push(entry);
     }
     Ok((exit, results))
+}
+
+/// Moves persistent cache directories into a fresh checkout and back afterwards.
+/// A key already in use by another attempt runs without its cache instead of waiting.
+struct CacheLease<'a> {
+    state: &'a State,
+    workdir: PathBuf,
+    entries: Vec<(String, String)>,
+}
+
+impl<'a> CacheLease<'a> {
+    fn claim(state: &'a State, spec: &JobSpec, workdir: &Path) -> Result<Self> {
+        let mut lease = Self {
+            state,
+            workdir: workdir.into(),
+            entries: Vec::new(),
+        };
+        let Some(scope) = spec.cache_scope.as_deref() else {
+            return Ok(lease);
+        };
+        for path in &spec.cache {
+            crate::platform::filesystem_relative(path)?;
+            if fs::symlink_metadata(workdir.join(path)).is_ok() {
+                continue; // The submitted inputs already provide this path.
+            }
+            let key = hex::encode(Sha256::digest(format!("{scope}\0{path}")));
+            if !state.caches.lock().unwrap().insert(key.clone()) {
+                eprintln!("cache {path} is in use by another attempt; running without it");
+                continue;
+            }
+            lease.entries.push((key.clone(), path.clone()));
+            let stored = state.data.join("caches").join(&key);
+            if stored.exists() {
+                let work = workdir.join(path);
+                if let Some(parent) = work.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::rename(&stored, &work).with_context(|| format!("restore cache {path}"))?;
+            }
+        }
+        Ok(lease)
+    }
+}
+
+impl Drop for CacheLease<'_> {
+    fn drop(&mut self) {
+        for (key, path) in &self.entries {
+            // Only keep a real directory reached without symlinks, so a job cannot redirect the move.
+            let mut current = self.workdir.clone();
+            let real = path.split('/').all(|part| {
+                current.push(part);
+                fs::symlink_metadata(&current)
+                    .is_ok_and(|m| m.is_dir() && !crate::platform::is_link(&m))
+            });
+            let stored = self.state.data.join("caches").join(key);
+            if real
+                && !stored.exists()
+                && let Err(error) = fs::rename(&current, &stored)
+            {
+                eprintln!("save cache {path}: {error}");
+            }
+            self.state.caches.lock().unwrap().remove(key);
+        }
+    }
 }
 
 async fn resolve_job_image(
@@ -2453,6 +2522,7 @@ mod tests {
             data.to_path_buf(),
             data.join("attempts"),
             data.join("blobs"),
+            data.join("caches"),
             data.join("environments"),
         ] {
             private_dir(&path).unwrap();
@@ -2475,6 +2545,7 @@ mod tests {
             attempts: Mutex::new(HashMap::new()),
             environments: Mutex::new(BTreeMap::new()),
             image_paths: Mutex::new(HashMap::new()),
+            caches: Mutex::new(HashSet::new()),
             events,
         })
     }
@@ -2633,6 +2704,63 @@ mod tests {
             fs::read(temp.path().join("blobs").join(hash)).unwrap(),
             b"original"
         );
+    }
+    #[test]
+    fn cache_lease_restores_saves_and_skips_busy_or_redirected_caches() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = state_at(temp.path());
+        let spec = JobSpec {
+            cache: vec!["deps/target".into()],
+            cache_scope: Some("app".into()),
+            ..Default::default()
+        };
+        let work = |name: &str| {
+            let dir = temp.path().join(name);
+            fs::create_dir(&dir).unwrap();
+            dir
+        };
+        let first = work("first");
+        drop({
+            let lease = CacheLease::claim(&state, &spec, &first).unwrap();
+            fs::create_dir_all(first.join("deps/target")).unwrap();
+            fs::write(first.join("deps/target/built"), "1").unwrap();
+            lease
+        });
+        let second = work("second");
+        let held = CacheLease::claim(&state, &spec, &second).unwrap();
+        assert_eq!(
+            fs::read_to_string(second.join("deps/target/built")).unwrap(),
+            "1"
+        );
+        let busy = work("busy");
+        let busy_lease = CacheLease::claim(&state, &spec, &busy).unwrap();
+        assert!(busy_lease.entries.is_empty() && !busy.join("deps/target").exists());
+        drop(busy_lease);
+        drop(held);
+        assert!(!second.join("deps/target").exists());
+        let other_scope = JobSpec {
+            cache_scope: Some("other".into()),
+            ..spec.clone()
+        };
+        let third = work("third");
+        drop(CacheLease::claim(&state, &other_scope, &third).unwrap());
+        assert!(!third.join("deps/target").exists());
+        #[cfg(unix)]
+        {
+            let fourth = work("fourth");
+            let lease = CacheLease::claim(&state, &spec, &fourth).unwrap();
+            fs::remove_dir_all(fourth.join("deps")).unwrap();
+            std::os::unix::fs::symlink(temp.path().join("first"), fourth.join("deps")).unwrap();
+            drop(lease);
+            assert!(temp.path().join("first").exists());
+            assert!(
+                CacheLease::claim(&state, &spec, &work("fifth"))
+                    .unwrap()
+                    .entries
+                    .len()
+                    == 1
+            );
+        }
     }
     #[cfg(windows)]
     fn windows_descendant_command(directory: &Path, wait: bool) -> Command {

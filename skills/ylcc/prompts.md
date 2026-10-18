@@ -32,3 +32,8 @@ These are examples of agent requests and the command flow ylcc is built to handl
 7. "Use the dashboard without giving you the token."
    - `ylcc dashboard --open`
    - Read the token value only from the displayed token-file location; never paste it in another command or output.
+
+8. "Set up the monorepo's tests on the pool so I can rerun them."
+   - `ylcc env presets` to choose a toolchain preset, or write a `setup`/`verify` recipe
+   - First run: `ylcc run --input ... --os linux --cache node_modules --save-task web-test -- sh -c 'bun install && bun test'`
+   - Then: `ylcc task run web-test`; for the same task on several OS/arch, add `targets` in `ylcc.yaml`

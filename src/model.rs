@@ -77,16 +77,21 @@ pub fn validate_hash(s: &str) -> Result<()> {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Requirements {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abi: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tools: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cpu_features: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_target: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub emulation: bool,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -168,6 +173,11 @@ pub struct JobSpec {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub timeout_secs: Option<u64>,
+    /// Workspace-relative directories the worker keeps between attempts of the same scope.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_scope: Option<String>,
 }
 impl JobSpec {
     pub fn validate(&self) -> Result<()> {
@@ -191,6 +201,15 @@ impl JobSpec {
             if self.requirements.os.as_deref() == Some("windows") {
                 windows_relative(p)?;
             }
+        }
+        for p in &self.cache {
+            safe_relative(p)?;
+            if self.requirements.os.as_deref() == Some("windows") {
+                windows_relative(p)?;
+            }
+        }
+        if !self.cache.is_empty() && self.cache_scope.as_deref().is_none_or(str::is_empty) {
+            bail!("cache requires a cache scope")
         }
         for key in self.env.keys() {
             validate_env_key(key)?;

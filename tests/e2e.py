@@ -215,6 +215,29 @@ def main():
             assert task.returncode == 0, task.stderr
             assert result(json.loads(task.stdout)) == "99\n"
 
+            # Inline environment, defaults, targets and a worker-persistent cache, then save an ad-hoc run.
+            repeat = base / "repeat"
+            repeat.mkdir()
+            counter = "from pathlib import Path; import os; c = Path('cache/count'); c.parent.mkdir(exist_ok=True); n = int(c.read_text()) + 1 if c.exists() else 1; c.write_text(str(n)); Path('answer.txt').write_text(os.environ['GREETING'] + str(n))"
+            (repeat / "ylcc.yaml").write_text(
+                "version: 1\n"
+                "environments:\n  inline-tools: {setup: ['exit 0'], verify: ['exit 0'], env: {GREETING: inline}}\n"
+                f"defaults:\n  requirements: {json.dumps({'os': os_name, 'arch': arch})}\n  cache: [cache]\n  environment: inline-tools\n"
+                f"tasks:\n  count:\n    command: {json.dumps(python(counter))}\n    no_input: true\n    outputs: [answer.txt]\n    targets: [{{}}, {{}}]\n")
+            def repeat_cli(*args):
+                done = subprocess.run(prefix + list(args), cwd=repeat, text=True, capture_output=True, timeout=120)
+                assert done.returncode == 0, done.stderr
+                return json.loads(done.stdout), done.stderr
+            counted, _ = repeat_cli("task", "run", "count")
+            assert sorted(result(job) for job in counted) == ["inline1", "inline2"], counted
+            counted_again, _ = repeat_cli("task", "run", "count")
+            assert sorted(result(job) for job in counted_again) == ["inline3", "inline4"]
+            saved, saved_log = repeat_cli("run", "--no-input", *common, "--save-task", "noop", "--", *noop)
+            assert saved["state"] == "succeeded" and "saved task noop" in saved_log
+            listed, _ = repeat_cli("task", "list")
+            assert set(listed) == {"count", "noop"}
+            assert repeat_cli("task", "run", "noop")[0]["state"] == "succeeded"
+
             paused, _ = cli("workers", "pause", "test-worker")
             assert paused["paused"]
             low, _ = cli("run", "--no-input", *common, "--detach", "--", *noop)

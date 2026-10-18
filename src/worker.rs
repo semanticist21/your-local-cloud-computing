@@ -461,7 +461,11 @@ async fn connection(state: Arc<State>) -> Result<()> {
             };
             for line in BufReader::new(file).lines() {
                 let line = line?;
-                let entry: LogEntry = serde_json::from_str(&line)?;
+                // A write cut short (for example by a full disk) must not block every reconnect.
+                let Ok(entry) = serde_json::from_str::<LogEntry>(&line) else {
+                    eprintln!("skipped unreadable log line in {}", attempt.dir.display());
+                    continue;
+                };
                 sink.send(Message::Text(
                     serde_json::to_string(&WorkerMessage::Log { entry })?.into(),
                 ))

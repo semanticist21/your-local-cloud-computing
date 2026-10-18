@@ -350,6 +350,9 @@ enum Services {
         max_jobs: usize,
         #[arg(long)]
         system_user: Option<String>,
+        /// Windows: start at boot without anyone logged in (S4U task; run from an elevated shell).
+        #[arg(long, conflicts_with = "system_user")]
+        at_startup: bool,
     },
     Uninstall {
         #[arg(long)]
@@ -1364,12 +1367,15 @@ async fn execute() -> Result<()> {
                 listen,
                 max_jobs,
                 system_user,
+                at_startup,
             } => {
                 let dir = data_dir.unwrap_or_else(|| data_path().join(&role));
                 if let Some(user) = system_user {
                     ylcc::service::install_system_user(
                         &role, &hub, &token, &dir, &id, &listen, max_jobs, &user,
                     )
+                } else if at_startup {
+                    ylcc::service::install_at_startup(&role, &hub, &token, &dir, &id, &listen, max_jobs)
                 } else {
                     ylcc::service::install(&role, &hub, &token, &dir, &id, &listen, max_jobs)
                 }

@@ -951,6 +951,25 @@ fn windows_runner(args: &[String], directory: &Path, path: &str, log: &Path) -> 
     ))
 }
 
+/// Start at boot without a login: a Windows S4U task, which only an elevated shell can register.
+#[cfg(not(windows))]
+#[allow(clippy::too_many_arguments)]
+pub fn install_at_startup(_: &str, _: &str, _: &Path, _: &Path, _: &str, _: &str, _: usize) -> Result<()> {
+    bail!("--at-startup is for Windows; use --system-user on macOS, or a user service with linger on Linux")
+}
+#[cfg(windows)]
+pub fn install_at_startup(
+    role: &str,
+    hub: &str,
+    token_file: &Path,
+    data_dir: &Path,
+    id: &str,
+    listen: &str,
+    max_jobs: usize,
+) -> Result<()> {
+    install_task(role, hub, token_file, data_dir, id, listen, max_jobs, true)
+}
+
 /// Windows workers run as the installing user while that user is logged in.
 #[cfg(windows)]
 pub fn install(
@@ -961,6 +980,21 @@ pub fn install(
     id: &str,
     listen: &str,
     max_jobs: usize,
+) -> Result<()> {
+    install_task(role, hub, token_file, data_dir, id, listen, max_jobs, false)
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn install_task(
+    role: &str,
+    hub: &str,
+    token_file: &Path,
+    data_dir: &Path,
+    id: &str,
+    listen: &str,
+    max_jobs: usize,
+    at_startup: bool,
 ) -> Result<()> {
     use std::{io::Write, os::windows::fs::OpenOptionsExt};
     let (name, directory) = windows_task(role)?;
@@ -1007,21 +1041,33 @@ pub fn install(
         "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{}\"",
         script_file.display()
     );
+    // S4U runs without a logon session or stored password, so it has no network credentials.
+    let (trigger, logon) = if at_startup {
+        ("-AtStartup", "S4U")
+    } else {
+        ("-AtLogOn -User $user", "Interactive")
+    };
     let install = format!(
         "$ErrorActionPreference='Stop'; $user=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; \
          $action=New-ScheduledTaskAction -Execute (Join-Path $PSHOME 'powershell.exe') -Argument {}; \
-         $trigger=New-ScheduledTaskTrigger -AtLogOn -User $user; \
-         $principal=New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited; \
+         $trigger=New-ScheduledTaskTrigger {trigger}; \
+         $principal=New-ScheduledTaskPrincipal -UserId $user -LogonType {logon} -RunLevel Limited; \
          $settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1); \
          Register-ScheduledTask -TaskName {name} -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null; \
          Start-ScheduledTask -TaskName {name}",
         powershell_literal(&action_args)?,
     );
-    powershell(&install)?;
-    println!(
-        "Installed {name}. The worker starts at this user's logon and runs only while logged in; locking the session is supported. Log: {}",
-        log.display()
-    );
+    powershell(&install).with_context(|| {
+        if at_startup { "registering a boot task without login needs an elevated (administrator) shell" } else { "register the worker task" }
+    })?;
+    if at_startup {
+        println!("Installed {name}. The worker starts at boot without a login and runs unelevated as this user. Log: {}", log.display());
+    } else {
+        println!(
+            "Installed {name}. The worker starts at this user's logon and runs only while logged in; locking the session is supported. Log: {}",
+            log.display()
+        );
+    }
     Ok(())
 }
 

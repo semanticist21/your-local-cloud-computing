@@ -1,13 +1,25 @@
-const tokenKey = 'ylcc-dashboard-token'
-import { useEffect, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  Link,
+  Outlet,
+  RouterProvider,
+  createHashHistory,
+  createRootRouteWithContext,
+  createRoute,
+  createRouter,
+  useNavigate,
+  useRouterState,
+} from '@tanstack/react-router'
 import {
   Activity,
+  ArrowLeft,
   Boxes,
   Check,
   CircleAlert,
-  CircleHelp,
   Clock3,
   Cpu,
+  FileText,
   LayoutDashboard,
   LockKeyhole,
   LogOut,
@@ -17,248 +29,115 @@ import {
   ShieldCheck,
   Terminal,
   Workflow,
+  X,
 } from 'lucide-react'
 import { Badge, Button } from './components/ui'
 import {
-  fetchJobLogs,
-  fetchSnapshot,
+  AuthError,
+  clearToken,
+  errorMessage,
+  formatBytes,
+  formatDuration,
   formatMemory,
+  formatRelative,
   formatTime,
+  jobLogsQuery,
+  readToken,
+  snapshotQuery,
+  storeToken,
+  useNow,
   type EnvironmentStatus,
   type Job,
-  type Snapshot,
   type WorkerInfo,
 } from './lib/api'
 
-type View = 'overview' | 'workers' | 'jobs' | 'environments'
-
 const activeJobStates = new Set(['assigned', 'running'])
+const terminalJobStates = new Set(['succeeded', 'failed', 'cancelled'])
+const jobStates = ['queued', 'assigned', 'running', 'cancelling', 'succeeded', 'failed', 'cancelled']
+const jobListLimit = 200
+
+// ---------- Routes ----------
+
+type JobSearch = { q?: string; state?: string; worker?: string }
+const optionalString = (value: unknown) => (typeof value === 'string' && value ? value : undefined)
+
+const rootRoute = createRootRouteWithContext<{ disconnect: (message?: string) => void }>()({ component: Shell })
+const overviewRoute = createRoute({ getParentRoute: () => rootRoute, path: '/', component: OverviewPage })
+const workersRoute = createRoute({ getParentRoute: () => rootRoute, path: '/workers', component: WorkersPage })
+const workerRoute = createRoute({ getParentRoute: () => rootRoute, path: '/workers/$workerId', component: WorkerPage })
+const jobsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/jobs',
+  component: JobsPage,
+  validateSearch: (search: Record<string, unknown>): JobSearch => ({
+    q: optionalString(search.q),
+    state: optionalString(search.state),
+    worker: optionalString(search.worker),
+  }),
+})
+const jobRoute = createRoute({ getParentRoute: () => rootRoute, path: '/jobs/$jobId', component: JobPage })
+const environmentsRoute = createRoute({ getParentRoute: () => rootRoute, path: '/environments', component: EnvironmentsPage })
+
+const routeTree = rootRoute.addChildren([overviewRoute, workersRoute, workerRoute, jobsRoute, jobRoute, environmentsRoute])
+
+// Hash history: deep links survive any static host and never depend on server-side route fallback.
+const createAppRouter = () =>
+  createRouter({
+    routeTree,
+    history: createHashHistory(),
+    context: { disconnect: () => {} },
+    defaultNotFoundComponent: () => (
+      <EmptyState icon={<CircleAlert />} title="Page not found" detail="This dashboard address does not exist.">
+        <Link className="text-action" to="/">Go to overview</Link>
+      </EmptyState>
+    ),
+  })
+
+declare module '@tanstack/react-router' {
+  interface Register {
+    router: ReturnType<typeof createAppRouter>
+  }
+}
+
+// ---------- App + session ----------
 
 function App() {
-  const [token, setToken] = useState(() => {
-    const hashToken = new URLSearchParams(window.location.hash.replace(/^#/, '')).get('token')
-    if (hashToken) {
-      sessionStorage.setItem(tokenKey, hashToken)
-      window.history.replaceState(null, '', window.location.pathname + window.location.search)
-      return hashToken
-    }
-    return sessionStorage.getItem(tokenKey) ?? ''
-  })
-  const [tokenInput, setTokenInput] = useState('')
-  const [snapshot, setSnapshot] = useState<Snapshot | null>(null)
-  const [error, setError] = useState('')
-  const [updatedAt, setUpdatedAt] = useState<number | null>(null)
-  const [view, setView] = useState<View>('overview')
-  const [refreshing, setRefreshing] = useState(false)
-  const [refreshKey, setRefreshKey] = useState(0)
+  const queryClient = useQueryClient()
+  const [token, setToken] = useState(readToken)
+  const [authError, setAuthError] = useState('')
+  const [router] = useState(createAppRouter)
 
-  useEffect(() => {
-    if (!token) return
-    let stopped = false
-    let timer: number | undefined
-
-    const poll = async () => {
-      setRefreshing(true)
-      try {
-        const next = await fetchSnapshot(token)
-        if (!stopped) {
-          setSnapshot(next)
-          setError('')
-          setUpdatedAt(Date.now())
-        }
-      } catch (cause) {
-        if (!stopped) {
-          const message = cause instanceof Error ? cause.message : 'Could not reach the Hub.'
-          if (message === 'AUTH_REQUIRED') {
-            setToken('')
-            setTokenInput('')
-            setSnapshot(null)
-            setError('This token was rejected. Enter the Hub token to reconnect.')
-          } else {
-            setError(message)
-          }
-        }
-      } finally {
-        if (!stopped) {
-          setRefreshing(false)
-          timer = window.setTimeout(poll, 5000)
-        }
-      }
-    }
-
-    void poll()
-    return () => {
-      stopped = true
-      if (timer !== undefined) window.clearTimeout(timer)
-    }
-  }, [token, refreshKey])
-
-  const workers = snapshot?.workers ?? []
-  const jobs = snapshot?.jobs ?? []
-  const onlineWorkers = workers.filter((worker) => worker.online)
-  const activeJobs = jobs.filter((job) => activeJobStates.has(job.state))
-  const queuedJobs = jobs.filter((job) => job.state === 'queued')
-  const jobsByWorker = new Map<string, number>()
-  for (const job of activeJobs) {
-    if (job.worker_id) jobsByWorker.set(job.worker_id, (jobsByWorker.get(job.worker_id) ?? 0) + 1)
-  }
-  const schedulableWorkers = onlineWorkers.filter((worker) => !worker.paused)
-  const totalCapacity = schedulableWorkers.reduce((sum, worker) => sum + worker.max_jobs, 0)
-  const availableSlots = schedulableWorkers.reduce(
-    (sum, worker) => sum + Math.max(worker.max_jobs - (jobsByWorker.get(worker.id) ?? 0), 0),
-    0,
-  )
-
-  const connect = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    const next = tokenInput.trim()
-    if (!next) return
-    setToken(next)
-    setTokenInput('')
-    sessionStorage.setItem(tokenKey, next)
-    setSnapshot(null)
-  }
-
-  const disconnect = () => {
+  const disconnect = useCallback((message = '') => {
+    clearToken()
+    queryClient.clear()
     setToken('')
-    setSnapshot(null)
-    sessionStorage.removeItem(tokenKey)
-    setError('')
-  }
+    setAuthError(message)
+  }, [queryClient])
 
   if (!token) {
     return (
       <ConnectScreen
-        error={error}
-        token={tokenInput}
-        onTokenChange={setTokenInput}
-        onSubmit={connect}
+        error={authError}
+        onConnect={(next) => {
+          storeToken(next)
+          setAuthError('')
+          setToken(next)
+        }}
       />
     )
   }
-
-  const insecureRemote =
-    window.location.protocol !== 'https:' &&
-    !['localhost', '127.0.0.1', '[::1]'].includes(window.location.hostname)
-
-  return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <a className="brand" href="#overview" onClick={() => setView('overview')}>
-          <span className="brand-mark"><Workflow size={18} strokeWidth={2.3} /></span>
-          <span className="brand-name">ylcc<span>compute pool</span></span>
-        </a>
-        <div className="nav-label">Workspace</div>
-        <nav className="nav-list" aria-label="Dashboard views">
-          <NavButton active={view === 'overview'} icon={<LayoutDashboard />} label="Overview" onClick={() => setView('overview')} />
-          <NavButton active={view === 'workers'} icon={<Server />} label="Workers" count={workers.length} onClick={() => setView('workers')} />
-          <NavButton active={view === 'jobs'} icon={<Activity />} label="Jobs" count={jobs.length} onClick={() => setView('jobs')} />
-          <NavButton active={view === 'environments'} icon={<Boxes />} label="Environments" count={snapshot?.environments.length ?? 0} onClick={() => setView('environments')} />
-        </nav>
-        <div className="sidebar-bottom">
-          <div className="hub-card">
-            <span className="hub-card-icon"><Radio size={15} /></span>
-            <div className="hub-card-copy">
-              <span>Hub endpoint</span>
-              <strong title={window.location.host}>{window.location.host}</strong>
-            </div>
-            <span className="online-dot" aria-label="Connected" />
-          </div>
-          <button className="account-button" onClick={disconnect}>
-            <span className="account-avatar">Y</span>
-            <span className="account-copy"><strong>Pool session</strong><small>Connected securely</small></span>
-            <LogOut size={15} aria-hidden="true" />
-          </button>
-        </div>
-      </aside>
-
-      <main className="main-panel">
-        <header className="topbar">
-          <div className="breadcrumb"><span>YLCC</span><span className="breadcrumb-slash">/</span><strong>{viewLabel(view)}</strong></div>
-          <div className="topbar-actions">
-            <span className="refresh-status">
-              <span className={error ? 'status-dot status-dot-error' : 'status-dot'} />
-              {error ? 'Hub unreachable' : 'Live connection'}
-            </span>
-            <Button variant="outline" size="sm" onClick={() => setRefreshKey((key) => key + 1)} disabled={refreshing} title="Refresh dashboard">
-              <RefreshCw size={14} className={refreshing ? 'spin' : ''} />
-              <span>Refresh</span>
-            </Button>
-            <button className="icon-button help-button" title="Dashboard updates every 5 seconds" aria-label="Dashboard updates every 5 seconds">
-              <CircleHelp size={17} />
-            </button>
-          </div>
-        </header>
-
-        <div className="page-content">
-          {insecureRemote && (
-            <div className="security-notice" role="status">
-              <LockKeyhole size={16} />
-              <span>This page is using HTTP. Use a trusted private network or HTTPS before entering a pool token.</span>
-            </div>
-          )}
-          {error && (
-            <div className="error-notice" role="alert">
-              <CircleAlert size={16} />
-              <span>{error}</span>
-            </div>
-          )}
-          {!snapshot ? (
-            <LoadingState />
-          ) : (
-            <>
-              <div className="page-heading">
-                <div>
-                  <h1>{viewLabel(view)}</h1>
-                  <p>{viewDescription(view)}</p>
-                </div>
-                <div className="last-updated"><Clock3 size={14} /> Updated {updatedAt ? formatTime(updatedAt / 1000) : '—'}</div>
-              </div>
-              {view === 'overview' && (
-                <Overview
-                  workers={workers}
-                  jobs={jobs}
-                  statuses={snapshot.environmentStatuses}
-                  onlineCount={onlineWorkers.length}
-                  activeCount={activeJobs.length}
-                  queuedCount={queuedJobs.length}
-                  availableSlots={availableSlots}
-                  totalCapacity={totalCapacity}
-                  jobsByWorker={jobsByWorker}
-                  onNavigate={setView}
-                />
-              )}
-              {view === 'workers' && <WorkersView workers={workers} jobsByWorker={jobsByWorker} />}
-              {view === 'jobs' && <JobsView jobs={jobs} token={token} />}
-              {view === 'environments' && (
-                <EnvironmentsView environments={snapshot.environments} statuses={snapshot.environmentStatuses} />
-              )}
-            </>
-          )}
-          <footer className="page-footer">
-            <span><ShieldCheck size={14} /> Read-only dashboard</span>
-            <span>Auto-refreshes every 5 seconds</span>
-          </footer>
-        </div>
-      </main>
-    </div>
-  )
+  return <RouterProvider router={router} context={{ disconnect }} />
 }
 
-function ConnectScreen({
-  error,
-  token,
-  onTokenChange,
-  onSubmit,
-}: {
-  error: string
-  token: string
-  onTokenChange: (value: string) => void
-  onSubmit: (event: FormEvent<HTMLFormElement>) => void
-}) {
-  const insecureRemote =
-    window.location.protocol !== 'https:' &&
-    !['localhost', '127.0.0.1', '[::1]'].includes(window.location.hostname)
+const isInsecureRemote = () =>
+  window.location.protocol !== 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(window.location.hostname)
+
+function ConnectScreen({ error, onConnect }: { error: string; onConnect: (token: string) => void }) {
+  const [token, setToken] = useState('')
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (token.trim()) onConnect(token.trim())
+  }
 
   return (
     <main className="connect-screen">
@@ -268,7 +147,7 @@ function ConnectScreen({
         <h1>Connect to your Hub</h1>
         <p className="connect-description">Enter the pool token configured for this Hub. Find its local file path with `ylcc dashboard`; it is never displayed by ylcc. Your dashboard reads status from this address.</p>
         <div className="endpoint-field"><span className="online-dot" />{window.location.origin}</div>
-        <form onSubmit={onSubmit} className="connect-form">
+        <form onSubmit={submit} className="connect-form">
           <label htmlFor="pool-token">Pool token</label>
           <input
             id="pool-token"
@@ -276,12 +155,12 @@ function ConnectScreen({
             autoComplete="off"
             autoFocus
             value={token}
-            onChange={(event) => onTokenChange(event.target.value)}
+            onChange={(event) => setToken(event.target.value)}
             placeholder="Paste token"
             required
           />
           {error && <p className="form-error" role="alert">{error}</p>}
-          {insecureRemote && <p className="form-warning"><LockKeyhole size={14} /> HTTP is not encrypted. Connect over a trusted private network or HTTPS.</p>}
+          {isInsecureRemote() && <p className="form-warning"><LockKeyhole size={14} /> HTTP is not encrypted. Connect over a trusted private network or HTTPS.</p>}
           <Button className="connect-submit" type="submit" disabled={!token.trim()}>
             Connect to Hub <Check size={16} />
           </Button>
@@ -293,72 +172,187 @@ function ConnectScreen({
   )
 }
 
-function NavButton({
-  active,
-  icon,
-  label,
-  count,
-  onClick,
-}: {
-  active: boolean
-  icon: React.ReactNode
-  label: string
-  count?: number
-  onClick: () => void
-}) {
+// ---------- Shell ----------
+
+const sectionLabels: Record<string, string> = { '': 'Overview', workers: 'Workers', jobs: 'Jobs', environments: 'Environments' }
+
+function Shell() {
+  const { disconnect } = rootRoute.useRouteContext()
+  const snapshot = useQuery(snapshotQuery)
+  const now = useNow()
+  const pathname = useRouterState({ select: (state) => state.location.pathname })
+  const [section = '', detail] = pathname.split('/').filter(Boolean)
+
+  useEffect(() => {
+    if (snapshot.error instanceof AuthError) disconnect(snapshot.error.message)
+  }, [snapshot.error, disconnect])
+
+  const data = snapshot.data
+  const failed = snapshot.isError && !(snapshot.error instanceof AuthError)
+  const retry = () => void snapshot.refetch()
+
   return (
-    <button className={`nav-button${active ? ' nav-button-active' : ''}`} onClick={onClick} aria-current={active ? 'page' : undefined}>
-      {icon}<span>{label}</span>{count !== undefined && <small>{count}</small>}
-    </button>
+    <div className="app-shell">
+      <aside className="sidebar">
+        <Link className="brand" to="/">
+          <span className="brand-mark"><Workflow size={18} strokeWidth={2.3} /></span>
+          <span className="brand-name">ylcc<span>compute pool</span></span>
+        </Link>
+        <div className="nav-label">Workspace</div>
+        <nav className="nav-list" aria-label="Dashboard views">
+          <NavLink to="/" icon={<LayoutDashboard />} label="Overview" exact />
+          <NavLink to="/workers" icon={<Server />} label="Workers" count={data?.workers.length} />
+          <NavLink to="/jobs" icon={<Activity />} label="Jobs" count={data?.jobs.length} />
+          <NavLink to="/environments" icon={<Boxes />} label="Environments" count={data?.environments.length} />
+        </nav>
+        <div className="sidebar-bottom">
+          <div className="hub-card">
+            <span className="hub-card-icon"><Radio size={15} /></span>
+            <div className="hub-card-copy">
+              <span>Hub endpoint</span>
+              <strong title={window.location.host}>{window.location.host}</strong>
+            </div>
+            <span className={failed ? 'online-dot online-dot-error' : 'online-dot'} aria-label={failed ? 'Unreachable' : 'Connected'} />
+          </div>
+          <button className="account-button" onClick={() => disconnect()}>
+            <span className="account-avatar">Y</span>
+            <span className="account-copy"><strong>Pool session</strong><small>Disconnect and clear token</small></span>
+            <LogOut size={15} aria-hidden="true" />
+          </button>
+        </div>
+      </aside>
+
+      <main className="main-panel">
+        <header className="topbar">
+          <nav className="breadcrumb" aria-label="Breadcrumb">
+            <span>YLCC</span>
+            <span className="breadcrumb-slash">/</span>
+            {detail ? (
+              <>
+                <Link to={`/${section}` as '/'}>{sectionLabels[section] ?? section}</Link>
+                <span className="breadcrumb-slash">/</span>
+                <strong className="breadcrumb-detail">{decodeURIComponent(detail)}</strong>
+              </>
+            ) : <strong>{sectionLabels[section] ?? 'Not found'}</strong>}
+          </nav>
+          <div className="topbar-actions">
+            <span className="refresh-status" role="status" title={`Auto-refreshes every 5 seconds`}>
+              <span className={failed ? 'status-dot status-dot-error' : 'status-dot'} />
+              <span className="refresh-label">
+                {failed ? 'Hub unreachable' : snapshot.dataUpdatedAt ? `Updated ${formatRelative(snapshot.dataUpdatedAt, now)}` : 'Connecting'}
+              </span>
+            </span>
+            <Button variant="outline" size="sm" onClick={retry} disabled={snapshot.isFetching} title="Refresh now" aria-label="Refresh now">
+              <RefreshCw size={14} className={snapshot.isFetching ? 'spin' : ''} />
+              <span>Refresh</span>
+            </Button>
+          </div>
+        </header>
+
+        <div className="page-content">
+          {isInsecureRemote() && (
+            <div className="security-notice" role="status">
+              <LockKeyhole size={16} />
+              <span>This page is using HTTP. Use a trusted private network or HTTPS before entering a pool token.</span>
+            </div>
+          )}
+          {failed && data && (
+            <div className="error-notice" role="alert">
+              <CircleAlert size={16} />
+              <span>Hub unreachable: {errorMessage(snapshot.error)}. Showing data from {formatRelative(snapshot.dataUpdatedAt, now)}.</span>
+              <button className="text-action notice-action" onClick={retry}>Retry</button>
+            </div>
+          )}
+          {data ? <Outlet /> : failed ? (
+            <EmptyState icon={<CircleAlert />} title="Could not reach the Hub" detail={errorMessage(snapshot.error)}>
+              <Button variant="outline" size="sm" onClick={retry} disabled={snapshot.isFetching}>Try again</Button>
+            </EmptyState>
+          ) : <LoadingState />}
+          <footer className="page-footer">
+            <span><ShieldCheck size={14} /> Read-only dashboard</span>
+            <span>Auto-refreshes every 5 seconds</span>
+          </footer>
+        </div>
+      </main>
+    </div>
   )
 }
 
-function Overview({
-  workers,
-  jobs,
-  statuses,
-  onlineCount,
-  activeCount,
-  queuedCount,
-  availableSlots,
-  totalCapacity,
-  jobsByWorker,
-  onNavigate,
-}: {
-  workers: WorkerInfo[]
-  jobs: Job[]
-  statuses: EnvironmentStatus[]
-  onlineCount: number
-  activeCount: number
-  queuedCount: number
-  availableSlots: number
-  totalCapacity: number
-  jobsByWorker: Map<string, number>
-  onNavigate: (view: View) => void
-}) {
-  const readyStatuses = statuses.filter((status) => status.state === 'ready').length
-  const recentJobs = [...jobs].sort((a, b) => b.updated_at - a.updated_at).slice(0, 5)
+function NavLink({ to, icon, label, count, exact }: { to: '/' | '/workers' | '/jobs' | '/environments'; icon: ReactNode; label: string; count?: number; exact?: boolean }) {
+  return (
+    <Link to={to} className="nav-button" activeProps={{ className: 'nav-button-active' }} activeOptions={{ exact, includeSearch: false }}>
+      {icon}<span>{label}</span>{count !== undefined && <small>{count}</small>}
+    </Link>
+  )
+}
+
+/** Pages render only inside Shell once the first snapshot has arrived. */
+function useSnapshot() {
+  return useQuery(snapshotQuery).data!
+}
+
+function PageHeading({ title, description, back, children }: { title: ReactNode; description?: ReactNode; back?: ReactNode; children?: ReactNode }) {
+  return (
+    <div className="page-heading">
+      <div className="page-heading-copy">
+        {back}
+        <h1>{title}</h1>
+        {description && <p>{description}</p>}
+      </div>
+      {children}
+    </div>
+  )
+}
+
+// ---------- Overview ----------
+
+function OverviewPage() {
+  const { workers, jobs, environmentStatuses } = useSnapshot()
+  const onlineWorkers = workers.filter((worker) => worker.online)
+  const activeJobs = jobs.filter((job) => activeJobStates.has(job.state))
+  const queuedCount = jobs.filter((job) => job.state === 'queued').length
+  const failedCount = jobs.filter((job) => job.state === 'failed').length
+  const jobsByWorker = countActiveJobs(jobs)
+  const schedulable = onlineWorkers.filter((worker) => !worker.paused)
+  const totalCapacity = schedulable.reduce((sum, worker) => sum + worker.max_jobs, 0)
+  const availableSlots = schedulable.reduce((sum, worker) => sum + Math.max(worker.max_jobs - (jobsByWorker.get(worker.id) ?? 0), 0), 0)
+  const readyStatuses = environmentStatuses.filter((status) => status.state === 'ready').length
+  const recentJobs = [...jobs].sort((a, b) => b.updated_at - a.updated_at).slice(0, 6)
 
   return (
     <>
+      <PageHeading title="Overview" description="A live view of your self-hosted compute pool." />
       <section className="metrics-strip" aria-label="Pool summary">
-        <Metric icon={<Server />} label="Online workers" value={`${onlineCount} / ${workers.length}`} note={workers.length ? `${workers.length - onlineCount} offline` : 'No workers registered'} tone="blue" />
-        <Metric icon={<Activity />} label="Active jobs" value={String(activeCount)} note={queuedCount ? `${queuedCount} waiting in queue` : 'Queue is clear'} tone="orange" />
-        <Metric icon={<Cpu />} label="Available slots" value={String(availableSlots)} note={`${totalCapacity} on unpaused workers`} tone="green" />
-        <Metric icon={<Boxes />} label="Ready environments" value={String(readyStatuses)} note={`${statuses.length} worker installs reported`} tone="slate" />
+        <Link className="metric-item metric-link" to="/workers">
+          <Metric icon={<Server />} label="Online workers" value={`${onlineWorkers.length} / ${workers.length}`} note={workers.length ? `${workers.length - onlineWorkers.length} offline` : 'No workers registered'} tone="blue" />
+        </Link>
+        <Link className="metric-item metric-link" to="/jobs" search={{ state: 'active' }}>
+          <Metric icon={<Activity />} label="Active jobs" value={String(activeJobs.length)} note={queuedCount ? `${queuedCount} waiting in queue` : 'Queue is clear'} tone="orange" />
+        </Link>
+        <div className="metric-item">
+          <Metric icon={<Cpu />} label="Available slots" value={String(availableSlots)} note={`${totalCapacity} on unpaused workers`} tone="green" />
+        </div>
+        <Link className="metric-item metric-link" to="/environments">
+          <Metric icon={<Boxes />} label="Ready environments" value={String(readyStatuses)} note={`${environmentStatuses.length} worker installs reported`} tone="slate" />
+        </Link>
       </section>
 
+      {failedCount > 0 && (
+        <Link className="security-notice notice-link" to="/jobs" search={{ state: 'failed' }}>
+          <CircleAlert size={16} />
+          <span>{failedCount} failed {failedCount === 1 ? 'job' : 'jobs'} in history. Review failures</span>
+        </Link>
+      )}
+
       <section className="content-section">
-        <SectionHeading title="Worker fleet" detail={`${onlineCount} online`} action="All workers" onAction={() => onNavigate('workers')} />
-        {workers.length ? (
-          <WorkersTable workers={workers.slice(0, 6)} jobsByWorker={jobsByWorker} />
-        ) : (
+        <SectionHeading title="Worker fleet" detail={`${onlineWorkers.length} online`} action={<Link className="text-action" to="/workers">All workers<span aria-hidden="true">→</span></Link>} />
+        {workers.length ? <WorkersTable workers={workers.slice(0, 6)} jobsByWorker={jobsByWorker} /> : (
           <EmptyState icon={<Server />} title="No workers connected" detail="Start a worker with this Hub address and pool token to see it here." />
         )}
       </section>
 
-      <section className="content-section jobs-section">
-        <SectionHeading title="Recent jobs" detail={`${jobs.length} total`} action="All jobs" onAction={() => onNavigate('jobs')} />
+      <section className="content-section">
+        <SectionHeading title="Recent jobs" detail={`${jobs.length} total`} action={<Link className="text-action" to="/jobs">All jobs<span aria-hidden="true">→</span></Link>} />
         {recentJobs.length ? <JobsTable jobs={recentJobs} /> : (
           <EmptyState icon={<Terminal />} title="No jobs yet" detail="Jobs submitted to this pool will appear here." />
         )}
@@ -367,181 +361,380 @@ function Overview({
   )
 }
 
-function WorkersView({ workers, jobsByWorker }: { workers: WorkerInfo[]; jobsByWorker: Map<string, number> }) {
+function countActiveJobs(jobs: Job[]) {
+  const counts = new Map<string, number>()
+  for (const job of jobs) {
+    if (job.worker_id && activeJobStates.has(job.state)) counts.set(job.worker_id, (counts.get(job.worker_id) ?? 0) + 1)
+  }
+  return counts
+}
+
+// ---------- Workers ----------
+
+function WorkersPage() {
+  const { workers, jobs } = useSnapshot()
+  const sorted = [...workers].sort((a, b) => Number(b.online) - Number(a.online) || a.id.localeCompare(b.id))
   return (
-    <section className="content-section view-section">
-      <SectionHeading title="Registered workers" detail={`${workers.filter((worker) => worker.online).length} online now`} />
-      {workers.length ? <WorkersTable workers={workers} jobsByWorker={jobsByWorker} /> : (
-        <EmptyState icon={<Server />} title="No workers registered" detail="Workers appear after they connect to this Hub." />
-      )}
-    </section>
+    <>
+      <PageHeading title="Workers" description="Connected machines and their available capacity." />
+      <section className="content-section">
+        <SectionHeading title="Registered workers" detail={`${workers.filter((worker) => worker.online).length} online now`} />
+        {workers.length ? <WorkersTable workers={sorted} jobsByWorker={countActiveJobs(jobs)} /> : (
+          <EmptyState icon={<Server />} title="No workers registered" detail="Workers appear after they connect to this Hub." />
+        )}
+      </section>
+    </>
   )
 }
 
-function JobsView({ jobs, token }: { jobs: Job[]; token: string }) {
-  const [filter, setFilter] = useState('')
-  const [selectedId, setSelectedId] = useState(jobs[0]?.id ?? '')
-  const [logs, setLogs] = useState<unknown[]>([])
-  const [logError, setLogError] = useState('')
-  const ordered = [...jobs]
-    .filter((job) => {
-      const haystack = [job.id, job.state, job.worker_id ?? '', job.spec.environment ?? '', ...job.spec.command].join(' ').toLowerCase()
-      return haystack.includes(filter.toLowerCase())
-    })
-    .sort((a, b) => b.created_at - a.created_at)
-  useEffect(() => {
-    if (!selectedId) return
-    let stopped = false
-    setLogError('')
-    void fetchJobLogs(token, selectedId).then((next) => {
-      if (!stopped) setLogs(next)
-    }).catch((cause) => {
-      if (!stopped) {
-        const message = cause instanceof Error ? cause.message : 'Could not load logs.'
-        if (message === 'AUTH_REQUIRED') setLogError('Token rejected.')
-        else setLogError(message)
-      }
-    })
-    return () => { stopped = true }
-  }, [selectedId, token])
+function WorkerPage() {
+  const { workerId } = workerRoute.useParams()
+  const { workers, jobs, environmentStatuses } = useSnapshot()
+  const worker = workers.find((candidate) => candidate.id === workerId)
+  const back = <Link className="back-link" to="/workers"><ArrowLeft size={14} /> Workers</Link>
+  if (!worker) {
+    return (
+      <>
+        <PageHeading title="Worker not found" back={back} />
+        <EmptyState icon={<Server />} title={`No worker named ${workerId}`} detail="It may have been removed from the Hub." />
+      </>
+    )
+  }
+  const caps = worker.capabilities
+  const workerJobs = jobs.filter((job) => job.worker_id === worker.id).sort((a, b) => b.updated_at - a.updated_at)
+  const active = workerJobs.filter((job) => activeJobStates.has(job.state))
+  const statuses = environmentStatuses.filter((status) => status.worker_id === worker.id)
+  const tools = Object.entries(caps.tools).sort(([a], [b]) => a.localeCompare(b))
+
   return (
-    <section className="content-section view-section">
-      <SectionHeading title="Job history" detail={`${ordered.length} of ${jobs.length} jobs`} />
-      <div className="filter-row">
-        <input
-          className="token-input"
-          type="search"
-          aria-label="Filter jobs"
-          placeholder="Filter by job, state, worker, command"
-          value={filter}
-          onChange={(event) => setFilter(event.target.value)}
+    <>
+      <PageHeading title={worker.id} back={back} description={<WorkerState worker={worker} />} />
+      <section className="content-section">
+        <dl className="detail-grid">
+          <Detail label="Platform">{caps.os} · <code>{caps.arch}</code>{caps.abi && <> · <code>{caps.abi}</code></>}</Detail>
+          <Detail label="Resources">{caps.cpus} CPU · {formatMemory(caps.memory_bytes)}</Detail>
+          <Detail label="Running jobs">{active.length} / {worker.max_jobs}</Detail>
+          <Detail label="Last seen"><RelativeTime timestamp={worker.last_seen} /></Detail>
+          <Detail label="GPU">{caps.gpu.length ? caps.gpu.join(', ') : 'None'}</Detail>
+          <Detail label="Runtimes">{caps.runtimes.length ? caps.runtimes.join(', ') : 'None'}</Detail>
+          <Detail label="Containerized">{caps.containerized ? 'Yes' : 'No'}</Detail>
+          <Detail label="CPU features">{caps.cpu_features?.length ? `${caps.cpu_features.length} reported` : 'None reported'}</Detail>
+        </dl>
+      </section>
+
+      <section className="content-section">
+        <SectionHeading
+          title="Jobs on this worker"
+          detail={`${active.length} active · ${workerJobs.length} total`}
+          action={workerJobs.length > 0 && <Link className="text-action" to="/jobs" search={{ worker: worker.id }}>View in jobs<span aria-hidden="true">→</span></Link>}
         />
-      </div>
-      {ordered.length ? <JobsTable jobs={ordered} /> : (
-        <EmptyState icon={<Terminal />} title="No matching jobs" detail="Submitted jobs and their latest states will appear here." />
-      )}
-      {jobs.length > 0 && (
-        <div className="log-panel">
-          <SectionHeading title="Job logs" detail={selectedId ? `Selected ${selectedId.slice(0, 8)}` : 'No job selected'} />
-          <select className="token-input" value={selectedId} onChange={(event) => setSelectedId(event.target.value)}>
-            {jobs.map((job) => <option key={job.id} value={job.id}>{job.id.slice(0, 8)} · {job.state}</option>)}
-          </select>
-          {logError ? <p className="form-error" role="alert">{logError}</p> : (
-            <pre className="command-cell">{logs.length ? JSON.stringify(logs, null, 2) : 'No logs returned.'}</pre>
-          )}
-        </div>
-      )}
-    </section>
-  )
-}
+        {workerJobs.length ? <JobsTable jobs={workerJobs.slice(0, 10)} /> : (
+          <EmptyState icon={<Terminal />} title="No jobs yet" detail="Jobs assigned to this worker will appear here." />
+        )}
+      </section>
 
-function EnvironmentsView({
-  environments,
-  statuses,
-}: {
-  environments: Snapshot['environments']
-  statuses: EnvironmentStatus[]
-}) {
-  return (
-    <section className="content-section view-section">
-      <SectionHeading title="Environment catalogue" detail={`${environments.length} definitions`} />
-      {environments.length ? (
-        <div className="table-scroll"><table className="data-table">
-          <thead><tr><th>Environment</th><th>Revision</th><th>Image</th><th>Worker installations</th></tr></thead>
-          <tbody>{environments.map((environment) => {
-            const installed = statuses.filter((status) => status.environment_id === environment.id && status.revision === environment.revision)
-            return <tr key={`${environment.id}-${environment.revision}`}>
-              <td><strong>{environment.id}</strong></td>
-              <td><code>{environment.revision}</code></td>
-              <td className="truncate-cell">{environment.image ?? 'Native'}</td>
-              <td><div className="install-list">{installed.length ? installed.map((status) => (
-                <span key={`${status.worker_id}-${status.environment_id}`} className="install-item">
-                  <StatusBadge state={status.state} /> <span>{status.worker_id}</span>
-                </span>
-              )) : <span className="muted-text">No worker status</span>}</div></td>
-            </tr>
-          })}</tbody>
-        </table></div>
-      ) : <EmptyState icon={<Boxes />} title="No environments configured" detail="Environment definitions will appear here when added to the Hub." />}
-    </section>
+      <section className="content-section">
+        <SectionHeading title="Environments" detail={`${statuses.length} reported`} />
+        {statuses.length ? (
+          <div className="table-scroll"><table className="data-table">
+            <thead><tr><th>Environment</th><th>Revision</th><th>State</th><th>Error</th></tr></thead>
+            <tbody>{statuses.map((status) => (
+              <tr key={`${status.environment_id}-${status.revision}`}>
+                <td><strong>{status.environment_id}</strong></td>
+                <td><code>{status.revision}</code></td>
+                <td><StatusBadge state={status.state} /></td>
+                <td className="truncate-cell" title={status.error ?? undefined}>{status.error ?? <span className="muted-text">—</span>}</td>
+              </tr>
+            ))}</tbody>
+          </table></div>
+        ) : <EmptyState icon={<Boxes />} title="No environments reported" detail="This worker has not prepared any environments." />}
+      </section>
+
+      <section className="content-section">
+        <SectionHeading title="Tools" detail={`${tools.length} detected`} />
+        {tools.length ? (
+          <div className="table-scroll"><table className="data-table">
+            <thead><tr><th>Tool</th><th>Version</th></tr></thead>
+            <tbody>{tools.map(([name, version]) => <tr key={name}><td><strong>{name}</strong></td><td><code>{version}</code></td></tr>)}</tbody>
+          </table></div>
+        ) : <EmptyState icon={<Cpu />} title="No tools detected" detail="The worker did not report any toolchains." />}
+      </section>
+    </>
   )
 }
 
 function WorkersTable({ workers, jobsByWorker }: { workers: WorkerInfo[]; jobsByWorker: Map<string, number> }) {
+  const navigate = useNavigate()
   return (
     <div className="table-scroll"><table className="data-table workers-table">
       <thead><tr><th>Worker</th><th>State</th><th>Platform</th><th>Resources</th><th>Jobs</th><th>Last seen</th></tr></thead>
-      <tbody>{workers.map((worker) => {
-        const active = jobsByWorker.get(worker.id) ?? 0
-        return <tr key={worker.id}>
-          <td><div className="worker-name"><span className={`worker-avatar worker-avatar-${worker.capabilities.os}`}>{osGlyph(worker.capabilities.os)}</span><strong>{worker.id}</strong></div></td>
+      <tbody>{workers.map((worker) => (
+        <tr key={worker.id} className="clickable-row" onClick={() => navigate({ to: '/workers/$workerId', params: { workerId: worker.id } })}>
+          <td><div className="worker-name"><span className={`worker-avatar worker-avatar-${worker.capabilities.os}`}>{osGlyph(worker.capabilities.os)}</span><Link className="table-link" to="/workers/$workerId" params={{ workerId: worker.id }}>{worker.id}</Link></div></td>
           <td><WorkerState worker={worker} /></td>
           <td><span className="platform-name">{worker.capabilities.os}</span><span className="platform-arch">{worker.capabilities.arch}</span></td>
           <td><div className="resource-line"><Cpu size={13} /> {worker.capabilities.cpus} CPU <span className="resource-divider">·</span> {formatMemory(worker.capabilities.memory_bytes)}</div></td>
-          <td><span className="capacity-value">{active}<span> / {worker.max_jobs}</span></span></td>
-          <td className="time-cell">{formatTime(worker.last_seen)}</td>
-        </tr>
-      })}</tbody>
-    </table></div>
-  )
-}
-
-function JobsTable({ jobs }: { jobs: Job[] }) {
-  return (
-    <div className="table-scroll"><table className="data-table jobs-table">
-      <thead><tr><th>Job</th><th>State</th><th>Command</th><th>Worker</th><th>Environment</th><th>Updated</th></tr></thead>
-      <tbody>{jobs.map((job) => (
-        <tr key={job.id}>
-          <td><code className="job-id">{job.id.slice(0, 8)}</code></td>
-          <td><StatusBadge state={job.state} /></td>
-          <td><code className="command-cell" title={job.spec.command.join(' ')}>{job.spec.command.join(' ') || '—'}</code></td>
-          <td>{job.worker_id ?? <span className="muted-text">Unassigned</span>}</td>
-          <td>{job.spec.environment ?? <span className="muted-text">Native</span>}</td>
-          <td className="time-cell">{formatTime(job.updated_at)}</td>
+          <td><span className="capacity-value">{jobsByWorker.get(worker.id) ?? 0}<span> / {worker.max_jobs}</span></span></td>
+          <td className="time-cell"><RelativeTime timestamp={worker.last_seen} /></td>
         </tr>
       ))}</tbody>
     </table></div>
   )
 }
 
-function Metric({
-  icon,
-  label,
-  value,
-  note,
-  tone,
-}: {
-  icon: React.ReactNode
-  label: string
-  value: string
-  note: string
-  tone: string
-}) {
+// ---------- Jobs ----------
+
+function JobsPage() {
+  const { jobs, workers } = useSnapshot()
+  const search = jobsRoute.useSearch()
+  const navigate = useNavigate({ from: '/jobs' })
+  const setSearch = useCallback(
+    (patch: JobSearch) => void navigate({ search: (previous) => ({ ...previous, ...patch }), replace: true }),
+    [navigate],
+  )
+  const [query, setQuery] = useState(search.q ?? '')
+  useEffect(() => {
+    const next = query.trim() || undefined
+    if (next === search.q) return
+    const timer = window.setTimeout(() => setSearch({ q: next }), 200)
+    return () => window.clearTimeout(timer)
+  }, [query, search.q, setSearch])
+
+  const needle = search.q?.toLowerCase()
+  const filtered = jobs
+    .filter((job) => {
+      if (search.state && (search.state === 'active' ? !activeJobStates.has(job.state) : job.state !== search.state)) return false
+      if (search.worker && job.worker_id !== search.worker) return false
+      if (!needle) return true
+      return [job.id, job.state, job.worker_id ?? '', job.spec.environment ?? '', ...job.spec.command].join(' ').toLowerCase().includes(needle)
+    })
+    .sort((a, b) => b.created_at - a.created_at)
+  const filtering = Boolean(search.q || search.state || search.worker)
+  const workerIds = [...new Set([...workers.map((worker) => worker.id), ...(search.worker ? [search.worker] : [])])].sort()
+
   return (
-    <div className="metric-item">
+    <>
+      <PageHeading title="Jobs" description="Recent execution state across the pool." />
+      <section className="content-section">
+        <div className="filter-row" role="search">
+          <input
+            className="field field-search"
+            type="search"
+            aria-label="Search jobs"
+            placeholder="Search job, command, worker, environment"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+          />
+          <select className="field" aria-label="Filter by state" value={search.state ?? ''} onChange={(event) => setSearch({ state: event.target.value || undefined })}>
+            <option value="">All states</option>
+            <option value="active">Active (assigned + running)</option>
+            {jobStates.map((state) => <option key={state} value={state}>{state}</option>)}
+          </select>
+          <select className="field" aria-label="Filter by worker" value={search.worker ?? ''} onChange={(event) => setSearch({ worker: event.target.value || undefined })}>
+            <option value="">All workers</option>
+            {workerIds.map((id) => <option key={id} value={id}>{id}</option>)}
+          </select>
+          {filtering && (
+            <Button variant="ghost" size="sm" onClick={() => { setQuery(''); setSearch({ q: undefined, state: undefined, worker: undefined }) }}>
+              <X size={14} /> Clear
+            </Button>
+          )}
+        </div>
+        <SectionHeading
+          title="Job history"
+          detail={filtered.length > jobListLimit ? `Showing newest ${jobListLimit} of ${filtered.length} matches` : `${filtered.length} of ${jobs.length} jobs`}
+        />
+        {filtered.length ? <JobsTable jobs={filtered.slice(0, jobListLimit)} /> : jobs.length ? (
+          <EmptyState icon={<Terminal />} title="No matching jobs" detail="Try a different search or clear the filters." />
+        ) : (
+          <EmptyState icon={<Terminal />} title="No jobs yet" detail="Submitted jobs and their latest states will appear here." />
+        )}
+      </section>
+    </>
+  )
+}
+
+function JobPage() {
+  const { jobId } = jobRoute.useParams()
+  const { jobs } = useSnapshot()
+  const job = jobs.find((candidate) => candidate.id === jobId)
+  const logs = useQuery({ ...jobLogsQuery(jobId, !job || !terminalJobStates.has(job.state)), enabled: Boolean(job) })
+  const now = useNow()
+  const back = <Link className="back-link" to="/jobs"><ArrowLeft size={14} /> Jobs</Link>
+  if (!job) {
+    return (
+      <>
+        <PageHeading title="Job not found" back={back} />
+        <EmptyState icon={<Terminal />} title={`No job with ID ${jobId}`} detail="It may have been pruned from the Hub history." />
+      </>
+    )
+  }
+  const spec = job.spec
+  const finished = terminalJobStates.has(job.state)
+  const envKeys = Object.keys(spec.env ?? {}).sort()
+  const requirements = Object.entries(spec.requirements ?? {}).filter(([, value]) =>
+    value !== null && value !== false && !(Array.isArray(value) && !value.length) && !(typeof value === 'object' && !Array.isArray(value) && !Object.keys(value as object).length))
+  const inputBytes = (spec.inputs ?? []).reduce((sum, file) => sum + file.size, 0)
+  const results = job.results ?? []
+
+  return (
+    <>
+      <PageHeading title={<code className="heading-code">{job.id}</code>} back={back} description={<StatusBadge state={job.state} />} />
+      {job.error && (
+        <div className="error-notice" role="alert"><CircleAlert size={16} /><span>{job.error}</span></div>
+      )}
+      <section className="content-section">
+        <dl className="detail-grid">
+          <Detail label="Worker">{job.worker_id ? <Link className="table-link" to="/workers/$workerId" params={{ workerId: job.worker_id }}>{job.worker_id}</Link> : <span className="muted-text">Unassigned</span>}</Detail>
+          <Detail label="Environment">{spec.environment ?? <span className="muted-text">Native</span>}</Detail>
+          <Detail label="Created"><RelativeTime timestamp={job.created_at} /></Detail>
+          <Detail label={finished ? 'Duration' : 'Elapsed'}>{formatDuration(job.created_at, finished ? job.updated_at : now)}</Detail>
+          <Detail label="Exit code">{job.exit_code ?? <span className="muted-text">—</span>}</Detail>
+          <Detail label="Priority">{spec.priority ?? 0}</Detail>
+          <Detail label="Timeout">{spec.timeout_secs ? `${spec.timeout_secs}s` : <span className="muted-text">None</span>}</Detail>
+          <Detail label="Container">{spec.container ?? <span className="muted-text">None</span>}</Detail>
+        </dl>
+      </section>
+
+      <section className="content-section">
+        <SectionHeading title="Command" detail={`${spec.command.length} arguments`} />
+        <pre className="code-block">{spec.command.join(' ')}</pre>
+      </section>
+
+      <section className="content-section">
+        <SectionHeading
+          title="Logs"
+          detail={logs.data ? `${logs.data.length} entries${finished ? '' : ' · live'}` : 'Loading'}
+          action={logs.isFetching && <RefreshCw size={13} className="spin muted-text" aria-label="Updating logs" />}
+        />
+        {logs.isError && <div className="error-notice" role="alert"><CircleAlert size={16} /><span>Could not load logs: {errorMessage(logs.error)}</span></div>}
+        {logs.data ? (
+          logs.data.length ? (
+            <pre className="log-view" tabIndex={0} aria-label="Job output">
+              {logs.data.map((entry) => <span key={`${entry.attempt_id}-${entry.seq}`} className={entry.stream === 'stderr' ? 'log-stderr' : undefined}>{entry.text}</span>)}
+            </pre>
+          ) : <EmptyState icon={<FileText />} title={finished ? 'No output recorded' : 'No output yet'} detail={finished ? 'This job finished without writing to stdout or stderr.' : 'Output appears here as the worker streams it.'} />
+        ) : !logs.isError && <LoadingState compact />}
+      </section>
+
+      <section className="content-section">
+        <SectionHeading title="Results" detail={`${results.length} files`} />
+        {results.length ? <FilesTable files={results} /> : (
+          <EmptyState icon={<FileText />} title="No result files" detail={spec.outputs?.length ? `Expected outputs: ${spec.outputs.join(', ')}` : 'This job did not declare any outputs.'} />
+        )}
+      </section>
+
+      <section className="content-section">
+        <SectionHeading title="Spec" detail="As submitted" />
+        <dl className="detail-grid">
+          <Detail label="Inputs">{spec.inputs?.length ? `${spec.inputs.length} files · ${formatBytes(inputBytes)}` : 'None'}</Detail>
+          <Detail label="Outputs">{spec.outputs?.length ? spec.outputs.join(', ') : 'None'}</Detail>
+          <Detail label="Environment variables">{envKeys.length ? <>{envKeys.join(', ')} <span className="muted-text">(values hidden)</span></> : 'None'}</Detail>
+          <Detail label="Attempt"><code>{job.attempt_id ?? '—'}</code></Detail>
+        </dl>
+        {requirements.length > 0 && <pre className="code-block">{JSON.stringify(Object.fromEntries(requirements), null, 2)}</pre>}
+      </section>
+    </>
+  )
+}
+
+function JobsTable({ jobs }: { jobs: Job[] }) {
+  const navigate = useNavigate()
+  return (
+    <div className="table-scroll"><table className="data-table jobs-table">
+      <thead><tr><th>Job</th><th>State</th><th>Command</th><th>Worker</th><th>Environment</th><th>Updated</th></tr></thead>
+      <tbody>{jobs.map((job) => (
+        <tr key={job.id} className="clickable-row" onClick={() => navigate({ to: '/jobs/$jobId', params: { jobId: job.id } })}>
+          <td><Link className="table-link" to="/jobs/$jobId" params={{ jobId: job.id }}><code className="job-id">{job.id.slice(0, 8)}</code></Link></td>
+          <td><StatusBadge state={job.state} /></td>
+          <td><code className="command-cell" title={job.spec.command.join(' ')}>{job.spec.command.join(' ') || '—'}</code></td>
+          <td>{job.worker_id
+            ? <Link className="table-link" to="/workers/$workerId" params={{ workerId: job.worker_id }} onClick={(event) => event.stopPropagation()}>{job.worker_id}</Link>
+            : <span className="muted-text">Unassigned</span>}</td>
+          <td>{job.spec.environment ?? <span className="muted-text">Native</span>}</td>
+          <td className="time-cell"><RelativeTime timestamp={job.updated_at} /></td>
+        </tr>
+      ))}</tbody>
+    </table></div>
+  )
+}
+
+function FilesTable({ files }: { files: { path: string; hash: string; size: number }[] }) {
+  return (
+    <div className="table-scroll"><table className="data-table">
+      <thead><tr><th>Path</th><th>Size</th><th>Hash</th></tr></thead>
+      <tbody>{files.map((file) => (
+        <tr key={file.path}><td><code>{file.path}</code></td><td>{formatBytes(file.size)}</td><td><code title={file.hash}>{file.hash.slice(0, 12)}</code></td></tr>
+      ))}</tbody>
+    </table></div>
+  )
+}
+
+// ---------- Environments ----------
+
+function EnvironmentsPage() {
+  const { environments, environmentStatuses } = useSnapshot()
+  return (
+    <>
+      <PageHeading title="Environments" description="Configured environments and worker readiness." />
+      <section className="content-section">
+        <SectionHeading title="Environment catalogue" detail={`${environments.length} definitions`} />
+        {environments.length ? (
+          <div className="table-scroll"><table className="data-table">
+            <thead><tr><th>Environment</th><th>Revision</th><th>Image</th><th>Worker installations</th></tr></thead>
+            <tbody>{environments.map((environment) => {
+              const installed = environmentStatuses.filter((status) => status.environment_id === environment.id && status.revision === environment.revision)
+              return <tr key={`${environment.id}-${environment.revision}`}>
+                <td><strong>{environment.id}</strong></td>
+                <td><code>{environment.revision}</code></td>
+                <td className="truncate-cell">{environment.image ?? 'Native'}</td>
+                <td><div className="install-list">{installed.length ? installed.map((status) => <InstallItem key={status.worker_id} status={status} />) : <span className="muted-text">No worker status</span>}</div></td>
+              </tr>
+            })}</tbody>
+          </table></div>
+        ) : <EmptyState icon={<Boxes />} title="No environments configured" detail="Environment definitions will appear here when added to the Hub." />}
+      </section>
+    </>
+  )
+}
+
+function InstallItem({ status }: { status: EnvironmentStatus }) {
+  return (
+    <span className="install-item" title={status.error ?? undefined}>
+      <StatusBadge state={status.state} />
+      <Link className="table-link" to="/workers/$workerId" params={{ workerId: status.worker_id }}>{status.worker_id}</Link>
+    </span>
+  )
+}
+
+// ---------- Shared pieces ----------
+
+function Metric({ icon, label, value, note, tone }: { icon: ReactNode; label: string; value: string; note: string; tone: string }) {
+  return (
+    <>
       <div className={`metric-icon metric-icon-${tone}`}>{icon}</div>
       <div className="metric-copy"><span>{label}</span><strong>{value}</strong><small>{note}</small></div>
+    </>
+  )
+}
+
+function SectionHeading({ title, detail, action }: { title: string; detail: string; action?: ReactNode }) {
+  return (
+    <div className="section-heading">
+      <div><h2>{title}</h2><span>{detail}</span></div>
+      {action}
     </div>
   )
 }
 
-function SectionHeading({
-  title,
-  detail,
-  action,
-  onAction,
-}: {
-  title: string
-  detail: string
-  action?: string
-  onAction?: () => void
-}) {
-  return (
-    <div className="section-heading">
-      <div><h2>{title}</h2><span>{detail}</span></div>
-      {action && <button className="text-action" onClick={onAction}>{action}<span aria-hidden="true">↗</span></button>}
-    </div>
-  )
+function Detail({ label, children }: { label: string; children: ReactNode }) {
+  return <div className="detail-item"><dt>{label}</dt><dd>{children}</dd></div>
+}
+
+function RelativeTime({ timestamp }: { timestamp: number }) {
+  const now = useNow()
+  const milliseconds = timestamp < 1_000_000_000_000 ? timestamp * 1000 : timestamp
+  return <time dateTime={new Date(milliseconds).toISOString()} title={formatTime(timestamp)}>{formatRelative(timestamp, now)}</time>
 }
 
 function WorkerState({ worker }: { worker: WorkerInfo }) {
@@ -554,29 +747,21 @@ function StatusBadge({ state }: { state: string }) {
   const variant = ['succeeded', 'ready', 'complete'].includes(state) ? 'success'
     : ['running', 'assigned', 'preparing'].includes(state) ? 'default'
       : ['failed', 'unknown'].includes(state) ? 'danger'
-        : ['queued', 'pending'].includes(state) ? 'warning' : 'muted'
-  return <Badge variant={variant}><span className="badge-dot" />{state}</Badge>
+        : ['queued', 'pending', 'cancelling'].includes(state) ? 'warning' : 'muted'
+  return <Badge variant={variant}><span className={variant === 'default' ? 'badge-dot badge-dot-live' : 'badge-dot'} />{state}</Badge>
 }
 
-function EmptyState({ icon, title, detail }: { icon: React.ReactNode; title: string; detail: string }) {
-  return <div className="empty-state"><span className="empty-icon">{icon}</span><div><strong>{title}</strong><p>{detail}</p></div></div>
+function EmptyState({ icon, title, detail, children }: { icon: ReactNode; title: string; detail: string; children?: ReactNode }) {
+  return <div className="empty-state"><span className="empty-icon">{icon}</span><div><strong>{title}</strong><p>{detail}</p></div>{children && <div className="empty-action">{children}</div>}</div>
 }
 
-function LoadingState() {
-  return <div className="loading-state"><span className="loading-indicator" /><strong>Connecting to Hub</strong><p>Reading workers, jobs, and environments</p></div>
-}
-
-function viewLabel(view: View): string {
-  return { overview: 'Overview', workers: 'Workers', jobs: 'Jobs', environments: 'Environments' }[view]
-}
-
-function viewDescription(view: View): string {
-  return {
-    overview: 'A live view of your self-hosted compute pool.',
-    workers: 'Connected machines and their available capacity.',
-    jobs: 'Recent execution state across the pool.',
-    environments: 'Configured environments and worker readiness.',
-  }[view]
+function LoadingState({ compact }: { compact?: boolean }) {
+  return (
+    <div className={compact ? 'loading-state loading-state-compact' : 'loading-state'} role="status">
+      <span className="loading-indicator" />
+      {compact ? <p>Loading…</p> : <><strong>Connecting to Hub</strong><p><Clock3 size={12} /> Reading workers, jobs, and environments</p></>}
+    </div>
+  )
 }
 
 function osGlyph(os: string): string {

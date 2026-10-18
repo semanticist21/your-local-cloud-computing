@@ -1,9 +1,13 @@
+import { keepPreviousData, queryOptions } from '@tanstack/react-query'
+import { useSyncExternalStore } from 'react'
+
 export type Capabilities = {
   os: string
   arch: string
   abi: string
   tools: Record<string, string>
   gpu: string[]
+  cpu_features?: string[]
   runtimes: string[]
   cpus: number
   memory_bytes: number
@@ -19,14 +23,34 @@ export type WorkerInfo = {
   last_seen: number
 }
 
+export type FileEntry = { path: string; hash: string; size: number; mode: number }
+
+export type JobSpec = {
+  command: string[]
+  priority?: number
+  inputs?: FileEntry[]
+  outputs?: string[]
+  requirements?: Record<string, unknown>
+  environment?: string | null
+  container?: string | null
+  env?: Record<string, string>
+  timeout_secs?: number | null
+}
+
 export type Job = {
   id: string
+  attempt_id?: string
   state: string
-  spec: { command: string[]; environment?: string | null }
+  spec: JobSpec
   worker_id?: string | null
   created_at: number
   updated_at: number
+  exit_code?: number | null
+  error?: string | null
+  results?: FileEntry[]
 }
+
+export type LogEntry = { job_id: string; attempt_id: string; seq: number; stream: string; text: string }
 
 export type Environment = {
   id: string
@@ -49,50 +73,94 @@ export type Snapshot = {
   environmentStatuses: EnvironmentStatus[]
 }
 
-async function get<T>(path: string, token: string): Promise<T> {
+const tokenKey = 'ylcc-dashboard-token'
+
+export const readToken = () => sessionStorage.getItem(tokenKey) ?? ''
+export const storeToken = (token: string) => sessionStorage.setItem(tokenKey, token)
+export const clearToken = () => sessionStorage.removeItem(tokenKey)
+
+/** Moves a `#token=...` handoff from `ylcc dashboard` into sessionStorage and strips it from the URL. */
+export function consumeHashToken() {
+  const hashToken = new URLSearchParams(window.location.hash.replace(/^#/, '')).get('token')
+  if (!hashToken) return
+  storeToken(hashToken)
+  window.history.replaceState(null, '', window.location.pathname + window.location.search)
+}
+
+export class AuthError extends Error {
+  constructor() {
+    super('This token was rejected. Enter the Hub token to reconnect.')
+  }
+}
+
+async function get<T>(path: string): Promise<T> {
   const response = await fetch(path, {
-    headers: { Authorization: `Bearer ${token}` },
+    headers: { Authorization: `Bearer ${readToken()}` },
     cache: 'no-store',
   })
   if (!response.ok) {
-    if (response.status === 401) throw new Error('AUTH_REQUIRED')
+    if (response.status === 401) throw new AuthError()
     const message = await response.text()
     throw new Error(message || `Hub returned ${response.status}`)
   }
   return response.json() as Promise<T>
 }
 
-export async function fetchSnapshot(token: string): Promise<Snapshot> {
-  const [workers, jobs, environments, environmentStatuses] = await Promise.all([
-    get<WorkerInfo[]>('/v1/workers', token),
-    get<Job[]>('/v1/jobs', token),
-    get<Environment[]>('/v1/environments', token),
-    get<EnvironmentStatus[]>('/v1/environments/status', token),
-  ])
-  return { workers, jobs, environments, environmentStatuses }
-}
+export const pollMs = 5000
+
+export const snapshotQuery = queryOptions({
+  queryKey: ['snapshot'],
+  queryFn: async (): Promise<Snapshot> => {
+    const [workers, jobs, environments, environmentStatuses] = await Promise.all([
+      get<WorkerInfo[]>('/v1/workers'),
+      get<Job[]>('/v1/jobs'),
+      get<Environment[]>('/v1/environments'),
+      get<EnvironmentStatus[]>('/v1/environments/status'),
+    ])
+    return { workers, jobs, environments, environmentStatuses }
+  },
+  refetchInterval: pollMs,
+  placeholderData: keepPreviousData,
+})
+
+export const jobLogsQuery = (jobId: string, active: boolean) =>
+  queryOptions({
+    queryKey: ['job-logs', jobId],
+    queryFn: () => get<LogEntry[]>(`/v1/jobs/${encodeURIComponent(jobId)}/logs`),
+    refetchInterval: active ? pollMs : false,
+    placeholderData: keepPreviousData,
+  })
+
+export const errorMessage = (error: unknown) => (error instanceof Error ? error.message : 'Could not reach the Hub.')
+
+const toMs = (timestamp: number) => (timestamp < 1_000_000_000_000 ? timestamp * 1000 : timestamp)
 
 export function formatTime(timestamp: number): string {
-  const milliseconds = timestamp < 1_000_000_000_000 ? timestamp * 1000 : timestamp
   return new Intl.DateTimeFormat('en', {
     month: 'short',
     day: 'numeric',
     hour: '2-digit',
     minute: '2-digit',
-  }).format(new Date(milliseconds))
+    second: '2-digit',
+  }).format(new Date(toMs(timestamp)))
 }
 
-export async function fetchJobLogs(token: string, jobId: string): Promise<unknown[]> {
-  const response = await fetch(`/v1/jobs/${encodeURIComponent(jobId)}/logs`, {
-    headers: { Authorization: `Bearer ${token}` },
-    cache: 'no-store',
-  })
-  if (!response.ok) {
-    if (response.status === 401) throw new Error('AUTH_REQUIRED')
-    const message = await response.text()
-    throw new Error(message || `Hub returned ${response.status}`)
+const relative = new Intl.RelativeTimeFormat('en', { numeric: 'auto' })
+
+export function formatRelative(timestamp: number, now: number): string {
+  const seconds = Math.round((toMs(timestamp) - now) / 1000)
+  if (Math.abs(seconds) < 10) return 'just now'
+  for (const [unit, size] of [['day', 86400], ['hour', 3600], ['minute', 60]] as const) {
+    if (Math.abs(seconds) >= size) return relative.format(Math.round(seconds / size), unit)
   }
-  return response.json() as Promise<unknown[]>
+  return relative.format(seconds, 'second')
+}
+
+export function formatDuration(fromTimestamp: number, toTimestamp: number): string {
+  const seconds = Math.max(0, Math.round((toMs(toTimestamp) - toMs(fromTimestamp)) / 1000))
+  if (seconds < 60) return `${seconds}s`
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`
+  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`
 }
 
 export function formatMemory(bytes: number): string {
@@ -100,3 +168,32 @@ export function formatMemory(bytes: number): string {
   const gibibytes = bytes / 1024 ** 3
   return `${gibibytes < 10 ? gibibytes.toFixed(1) : Math.round(gibibytes)} GiB`
 }
+
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KiB', 'MiB', 'GiB', 'TiB']
+  let value = bytes / 1024
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit += 1
+  }
+  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`
+}
+
+// One shared clock so relative times stay fresh without a timer per row.
+let now = Date.now()
+const listeners = new Set<() => void>()
+window.setInterval(() => {
+  now = Date.now()
+  listeners.forEach((listener) => listener())
+}, pollMs)
+
+export const useNow = () =>
+  useSyncExternalStore(
+    (listener) => {
+      listeners.add(listener)
+      return () => listeners.delete(listener)
+    },
+    () => now,
+  )

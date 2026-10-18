@@ -25,7 +25,10 @@ tasks:
 ylcc task list
 ylcc task run test
 ylcc task run test --file /path/to/application/ylcc.yaml --detach
+ylcc task delete test
 ```
+
+`task delete`는 태스크 블록과 바로 위의 주석 줄을 지우고 나머지 파일은 그대로 둡니다. 태스크가 이미 없으면 성공합니다. 다른 태스크가 쓰는 YAML 앵커를 가진 태스크처럼, 지우면 파일이 유효하지 않게 되는 경우는 거부합니다. 저장된 태스크를 바꾸려면 직접 고치거나, 지운 뒤 다시 저장하세요.
 
 ## 반복 가능한 워크플로
 

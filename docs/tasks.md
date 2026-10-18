@@ -25,7 +25,10 @@ Use your project's actual inputs and command. Add `outputs` for files to downloa
 ylcc task list
 ylcc task run test
 ylcc task run test --file /path/to/application/ylcc.yaml --detach
+ylcc task delete test
 ```
+
+`task delete` removes the task block and the comment lines directly above it, keeps the rest of the file, and succeeds when the task is already gone. It refuses a removal that would leave the file invalid, such as deleting a task whose YAML anchor other tasks use. To change a saved task, edit it in place, or delete it and save it again.
 
 ## Repeatable workflows
 

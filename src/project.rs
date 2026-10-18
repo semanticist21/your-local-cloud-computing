@@ -1,5 +1,5 @@
 use crate::{model::*, platform, snapshot};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -592,6 +592,59 @@ impl Project {
     }
 }
 
+impl Project {
+    /// Removes a task's block, with the comment lines directly above it, keeping the rest of the file.
+    /// Returns false when the file or task is already absent, so retries are idempotent.
+    pub fn delete_task(file: &Path, name: &str) -> Result<bool> {
+        if !file.exists() {
+            return Ok(false);
+        }
+        let text = fs::read_to_string(file)?;
+        if !Self::parse(&text)?.tasks.contains_key(name) {
+            return Ok(false);
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        let indent_of = |line: &str| line.len() - line.trim_start().len();
+        let content = |line: &str| !line.trim().is_empty() && !line.trim_start().starts_with('#');
+        let tasks = lines
+            .iter()
+            .position(|line| line.split('#').next().unwrap_or_default().trim_end() == "tasks:")
+            .context("project file has no block-style `tasks:` mapping; remove the task manually")?;
+        let start = (tasks + 1..lines.len())
+            .find(|&i| {
+                indent_of(lines[i]) > 0
+                    && content(lines[i])
+                    && [format!("{name}:"), format!("'{name}':"), format!("\"{name}\":")]
+                        .iter()
+                        .any(|key| lines[i].trim_start().starts_with(key.as_str()))
+            })
+            .context("task key not found as a block entry under `tasks:`; remove the task manually")?;
+        let indent = indent_of(lines[start]);
+        let mut end = start + 1;
+        while end < lines.len() && (!content(lines[end]) || indent_of(lines[end]) > indent) {
+            end += 1;
+        }
+        // Trailing blank or comment lines belong to whatever follows.
+        while end > start + 1 && !content(lines[end - 1]) {
+            end -= 1;
+        }
+        let mut first = start;
+        while first > tasks + 1
+            && lines[first - 1].trim_start().starts_with('#')
+            && indent_of(lines[first - 1]) == indent
+        {
+            first -= 1;
+        }
+        let mut out: Vec<&str> = lines[..first].to_vec();
+        out.extend(&lines[end..]);
+        let text = out.join("\n") + "\n";
+        let project = Self::parse(&text).context("removing the task would make the project file invalid")?;
+        ensure!(!project.tasks.contains_key(name), "task {name} is still present after removal");
+        fs::write(file, text)?;
+        Ok(true)
+    }
+}
+
 impl Task {
     fn validate(&self) -> Result<()> {
         if self.no_input && (self.project || !self.inputs.is_empty()) {
@@ -884,5 +937,20 @@ tasks:
         assert_eq!(project.defaults.timeout_secs, Some(5));
         assert!(!text.contains("null"));
         assert!(Project::save_task(&file, "second", &task("x")).is_err());
+
+        // Delete removes only that block and its leading comment, then is a no-op.
+        let text = fs::read_to_string(&file).unwrap().replace("tasks:\n", "tasks:\n  # about second\n");
+        let text = text.replacen("  second:", "  # about second\n  second:", 1);
+        fs::write(&file, &text).unwrap();
+        assert!(Project::delete_task(&file, "second").unwrap());
+        let text = fs::read_to_string(&file).unwrap();
+        assert!(!text.contains("second") && text.starts_with("# keep me\n"));
+        let project = Project::parse(&text).unwrap();
+        assert_eq!(project.tasks.keys().collect::<Vec<_>>(), ["first"]);
+        assert_eq!(project.defaults.timeout_secs, Some(5));
+        assert!(!Project::delete_task(&file, "second").unwrap());
+        assert!(Project::delete_task(&file, "first").unwrap());
+        assert!(Project::parse(&fs::read_to_string(&file).unwrap()).unwrap().tasks.is_empty());
+        assert!(!Project::delete_task(&temp.path().join("missing.yaml"), "x").unwrap());
     }
 }

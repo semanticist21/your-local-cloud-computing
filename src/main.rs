@@ -214,6 +214,12 @@ enum Tasks {
         #[arg(long)]
         force: bool,
     },
+    /// Remove a task from the project file; succeeds if it is already gone.
+    Delete {
+        name: String,
+        #[arg(long, default_value = "ylcc.yaml")]
+        file: PathBuf,
+    },
     Run {
         name: String,
         #[arg(long, default_value = "ylcc.yaml")]
@@ -858,6 +864,10 @@ async fn execute() -> Result<()> {
             Tasks::List { file } => {
                 let (project, _) = Project::load(&file)?;
                 print(&project.tasks)
+            }
+            Tasks::Delete { name, file } => {
+                let deleted = Project::delete_task(&file, &name)?;
+                print(&serde_json::json!({"task": name, "deleted": deleted, "file": absolute_path(&file)?}))
             }
             Tasks::Init { file, runtime, name, os, arch, force } => {
                 let existed_before = file.exists();

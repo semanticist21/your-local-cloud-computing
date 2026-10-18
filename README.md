@@ -8,7 +8,11 @@ English | [한국어](README.ko.md)
 
 **Put your other computers to work.**
 
-Run builds, tests, rendering and GPU workloads across your own Linux, macOS and Windows machines, from a CLI or coding agent.
+Let your coding agent run builds, tests, rendering and GPU jobs on your own Linux, macOS and Windows machines.
+
+[![CI](https://github.com/semanticist21/your-local-cloud-computing/actions/workflows/ci.yml/badge.svg)](https://github.com/semanticist21/your-local-cloud-computing/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/semanticist21/your-local-cloud-computing)](https://github.com/semanticist21/your-local-cloud-computing/releases/latest)
+
+![Demo: a Mac builds and runs a Rust program on a Windows worker](assets/demo.gif)
 
 [Quick start](#quick-start) · [Docs](#documentation) · [Agents](docs/agents.md) · [Containers](docs/containers.md) · [Environments](docs/environments.md) · [MIT](LICENSE)
 
@@ -35,7 +39,14 @@ flowchart LR
 - Writable job checkouts, remote reusable environments, durable logs and declared outputs downloaded to a separate job directory.
 - Native services, Docker/Podman packaging, and an agent skill that uses the same CLI. No remote LLM is required.
 
-This is a pool for trusted people and trusted code. Native jobs have the worker service user's permissions. A container runtime socket grants control over that runtime and its mounted host resources. Other CI workloads remain the machine owner's resource-management responsibility.
+## Security model
+
+YLCC is a pool for trusted people and trusted code: one person or a small team sharing their own machines, not multi-tenant CI.
+
+- **Who can run jobs?** Anyone holding the pool token. One shared token authorizes arbitrary workloads on every worker, so give it only to trusted operators.
+- **What can a job touch?** Native jobs run with the worker service user's permissions; use a dedicated non-admin account on shared machines ([Services](docs/services.md)). A container runtime socket grants control over that runtime and its mounted host resources.
+- **How is traffic protected?** The Hub has no TLS of its own. Put it behind a private HTTPS endpoint such as Tailscale Serve, never a public one. Workers only connect outward; they open no inbound ports.
+- **Who limits resources?** The machine owner. Concurrency is a job count, not a CPU or memory cap.
 
 ## Install the CLI
 
@@ -66,7 +77,7 @@ ylcc hub --listen 127.0.0.1:7443 --data-dir "$HOME/.local/share/ylcc/hub"
 
 The Hub serves its read-only dashboard at the same address. Open `http://127.0.0.1:7443/` on the Hub machine, or use the private HTTPS address from another device, then enter the pool token in the browser. The dashboard shows workers, jobs and environment readiness and refreshes every five seconds. Its token is kept only in that browser tab.
 
-The Hub itself does not provide TLS. Do not send the pool token over plain HTTP on an untrusted network; use a private HTTPS endpoint such as Tailscale Serve. For direct LAN access, bind the Hub to a reachable private interface and apply the host firewall's normal restrictions.
+Do not send the pool token over plain HTTP on an untrusted network. For direct LAN access, bind the Hub to a reachable private interface and apply the host firewall's normal restrictions.
 
 In another terminal, publish only to your private network. For example, with Tailscale installed and HTTPS enabled for your tailnet:
 
@@ -76,7 +87,7 @@ tailscale serve --bg --https=10000 http://127.0.0.1:7443
 
 Use the resulting private `https://HUB.example.ts.net:10000` address below. Keep any existing Serve configuration intact; do not enable Funnel. See [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve).
 
-All authorized requesters and workers need the same token file. Transfer it through your existing secure administration channel, keep it outside projects and images, and restrict it with `chmod 600`. The default is `~/.config/ylcc/token`. The shared token authorizes arbitrary pool workloads; only distribute it to trusted operators.
+All authorized requesters and workers need the same token file. Transfer it through your existing secure administration channel, keep it outside projects and images, and restrict it with `chmod 600`. The default is `~/.config/ylcc/token`.
 
 ### 2. Connect workers
 

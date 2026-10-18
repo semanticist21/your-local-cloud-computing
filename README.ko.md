@@ -8,7 +8,11 @@
 
 **쉬고 있는 다른 컴퓨터에 일을 맡기세요.**
 
-빌드, 테스트, 렌더링, GPU 워크로드를 CLI나 코딩 에이전트에서 내 Linux, macOS, Windows 머신들에 나눠 실행합니다.
+코딩 에이전트가 빌드, 테스트, 렌더링, GPU 작업을 내 Linux, macOS, Windows 머신들에서 실행하게 하세요.
+
+[![CI](https://github.com/semanticist21/your-local-cloud-computing/actions/workflows/ci.yml/badge.svg)](https://github.com/semanticist21/your-local-cloud-computing/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/semanticist21/your-local-cloud-computing)](https://github.com/semanticist21/your-local-cloud-computing/releases/latest)
+
+![데모: Mac에서 Windows 워커로 Rust 프로그램을 빌드하고 실행](assets/demo.gif)
 
 [빠른 시작](#빠른-시작) · [문서](#문서) · [에이전트](docs/ko/agents.md) · [컨테이너](docs/ko/containers.md) · [환경](docs/ko/environments.md) · [MIT](LICENSE)
 
@@ -35,7 +39,14 @@ flowchart LR
 - 쓰기 가능한 잡 체크아웃, 원격 재사용 환경, 영구 보존되는 로그, 그리고 별도 잡 디렉터리로 내려받는 선언된 출력물을 제공합니다.
 - 네이티브 서비스, Docker/Podman 패키징, 그리고 같은 CLI를 쓰는 에이전트 스킬을 제공합니다. 원격 LLM은 필요 없습니다.
 
-이 풀은 신뢰할 수 있는 사람과 신뢰할 수 있는 코드를 위한 것입니다. 네이티브 잡은 워커 서비스 사용자의 권한으로 실행됩니다. 컨테이너 런타임 소켓을 주면 그 런타임과 마운트된 호스트 자원을 제어할 권한도 함께 주는 셈입니다. 다른 CI 워크로드의 자원 관리는 여전히 머신 소유자의 책임입니다.
+## 보안 모델
+
+YLCC는 신뢰할 수 있는 사람과 신뢰할 수 있는 코드를 위한 풀입니다. 한 사람이나 작은 팀이 자기 머신을 나눠 쓰는 용도이며, 멀티테넌트 CI가 아닙니다.
+
+- **누가 잡을 실행할 수 있나요?** 풀 토큰을 가진 사람 누구나입니다. 공유 토큰 하나가 모든 워커에서 임의의 워크로드를 실행할 권한을 주므로 신뢰할 수 있는 운영자에게만 배포하세요.
+- **잡은 무엇에 접근할 수 있나요?** 네이티브 잡은 워커 서비스 사용자의 권한으로 실행됩니다. 공유 머신에서는 관리자 권한이 없는 전용 계정을 쓰세요([서비스](docs/ko/services.md)). 컨테이너 런타임 소켓을 주면 그 런타임과 마운트된 호스트 자원을 제어할 권한도 함께 주는 셈입니다.
+- **트래픽은 어떻게 보호되나요?** 허브 자체에는 TLS가 없습니다. Tailscale Serve 같은 비공개 HTTPS 엔드포인트 뒤에 두고, 공개 엔드포인트에는 절대 두지 마세요. 워커는 바깥으로만 연결하며 인바운드 포트를 열지 않습니다.
+- **자원 제한은 누가 하나요?** 머신 소유자입니다. 동시 실행 수는 잡 개수이지 CPU나 메모리 상한이 아닙니다.
 
 ## CLI 설치
 
@@ -66,7 +77,7 @@ ylcc hub --listen 127.0.0.1:7443 --data-dir "$HOME/.local/share/ylcc/hub"
 
 허브는 같은 주소에서 읽기 전용 대시보드를 제공합니다. 허브 머신에서 `http://127.0.0.1:7443/`을 열거나 다른 기기에서 비공개 HTTPS 주소로 접속한 뒤, 브라우저에 풀 토큰을 입력하세요. 대시보드는 워커, 잡, 환경 준비 상태를 보여 주고 5초마다 새로 고칩니다. 토큰은 해당 브라우저 탭에만 보관됩니다.
 
-허브 자체는 TLS를 제공하지 않습니다. 신뢰할 수 없는 네트워크에서 평문 HTTP로 풀 토큰을 보내지 마세요. Tailscale Serve 같은 비공개 HTTPS 엔드포인트를 쓰세요. LAN에서 직접 접속하려면 허브를 접근 가능한 사설 인터페이스에 바인딩하고 호스트 방화벽의 일반적인 제한을 적용하세요.
+신뢰할 수 없는 네트워크에서 평문 HTTP로 풀 토큰을 보내지 마세요. LAN에서 직접 접속하려면 허브를 접근 가능한 사설 인터페이스에 바인딩하고 호스트 방화벽의 일반적인 제한을 적용하세요.
 
 다른 터미널에서 비공개 네트워크에만 공개합니다. 예를 들어 Tailscale을 설치하고 tailnet에 HTTPS를 켠 경우:
 
@@ -76,7 +87,7 @@ tailscale serve --bg --https=10000 http://127.0.0.1:7443
 
 이후 단계에서는 이렇게 얻은 비공개 `https://HUB.example.ts.net:10000` 주소를 사용합니다. 기존 Serve 설정은 그대로 두고, Funnel은 켜지 마세요. [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve)를 참고하세요.
 
-권한이 있는 모든 요청자와 워커는 같은 토큰 파일이 필요합니다. 기존의 안전한 관리 채널로 전달하고, 프로젝트와 이미지 바깥에 두며, `chmod 600`으로 권한을 제한하세요. 기본 위치는 `~/.config/ylcc/token`입니다. 공유 토큰은 풀에서 임의의 워크로드를 실행할 권한을 주므로 신뢰할 수 있는 운영자에게만 배포하세요.
+권한이 있는 모든 요청자와 워커는 같은 토큰 파일이 필요합니다. 기존의 안전한 관리 채널로 전달하고, 프로젝트와 이미지 바깥에 두며, `chmod 600`으로 권한을 제한하세요. 기본 위치는 `~/.config/ylcc/token`입니다.
 
 ### 2. 워커 연결
 

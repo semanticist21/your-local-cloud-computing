@@ -4,7 +4,7 @@ version = "0.4.10"
 edition = "2024"
 build = "build.rs"
 license = "MIT"
-description = "Run workloads across your own Linux, macOS and Windows machines"
+description = "Let your coding agent run builds, tests and GPU jobs on your own Linux, macOS and Windows machines"
 repository = "https://github.com/semanticist21/your-local-cloud-computing"
 
 [dependencies]

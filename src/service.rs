@@ -951,6 +951,21 @@ fn windows_runner(args: &[String], directory: &Path, path: &str, log: &Path) -> 
     ))
 }
 
+/// Stopping a task ends only its PowerShell runner; the worker it started keeps running and
+/// holds the data directory lock, so end worker processes of this executable as well.
+#[cfg(windows)]
+fn stop_task(name: &str, unregister: bool) -> Result<String> {
+    let exe = powershell_literal(&env::current_exe()?.to_string_lossy())?;
+    let unregister = if unregister { "; Unregister-ScheduledTask -InputObject $task -Confirm:$false" } else { "" };
+    Ok(format!(
+        "$ErrorActionPreference='Stop'; $task = Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop | Where-Object {{ $_.TaskName -eq {name} }}; \
+         if ($task) {{ Stop-ScheduledTask -InputObject $task{unregister} }}; \
+         Get-CimInstance Win32_Process -Filter \"Name='ylcc.exe'\" | Where-Object {{ $_.ProcessId -ne {pid} -and $_.ExecutablePath -eq {exe} -and $_.CommandLine -match '\\sworker\\s' }} | \
+         ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}",
+        pid = std::process::id(),
+    ))
+}
+
 /// Start at boot without a login: a Windows S4U task, which only an elevated shell can register.
 #[cfg(not(windows))]
 #[allow(clippy::too_many_arguments)]
@@ -1004,10 +1019,7 @@ fn install_task(
         service_arguments(role, hub, token_file, data_dir, id, listen, max_jobs)?;
     // A running worker holds its log open, so stop it before reopening the log on reinstall.
     let name = powershell_literal(&name)?;
-    let stop = format!(
-        "$ErrorActionPreference='Stop'; $task = Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop | Where-Object {{ $_.TaskName -eq {name} }}; if ($task) {{ Stop-ScheduledTask -InputObject $task }}"
-    );
-    powershell(&stop)?;
+    powershell(&stop_task(&name, false)?)?;
     let script_file = directory.join("worker.ps1");
     let log = directory.join("worker.log");
     // Stopping the task does not wait for the worker process to exit and release the log.
@@ -1083,9 +1095,7 @@ fn install_task(
 pub fn uninstall(role: &str) -> Result<()> {
     let (name, directory) = windows_task(role)?;
     let name = powershell_literal(&name)?;
-    powershell(&format!(
-        "$ErrorActionPreference='Stop'; $task=Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop | Where-Object {{ $_.TaskName -eq {name} }}; if ($task) {{ Stop-ScheduledTask -InputObject $task; Unregister-ScheduledTask -InputObject $task -Confirm:$false }}"
-    ))?;
+    powershell(&stop_task(&name, true)?)?;
     let script = directory.join("worker.ps1");
     if script.exists() {
         fs::remove_file(script)?;

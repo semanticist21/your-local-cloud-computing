@@ -16,7 +16,7 @@ YLCC is a small self-hosted compute pool: one hub, workers on your machines, and
 
 ```mermaid
 flowchart LR
-    A["Laptop · CLI / agent skill"] -->|"Requirements + input manifest"| H["Hub · SQLite + blob storage"]
+    A["Laptop · CLI / agent skill / ylcc.yaml tasks"] -->|"Requirements + input manifest"| H["Hub · SQLite + blob storage"]
     A <-->|"HTTPS · missing content + results"| H
     W1["Linux worker · x86_64 / arm64"] <-->|"Outbound WebSocket · jobs / logs / status"| H
     W2["macOS worker · Intel / Apple Silicon"] <-->|"Outbound WebSocket · jobs / logs / status"| H
@@ -270,14 +270,16 @@ sequenceDiagram
     participant A as CLI / agent
     participant H as Hub
     participant W as Matching worker
+    A->>A: Resolve task (one job per target)
     A->>A: Select files and freeze input bytes
     A->>H: Ask which content hashes are missing
-    A->>H: Upload missing blobs + submit job
-    H-->>A: Job ID (queued immediately if busy)
+    A->>H: Upload missing blobs once + submit jobs
+    H-->>A: Job IDs (queued immediately if busy)
     W->>H: Outbound connection + capabilities
     H->>W: Assign one durable attempt
-    W->>W: Prepare environment + writable checkout
+    W->>W: Prepare environment on first use + restore caches + writable checkout
     W-->>H: Stream logs and durable outcome
+    W->>W: Keep caches for the next run on this worker
     W->>H: Upload declared results
     A->>H: Wait / fetch
     H-->>A: Results in job-specific folder

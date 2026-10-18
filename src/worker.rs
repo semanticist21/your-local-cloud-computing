@@ -58,6 +58,8 @@ struct State {
     image_paths: Mutex<HashMap<String, String>>,
     /// Cache keys currently moved into a running attempt.
     caches: Mutex<HashSet<String>>,
+    /// Fixed checkout directories currently used by an attempt.
+    workspaces: Mutex<HashSet<String>>,
     events: broadcast::Sender<WorkerMessage>,
 }
 
@@ -246,7 +248,7 @@ pub async fn run(
             "another worker is using this data directory"
         );
     }
-    for child in ["attempts", "blobs", "caches", "environments"] {
+    for child in ["attempts", "blobs", "caches", "environments", "workspaces"] {
         private_dir(&data.join(child))?;
     }
     let capabilities = probe().await?;
@@ -268,6 +270,7 @@ pub async fn run(
         environments: Mutex::new(BTreeMap::new()),
         image_paths: Mutex::new(HashMap::new()),
         caches: Mutex::new(HashSet::new()),
+        workspaces: Mutex::new(HashSet::new()),
         events,
     });
     load_state(&state).await?;
@@ -1325,7 +1328,9 @@ async fn run_attempt(
         }
         let _ = fs::write(env_dir.join(LAST_USED), b"");
     }
-    let workdir = attempt.dir.join("work");
+    // Declared before the cache lease so caches are moved back before the checkout is removed.
+    let workspace = Workspace::claim(state, &job.spec, &attempt.dir)?;
+    let workdir = workspace.dir.clone();
     fs::create_dir(&workdir).context("create fresh attempt checkout")?;
     for input in &job.spec.inputs {
         cancelled(&cancel)?;
@@ -1487,6 +1492,49 @@ async fn run_attempt(
     Ok((exit, results))
 }
 
+/// Tasks with caches check out into a fixed directory per cache scope, as CI runners do:
+/// build outputs such as Cargo's `target` embed absolute paths and break under a new path.
+/// The directory is still fresh for every attempt; an attempt that finds it busy uses its own.
+struct Workspace<'a> {
+    state: &'a State,
+    key: Option<String>,
+    dir: PathBuf,
+}
+
+impl<'a> Workspace<'a> {
+    fn claim(state: &'a State, spec: &JobSpec, attempt: &Path) -> Result<Self> {
+        let mut workspace = Self { state, key: None, dir: attempt.join("work") };
+        let Some(scope) = spec.cache_scope.as_deref().filter(|_| !spec.cache.is_empty()) else {
+            return Ok(workspace);
+        };
+        let key = hex::encode(Sha256::digest(format!(
+            "{scope}\0{}\0{}",
+            spec.environment.as_deref().unwrap_or_default(),
+            spec.container.as_deref().unwrap_or_default()
+        )))[..16]
+            .to_owned();
+        if !state.workspaces.lock().unwrap().insert(key.clone()) {
+            eprintln!("workspace {key} is in use by another attempt; using the attempt directory");
+            return Ok(workspace);
+        }
+        workspace.dir = state.data.join("workspaces").join(&key);
+        workspace.key = Some(key);
+        remove_tree(&workspace.dir)?; // left behind by a crash
+        Ok(workspace)
+    }
+}
+
+impl Drop for Workspace<'_> {
+    fn drop(&mut self) {
+        if let Some(key) = &self.key {
+            if let Err(error) = remove_tree(&self.dir) {
+                eprintln!("workspace cleanup: {error:#}");
+            }
+            self.state.workspaces.lock().unwrap().remove(key);
+        }
+    }
+}
+
 /// Moves persistent cache directories into a fresh checkout and back afterwards.
 /// A key already in use by another attempt runs without its cache instead of waiting.
 struct CacheLease<'a> {
@@ -1511,8 +1559,9 @@ impl<'a> CacheLease<'a> {
                 continue; // The submitted inputs already provide this path.
             }
             // A different toolchain or image never reuses another's dependency or build output.
+            // "fixed" marks caches built in a fixed workspace; earlier ones embed attempt paths.
             let key = hex::encode(Sha256::digest(format!(
-                "{scope}\0{}\0{}\0{path}",
+                "fixed\0{scope}\0{}\0{}\0{path}",
                 spec.environment.as_deref().unwrap_or_default(),
                 spec.container.as_deref().unwrap_or_default()
             )));
@@ -2650,6 +2699,9 @@ fn collect_garbage(state: &State, now: SystemTime, usage: &dyn Fn(&State) -> Res
             state.attempts.lock().unwrap().remove(id);
         }
     }
+    for entry in fs::read_dir(state.data.join("workspaces"))? {
+        remove_tree(&entry?.path())?; // none is in use while idle
+    }
     let mut candidates = vec![];
     for entry in fs::read_dir(state.data.join("blobs"))? {
         let path = entry?.path();
@@ -2845,6 +2897,7 @@ mod tests {
             data.join("blobs"),
             data.join("caches"),
             data.join("environments"),
+            data.join("workspaces"),
         ] {
             private_dir(&path).unwrap();
         }
@@ -2867,6 +2920,7 @@ mod tests {
             environments: Mutex::new(BTreeMap::new()),
             image_paths: Mutex::new(HashMap::new()),
             caches: Mutex::new(HashSet::new()),
+            workspaces: Mutex::new(HashSet::new()),
             events,
         })
     }
@@ -3098,6 +3152,26 @@ mod tests {
             fs::read(temp.path().join("blobs").join(hash)).unwrap(),
             b"original"
         );
+    }
+    #[test]
+    fn cached_tasks_reuse_one_fixed_fresh_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = state_at(temp.path());
+        let spec = JobSpec { cache: vec!["target".into()], cache_scope: Some("app".into()), ..Default::default() };
+        let attempt = temp.path().join("attempts/a");
+        let first = Workspace::claim(&state, &spec, &attempt).unwrap();
+        let fixed = first.dir.clone();
+        assert!(fixed.starts_with(temp.path().join("workspaces")));
+        fs::create_dir(&fixed).unwrap();
+        fs::write(fixed.join("left"), "x").unwrap();
+        let busy = Workspace::claim(&state, &spec, &attempt).unwrap();
+        assert_eq!(busy.dir, attempt.join("work"), "a concurrent attempt uses its own directory");
+        drop(busy);
+        drop(first);
+        assert!(!fixed.exists(), "the workspace is removed after the attempt");
+        assert_eq!(Workspace::claim(&state, &spec, &attempt).unwrap().dir, fixed);
+        let uncached = JobSpec { cache_scope: Some("app".into()), ..Default::default() };
+        assert_eq!(Workspace::claim(&state, &uncached, &attempt).unwrap().dir, attempt.join("work"));
     }
     #[test]
     fn cache_lease_restores_saves_and_skips_busy_or_redirected_caches() {

@@ -1002,8 +1002,21 @@ fn install_task(
     crate::platform::private_dir(data_dir)?;
     let (args, data_dir) =
         service_arguments(role, hub, token_file, data_dir, id, listen, max_jobs)?;
+    // A running worker holds its log open, so stop it before reopening the log on reinstall.
+    let name = powershell_literal(&name)?;
+    let stop = format!(
+        "$ErrorActionPreference='Stop'; $task = Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop | Where-Object {{ $_.TaskName -eq {name} }}; if ($task) {{ Stop-ScheduledTask -InputObject $task }}"
+    );
+    powershell(&stop)?;
     let script_file = directory.join("worker.ps1");
     let log = directory.join("worker.log");
+    // Stopping the task does not wait for the worker process to exit and release the log.
+    for _ in 0..30 {
+        if !log.exists() || fs::OpenOptions::new().append(true).open(&log).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
     // Open only a protected regular file before PowerShell redirects into it.
     let file = match crate::platform::create_private_file(&log) {
         Ok(file) => file,
@@ -1031,11 +1044,6 @@ fn install_task(
     temporary.write_all(b"\xef\xbb\xbf")?;
     temporary.write_all(runner.as_bytes())?;
     temporary.as_file().sync_all()?;
-    let name = powershell_literal(&name)?;
-    let stop = format!(
-        "$ErrorActionPreference='Stop'; $task = Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop | Where-Object {{ $_.TaskName -eq {name} }}; if ($task) {{ Stop-ScheduledTask -InputObject $task }}"
-    );
-    powershell(&stop)?;
     crate::platform::replace_file(temporary.path(), &script_file)?;
     let action_args = format!(
         "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{}\"",

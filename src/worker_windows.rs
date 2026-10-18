@@ -7,7 +7,7 @@ use std::{
 use tokio::process::{Child, Command};
 use windows_sys::Win32::{
     Foundation::{
-        ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES, GetLastError,
+        ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES, FILETIME, GetLastError,
         INVALID_HANDLE_VALUE,
     },
     System::{
@@ -26,8 +26,8 @@ use windows_sys::Win32::{
         },
         SystemServices::JOB_OBJECT_QUERY,
         Threading::{
-            CREATE_SUSPENDED, GetCurrentProcess, IsWow64Process2, OpenThread, ResumeThread,
-            THREAD_SUSPEND_RESUME,
+            CREATE_SUSPENDED, GetCurrentProcess, GetSystemTimes, IsWow64Process2, OpenThread,
+            ResumeThread, THREAD_SUSPEND_RESUME,
         },
     },
 };
@@ -241,4 +241,25 @@ pub(super) fn memory_bytes() -> Result<u64> {
         std::io::Error::last_os_error()
     );
     Ok(info.ullTotalPhys)
+}
+
+/// Cumulative (busy, total) CPU time; kernel time includes idle time.
+pub(super) fn cpu_ticks() -> Option<(u64, u64)> {
+    let [mut idle, mut kernel, mut user] = [FILETIME::default(); 3];
+    if unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) } == 0 {
+        return None;
+    }
+    let ticks = |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
+    let total = ticks(kernel) + ticks(user);
+    Some((total.saturating_sub(ticks(idle)), total))
+}
+
+/// (used, total) physical memory in bytes.
+pub(super) fn memory_usage() -> Option<(u64, u64)> {
+    let mut info = MEMORYSTATUSEX {
+        dwLength: size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    (unsafe { GlobalMemoryStatusEx(&mut info) } != 0)
+        .then(|| (info.ullTotalPhys - info.ullAvailPhys, info.ullTotalPhys))
 }

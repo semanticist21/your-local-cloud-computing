@@ -566,11 +566,7 @@ async fn connection(state: Arc<State>) -> Result<()> {
         }
     }
     // Older Hubs reject unknown messages and drop the connection, so ask before sending samples.
-    let mut system = (state.metrics && hub_accepts_metrics(&state).await).then(|| {
-        let mut system = sysinfo::System::new();
-        system.refresh_cpu_usage(); // CPU usage is the difference between two refreshes.
-        system
-    });
+    let mut sampler = (state.metrics && hub_accepts_metrics(&state).await).then(|| Sampler { cpu: cpu_ticks() });
     let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
     heartbeat.tick().await; // The first tick is immediate; the CPU baseline needs time to accumulate.
     loop {
@@ -615,8 +611,8 @@ async fn connection(state: Arc<State>) -> Result<()> {
                 Err(_) => return Ok(()),
             },
             _ = heartbeat.tick() => {
-                let message = match system.as_mut() {
-                    Some(system) => WorkerMessage::Metrics { metrics: sample(system, &state.data) },
+                let message = match sampler.as_mut() {
+                    Some(sampler) => WorkerMessage::Metrics { metrics: sampler.sample(&state.data) },
                     None => WorkerMessage::Heartbeat,
                 };
                 sink.send(Message::Text(serde_json::to_string(&message)?.into())).await?
@@ -637,17 +633,110 @@ async fn hub_accepts_metrics(state: &State) -> bool {
     })
 }
 
-fn sample(system: &mut sysinfo::System, data: &Path) -> WorkerMetrics {
-    system.refresh_cpu_usage();
-    system.refresh_memory();
-    WorkerMetrics {
-        at: 0,
-        cpu_percent: system.global_cpu_usage().into(),
-        memory_used: system.used_memory(),
-        memory_total: system.total_memory(),
-        load: sysinfo::System::load_average().one,
-        disk_percent: crate::platform::disk_usage(data).map_or(0.0, |used| used * 100.0),
+/// CPU usage is the change in cumulative ticks between two samples.
+struct Sampler {
+    cpu: Option<(u64, u64)>,
+}
+impl Sampler {
+    /// A value the OS cannot report is sent as 0.
+    fn sample(&mut self, data: &Path) -> WorkerMetrics {
+        let cpu = cpu_ticks();
+        let cpu_percent = match (self.cpu, cpu) {
+            (Some((busy, total)), Some((busy2, total2))) if total2 > total => {
+                busy2.saturating_sub(busy) as f64 * 100.0 / (total2 - total) as f64
+            }
+            _ => 0.0,
+        };
+        self.cpu = cpu;
+        let (memory_used, memory_total) = memory_usage().unwrap_or_default();
+        WorkerMetrics {
+            at: 0,
+            cpu_percent,
+            memory_used,
+            memory_total,
+            load: load_average().unwrap_or_default(),
+            disk_percent: crate::platform::disk_usage(data).map_or(0.0, |used| used * 100.0),
+        }
     }
+}
+
+/// Cumulative (busy, total) CPU ticks since boot across all cores.
+#[cfg(target_os = "linux")]
+fn cpu_ticks() -> Option<(u64, u64)> {
+    let stat = fs::read_to_string("/proc/stat").ok()?;
+    let ticks: Vec<u64> = stat.lines().next()?.split_whitespace().skip(1).filter_map(|v| v.parse().ok()).collect();
+    // user nice system idle iowait irq softirq steal; guest time is already inside user.
+    let total: u64 = ticks.iter().take(8).sum();
+    let idle = ticks.get(3)? + ticks.get(4).unwrap_or(&0);
+    Some((total - idle, total))
+}
+#[cfg(target_os = "macos")]
+fn cpu_ticks() -> Option<(u64, u64)> {
+    let mut info: libc::host_cpu_load_info = unsafe { std::mem::zeroed() };
+    let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;
+    #[allow(deprecated)] // libc points to the mach2 crate; the call itself is current.
+    let status = unsafe {
+        libc::host_statistics(libc::mach_host_self(), libc::HOST_CPU_LOAD_INFO, (&raw mut info).cast(), &mut count)
+    };
+    (status == libc::KERN_SUCCESS).then(|| {
+        let [user, system, idle, nice] = info.cpu_ticks.map(u64::from);
+        (user + system + nice, user + system + idle + nice)
+    })
+}
+#[cfg(windows)]
+fn cpu_ticks() -> Option<(u64, u64)> {
+    windows::cpu_ticks()
+}
+
+/// (used, total) physical memory in bytes, counted as the OS's own monitor does.
+#[cfg(target_os = "linux")]
+fn memory_usage() -> Option<(u64, u64)> {
+    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
+    let field = |name: &str| -> Option<u64> {
+        let line = meminfo.lines().find(|line| line.starts_with(name))?;
+        Some(line.split_whitespace().nth(1)?.parse::<u64>().ok()? * 1024)
+    };
+    let total = field("MemTotal:")?;
+    Some((total.saturating_sub(field("MemAvailable:")?), total))
+}
+#[cfg(target_os = "macos")]
+fn memory_usage() -> Option<(u64, u64)> {
+    let mut info: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    #[allow(deprecated)]
+    let status = unsafe {
+        libc::host_statistics64(libc::mach_host_self(), libc::HOST_VM_INFO64, (&raw mut info).cast(), &mut count)
+    };
+    if status != libc::KERN_SUCCESS {
+        return None;
+    }
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let mut total = 0u64;
+    let mut size = std::mem::size_of::<u64>();
+    unsafe { libc::sysctlbyname(c"hw.memsize".as_ptr(), (&raw mut total).cast(), &mut size, std::ptr::null_mut(), 0) };
+    // Activity Monitor's "Memory Used": app memory + wired + compressed.
+    let pages = u64::from(info.internal_page_count).saturating_sub(info.purgeable_count.into())
+        + u64::from(info.wire_count)
+        + u64::from(info.compressor_page_count);
+    Some((pages * page, total))
+}
+#[cfg(windows)]
+fn memory_usage() -> Option<(u64, u64)> {
+    windows::memory_usage()
+}
+
+#[cfg(target_os = "linux")]
+fn load_average() -> Option<f64> {
+    fs::read_to_string("/proc/loadavg").ok()?.split_whitespace().next()?.parse().ok()
+}
+#[cfg(target_os = "macos")]
+fn load_average() -> Option<f64> {
+    let mut load = 0.0;
+    (unsafe { libc::getloadavg(&mut load, 1) } == 1).then_some(load)
+}
+#[cfg(windows)]
+fn load_average() -> Option<f64> {
+    None // Windows has no load average.
 }
 
 fn accept(state: Arc<State>, job: Job, environment: Option<Environment>) -> Result<()> {
@@ -3202,6 +3291,17 @@ mod tests {
         fs::write(&fresh, "").unwrap();
         collect_garbage(&state, now, &full).unwrap();
         assert!(fresh.exists(), "anything used within the minimum age is spared");
+    }
+    #[test]
+    fn host_samples_are_plausible() {
+        let mut sampler = Sampler { cpu: cpu_ticks() };
+        assert!(sampler.cpu.is_some(), "CPU ticks are readable");
+        std::thread::sleep(Duration::from_millis(200));
+        let metrics = sampler.sample(Path::new("."));
+        assert!((0.0..=100.0).contains(&metrics.cpu_percent), "{metrics:?}");
+        assert!(metrics.memory_total > 0 && metrics.memory_used > 0, "{metrics:?}");
+        assert!(metrics.memory_used <= metrics.memory_total, "{metrics:?}");
+        assert!(metrics.disk_percent > 0.0 && metrics.disk_percent <= 100.0, "{metrics:?}");
     }
     #[tokio::test]
     async fn restart_marks_unfinished_unknown_and_duplicate_does_not_run() {

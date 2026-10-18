@@ -121,7 +121,8 @@ pub struct InlineEnvironment {
 
 /// A resolved task: the environment to register first, then one job per target.
 pub struct Plan {
-    pub environment: Option<Environment>,
+    /// Environments to register, deduplicated; targets on different OSes can need different ones.
+    pub environments: Vec<Environment>,
     pub specs: Vec<JobSpec>,
 }
 
@@ -167,30 +168,55 @@ fn strict_list<'de, D: serde::Deserializer<'de>>(
     serde_json::from_value(serde_json::Value::Array(values)).map_err(D::Error::custom)
 }
 
-/// Built-in native environment presets, used as `uses: NAME@VERSION` (Linux/macOS shells).
+/// Built-in native environment presets, used as `uses: NAME@VERSION` or `environment: NAME@VERSION`. Each has a POSIX shell
+/// recipe for Linux/macOS and a Windows PowerShell recipe for Windows x86_64.
 pub const PRESETS: &[&str] = &["bun", "node", "rust", "go", "uv"];
 
 const PLATFORM: &str = r#"os=$(uname -s | tr '[:upper:]' '[:lower:]'); arch=$(uname -m); case "$arch" in x86_64|amd64) arch=x64 goarch=amd64;; aarch64|arm64) arch=arm64 goarch=arm64;; *) goarch=$arch;; esac"#;
 
-pub fn preset(uses: &str) -> Result<Environment> {
+/// Downloads a ZIP and merges the contents of `inner` into `$YLCC_ENV_DIR\dest` (PowerShell 5.1).
+fn windows_zip(url: &str, inner: &str, dest: &str) -> String {
+    format!(
+        r#"$ProgressPreference = 'SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol = 'Tls12'; $d = $env:YLCC_ENV_DIR; $t = Join-Path $d 'download'; Invoke-WebRequest -UseBasicParsing -Uri '{url}' -OutFile "$t.zip"; Expand-Archive -Path "$t.zip" -DestinationPath $t -Force; New-Item -ItemType Directory -Force -Path (Join-Path $d '{dest}') | Out-Null; Get-ChildItem -Path (Join-Path $t '{inner}') | Copy-Item -Recurse -Force -Destination (Join-Path $d '{dest}'); Remove-Item -Recurse -Force $t, "$t.zip""#
+    )
+}
+
+/// Resolves a preset for the job's execution OS (`linux`, `macos` or `windows`).
+pub fn preset(uses: &str, os: Option<&str>) -> Result<Environment> {
     let (name, version) = uses
         .split_once('@')
         .context("preset must be NAME@VERSION, for example bun@1.3.14")?;
-    if version.is_empty()
+    if !version.starts_with(|c: char| c.is_ascii_digit())
         || !version
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
     {
-        bail!("preset version must contain only letters, digits, ., _ or -")
+        bail!("preset version must be an exact release such as 1.3.14 (letters, digits, ., _ or -)")
     }
+    if !PRESETS.contains(&name) {
+        bail!("unknown preset {name}; available: {}", PRESETS.join(", "))
+    }
+    let windows = match os {
+        Some("windows") => true,
+        Some("linux" | "macos") => false,
+        Some(os) => bail!("preset {name} has no recipe for OS {os}"),
+        None => {
+            bail!("preset {uses} needs an explicit os (requirements or target) to pick its recipe")
+        }
+    };
     let env = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
         pairs
             .iter()
-            .map(|(k, v)| ((*k).into(), (*v).into()))
+            .map(|(k, v)| {
+                (
+                    (*k).into(),
+                    (*v).replace('/', if windows { "\\" } else { "/" }),
+                )
+            })
             .collect()
     };
-    let (setup, verify, env) = match name {
-        "bun" => (
+    let (setup, verify, env) = match (name, windows) {
+        ("bun", false) => (
             format!(
                 r#"curl -fsSL https://bun.sh/install -o "$YLCC_ENV_DIR/bun-install.sh" && bash "$YLCC_ENV_DIR/bun-install.sh" "bun-v{version}""#
             ),
@@ -200,14 +226,34 @@ pub fn preset(uses: &str) -> Result<Environment> {
                 ("BUN_INSTALL_CACHE_DIR", "${YLCC_ENV_DIR}/cache/bun"),
             ]),
         ),
-        "node" => (
+        ("bun", true) => (
+            windows_zip(
+                &format!(
+                    "https://github.com/oven-sh/bun/releases/download/bun-v{version}/bun-windows-x64.zip"
+                ),
+                "bun-windows-x64",
+                "bin",
+            ),
+            format!("if ((bun --version) -ne '{version}') {{ exit 1 }}"),
+            env(&[("BUN_INSTALL_CACHE_DIR", "${YLCC_ENV_DIR}/cache/bun")]),
+        ),
+        ("node", false) => (
             format!(
                 r#"{PLATFORM}; curl -fsSL "https://nodejs.org/dist/v{version}/node-v{version}-$os-$arch.tar.gz" -o "$YLCC_ENV_DIR/node.tar.gz" && tar -xzf "$YLCC_ENV_DIR/node.tar.gz" -C "$YLCC_ENV_DIR" --strip-components=1"#
             ),
             format!(r#"test "$(node --version)" = "v{version}""#),
             env(&[("npm_config_cache", "${YLCC_ENV_DIR}/cache/npm")]),
         ),
-        "rust" => (
+        ("node", true) => (
+            windows_zip(
+                &format!("https://nodejs.org/dist/v{version}/node-v{version}-win-x64.zip"),
+                &format!("node-v{version}-win-x64"),
+                "bin",
+            ),
+            format!("if ((node --version) -ne 'v{version}') {{ exit 1 }}"),
+            env(&[("npm_config_cache", "${YLCC_ENV_DIR}/cache/npm")]),
+        ),
+        ("rust", false) => (
             format!(
                 r#"curl --fail --location --proto '=https' --tlsv1.2 https://sh.rustup.rs -o "$YLCC_ENV_DIR/rustup-init.sh" && sh "$YLCC_ENV_DIR/rustup-init.sh" -y --no-modify-path --profile minimal --default-toolchain {version}"#
             ),
@@ -217,7 +263,20 @@ pub fn preset(uses: &str) -> Result<Environment> {
                 ("RUSTUP_HOME", "${YLCC_ENV_DIR}/rustup"),
             ]),
         ),
-        "go" => (
+        // Linking MSVC targets additionally needs Visual Studio Build Tools on the host.
+        ("rust", true) => (
+            format!(
+                r#"$ProgressPreference = 'SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol = 'Tls12'; $i = Join-Path $env:YLCC_ENV_DIR 'rustup-init.exe'; Invoke-WebRequest -UseBasicParsing -Uri 'https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe' -OutFile $i; & $i -y --no-modify-path --profile minimal --default-toolchain {version}"#
+            ),
+            format!(
+                "if (-not ((rustc --version) -like 'rustc {version} *')) {{ exit 1 }}; cargo --version"
+            ),
+            env(&[
+                ("CARGO_HOME", "${YLCC_ENV_DIR}"),
+                ("RUSTUP_HOME", "${YLCC_ENV_DIR}/rustup"),
+            ]),
+        ),
+        ("go", false) => (
             format!(
                 r#"{PLATFORM}; curl -fsSL "https://go.dev/dl/go{version}.$os-$goarch.tar.gz" -o "$YLCC_ENV_DIR/go.tar.gz" && tar -xzf "$YLCC_ENV_DIR/go.tar.gz" -C "$YLCC_ENV_DIR" --strip-components=1"#
             ),
@@ -228,20 +287,51 @@ pub fn preset(uses: &str) -> Result<Environment> {
                 ("GOTOOLCHAIN", "local"),
             ]),
         ),
-        "uv" => (
+        ("go", true) => (
+            windows_zip(
+                &format!("https://go.dev/dl/go{version}.windows-amd64.zip"),
+                "go",
+                ".",
+            ),
+            format!("if (-not ((go version) -like 'go version go{version} *')) {{ exit 1 }}"),
+            env(&[
+                ("GOPATH", "${YLCC_ENV_DIR}/gopath"),
+                ("GOCACHE", "${YLCC_ENV_DIR}/cache/go-build"),
+                ("GOTOOLCHAIN", "local"),
+            ]),
+        ),
+        ("uv", false) => (
             format!(
                 r#"curl -LsSf "https://astral.sh/uv/{version}/install.sh" -o "$YLCC_ENV_DIR/uv-install.sh" && UV_INSTALL_DIR="$YLCC_ENV_DIR/bin" UV_NO_MODIFY_PATH=1 sh "$YLCC_ENV_DIR/uv-install.sh""#
             ),
-            format!(r#"uv --version | grep -F "uv {version}""#),
+            format!(r#"uv --version | grep -F "uv {version} ""#),
             env(&[
                 ("UV_CACHE_DIR", "${YLCC_ENV_DIR}/cache/uv"),
                 ("UV_PYTHON_INSTALL_DIR", "${YLCC_ENV_DIR}/python"),
             ]),
         ),
-        _ => bail!("unknown preset {name}; available: {}", PRESETS.join(", ")),
+        ("uv", true) => (
+            windows_zip(
+                &format!(
+                    "https://github.com/astral-sh/uv/releases/download/{version}/uv-x86_64-pc-windows-msvc.zip"
+                ),
+                "",
+                "bin",
+            ),
+            format!("if (-not ((uv --version) -like 'uv {version} *')) {{ exit 1 }}"),
+            env(&[
+                ("UV_CACHE_DIR", "${YLCC_ENV_DIR}/cache/uv"),
+                ("UV_PYTHON_INSTALL_DIR", "${YLCC_ENV_DIR}/python"),
+            ]),
+        ),
+        _ => unreachable!("checked against PRESETS"),
     };
     Ok(Environment {
-        id: format!("{name}-{version}"),
+        id: format!("{name}-{version}{}", if windows { "-windows" } else { "" }),
+        requirements: Requirements {
+            os: windows.then(|| "windows".into()),
+            ..Default::default()
+        },
         setup: vec![setup],
         verify: vec![verify],
         env,
@@ -250,21 +340,33 @@ pub fn preset(uses: &str) -> Result<Environment> {
 }
 
 /// Resolves `NAME@VERSION` to a registrable preset environment; other names are Hub catalogue ids.
-pub fn preset_environment(name: &str) -> Result<Option<Environment>> {
+pub fn preset_environment(name: &str, os: Option<&str>) -> Result<Option<Environment>> {
     if !name.contains('@') {
         return Ok(None);
     }
-    let mut environment = preset(name)?;
+    let mut environment = preset(name, os)?;
     environment.revision = content_revision(&environment)?;
     Ok(Some(environment))
 }
 
+fn short_hash(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(text))[..16].into()
+}
+
+/// Identifies a project for caches and inline environment ids: its `name`, else its absolute directory.
+pub fn project_scope(name: Option<&str>, root: &Path) -> String {
+    short_hash(&name.map_or_else(
+        || root.to_string_lossy().into_owned(),
+        |n| format!("name:{n}"),
+    ))
+}
+
 /// Content-addressed revision, so editing a recipe prepares a new revision instead of conflicting.
 fn content_revision(environment: &Environment) -> Result<String> {
-    use sha2::{Digest, Sha256};
     let mut unrevised = environment.clone();
     unrevised.revision.clear();
-    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&unrevised)?))[..16].into())
+    Ok(short_hash(&serde_json::to_string(&unrevised)?))
 }
 
 fn merge(base: &Requirements, target: &Requirements) -> Requirements {
@@ -314,9 +416,11 @@ impl Project {
                 project.version
             )
         }
-        for name in project.environments.keys() {
+        for (name, inline) in &project.environments {
+            // Presets are resolved per target OS when a task uses them.
+            let os = inline.uses.as_ref().map(|_| "linux");
             project
-                .environment(name)
+                .environment(name, os, Path::new("project"))
                 .with_context(|| format!("environment {name}"))?;
         }
         for (name, task) in &project.tasks {
@@ -334,8 +438,9 @@ impl Project {
         Ok(project)
     }
 
-    /// Resolves an inline environment to the catalogue entry the Hub stores.
-    pub fn environment(&self, name: &str) -> Result<Environment> {
+    /// Resolves an inline environment to the catalogue entry the Hub stores. Custom recipes get an
+    /// id suffixed with the project scope so projects reusing a name never replace each other's.
+    pub fn environment(&self, name: &str, os: Option<&str>, root: &Path) -> Result<Environment> {
         let inline = self
             .environments
             .get(name)
@@ -349,13 +454,13 @@ impl Project {
             {
                 bail!("uses cannot be combined with a custom recipe")
             }
-            preset(uses)?
+            preset(uses, os)?
         } else {
             if inline.setup.is_empty() && inline.image.is_none() {
                 bail!("declare uses, setup or image")
             }
             Environment {
-                id: name.into(),
+                id: format!("{name}-{}", project_scope(self.name.as_deref(), root)),
                 requirements: inline.requirements.clone().unwrap_or_default(),
                 setup: inline.setup.clone(),
                 verify: inline.verify.clone(),
@@ -379,20 +484,8 @@ impl Project {
             .with_context(|| format!("unknown task {name}"))?;
         let defaults = &self.defaults;
         let environment_name = task.environment.as_ref().or(defaults.environment.as_ref());
-        let environment = match environment_name {
-            Some(name) if self.environments.contains_key(name) => Some(self.environment(name)?),
-            Some(name) => preset_environment(name)?,
-            None => None,
-        };
-        let environment_id = environment
-            .as_ref()
-            .map(|e| e.id.clone())
-            .or(environment_name.cloned());
         let cache = task.cache.clone().unwrap_or_else(|| defaults.cache.clone());
-        let scope = self.name.clone().or_else(|| {
-            root.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        });
+        let scope = project_scope(self.name.as_deref(), root);
         let base = task
             .requirements
             .clone()
@@ -405,35 +498,65 @@ impl Project {
         };
         let mut env = defaults.env.clone();
         env.extend(task.env.clone());
-        let specs = targets
-            .iter()
-            .map(|target| {
-                let spec = JobSpec {
-                    command: task.command.clone(),
-                    inputs: inputs.clone(),
-                    outputs: task.outputs.clone(),
-                    requirements: merge(&base, target),
-                    environment: environment_id.clone(),
-                    container: task
-                        .container
-                        .clone()
-                        .or_else(|| defaults.container.clone()),
-                    env: env.clone(),
-                    timeout_secs: task.timeout_secs.or(defaults.timeout_secs),
-                    priority: task.priority.or(defaults.priority).unwrap_or(0),
-                    cache: cache.clone(),
-                    cache_scope: (!cache.is_empty()).then(|| scope.clone()).flatten(),
-                };
-                spec.validate()?;
-                Ok(spec)
-            })
-            .collect::<Result<_>>()?;
-        Ok(Plan { environment, specs })
+        let mut environments: Vec<Environment> = Vec::new();
+        let mut specs = Vec::new();
+        for target in &targets {
+            let requirements = merge(&base, target);
+            let os = requirements.os.as_deref();
+            let environment = match environment_name {
+                Some(name) if self.environments.contains_key(name) => {
+                    Some(self.environment(name, os, root)?)
+                }
+                Some(name) => preset_environment(name, os)?,
+                None => None,
+            };
+            let environment_id = environment
+                .as_ref()
+                .map(|e| e.id.clone())
+                .or(environment_name.cloned());
+            if let Some(environment) = environment
+                && !environments.iter().any(|e| e.id == environment.id)
+            {
+                environments.push(environment);
+            }
+            let spec = JobSpec {
+                command: task.command.clone(),
+                inputs: inputs.clone(),
+                outputs: task.outputs.clone(),
+                requirements,
+                environment: environment_id,
+                container: task
+                    .container
+                    .clone()
+                    .or_else(|| defaults.container.clone()),
+                env: env.clone(),
+                timeout_secs: task.timeout_secs.or(defaults.timeout_secs),
+                priority: task.priority.or(defaults.priority).unwrap_or(0),
+                cache: cache.clone(),
+                cache_scope: (!cache.is_empty()).then(|| scope.clone()),
+            };
+            spec.validate()?;
+            specs.push(spec);
+        }
+        Ok(Plan {
+            environments,
+            specs,
+        })
     }
 
-    /// Adds a task to a project file, creating it when missing. Existing text and comments are kept.
-    pub fn save_task(file: &Path, name: &str, task: Task) -> Result<()> {
-        let block = yaml_serde::to_string(&BTreeMap::from([(name, &task)]))?;
+    /// Writes [`Project::with_task`] to the file.
+    pub fn save_task(file: &Path, name: &str, task: &Task) -> Result<()> {
+        let text = Self::with_task(file, name, task)?;
+        if let Some(parent) = file.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(file, text)?;
+        Ok(())
+    }
+
+    /// The project file text with a task added, creating the file when missing. Existing text and comments are kept.
+    pub fn with_task(file: &Path, name: &str, task: &Task) -> Result<String> {
+        let block = yaml_serde::to_string(&BTreeMap::from([(name, task)]))?;
         let text = if file.exists() {
             let text = fs::read_to_string(file)?;
             if Self::parse(&text)?.tasks.contains_key(name) {
@@ -465,11 +588,7 @@ impl Project {
             format!("version: 1\ntasks:\n{indented}")
         };
         Self::parse(&text).context("saved task would make the project file invalid")?;
-        if let Some(parent) = file.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(file, text)?;
-        Ok(())
+        Ok(text)
     }
 }
 
@@ -627,7 +746,14 @@ tasks:
         assert_eq!(specs[1].requirements.tools.len(), 2);
         assert_eq!(specs[0].timeout_secs, Some(600));
         assert_eq!(specs[0].cache, ["target"]);
-        assert_eq!(specs[0].cache_scope.as_deref(), Some("app"));
+        assert_eq!(
+            specs[0].cache_scope,
+            Some(project_scope(None, Path::new("/x/app")))
+        );
+        assert_ne!(
+            specs[0].cache_scope,
+            Some(project_scope(None, Path::new("/y/app")))
+        );
         assert_eq!(
             (specs[0].env["A"].as_str(), specs[0].env["B"].as_str()),
             ("1", "2")
@@ -643,56 +769,84 @@ tasks:
     }
 
     #[test]
-    fn inline_environments_resolve_presets_and_content_revisions() {
+    fn inline_environments_resolve_presets_per_os_and_scope_custom_ids() {
         let yaml = |setup: &str| {
             format!(
                 "version: 1
 environments:
   bun: {{uses: bun@1.3.14}}
   tools: {{setup: ['{setup}'], verify: [true]}}
+defaults:
+  requirements: {{os: linux}}
 tasks:
-  a: {{command: [bun, test], no_input: true, environment: bun}}
+  a:
+    command: [bun, test]
+    no_input: true
+    environment: bun
+    targets: [{{}}, {{os: macos}}, {{os: windows}}]
   b: {{command: [tool], no_input: true, environment: tools}}
   c: {{command: [x], no_input: true, environment: registered-elsewhere}}
 "
             )
         };
+        let root = Path::new("/work/app");
         let project = Project::parse(&yaml("echo one")).unwrap();
-        let plan = project.plan("a", Path::new("p"), Vec::new()).unwrap();
-        let bun = plan.environment.unwrap();
-        assert_eq!(bun.id, "bun-1.3.14");
-        assert_eq!(plan.specs[0].environment.as_deref(), Some("bun-1.3.14"));
-        assert!(bun.setup[0].contains("bun-v1.3.14") && bun.revision.len() == 16);
-        let tools = project.environment("tools").unwrap();
+        let plan = project.plan("a", root, Vec::new()).unwrap();
+        let ids: Vec<_> = plan.environments.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["bun-1.3.14", "bun-1.3.14-windows"]);
+        let spec_ids: Vec<_> = plan
+            .specs
+            .iter()
+            .map(|s| s.environment.clone().unwrap())
+            .collect();
+        assert_eq!(spec_ids, ["bun-1.3.14", "bun-1.3.14", "bun-1.3.14-windows"]);
+        assert!(plan.environments[0].setup[0].contains("bun-v1.3.14"));
+        assert!(plan.environments[1].setup[0].contains("bun-windows-x64.zip"));
+        assert_eq!(
+            plan.environments[1].requirements.os.as_deref(),
+            Some("windows")
+        );
+        assert!(plan.environments[0].revision.len() == 16);
+        let tools = project.environment("tools", Some("linux"), root).unwrap();
+        assert!(tools.id.starts_with("tools-") && tools.id != "tools");
+        assert_ne!(
+            tools.id,
+            project
+                .environment("tools", Some("linux"), Path::new("/other/app"))
+                .unwrap()
+                .id
+        );
         let changed = Project::parse(&yaml("echo two"))
             .unwrap()
-            .environment("tools")
+            .environment("tools", Some("linux"), root)
             .unwrap();
-        assert_eq!(tools.id, "tools");
+        assert_eq!(tools.id, changed.id);
         assert_ne!(tools.revision, changed.revision);
-        assert_eq!(
-            tools.revision,
-            project.environment("tools").unwrap().revision
-        );
-        let direct = Project::parse(
-            "version: 1\ntasks: {a: {command: [go], no_input: true, environment: go@1.23.4}}\n",
-        )
-        .unwrap();
-        let direct = direct.plan("a", Path::new("p"), Vec::new()).unwrap();
-        assert_eq!(direct.environment.unwrap().id, "go-1.23.4");
-        assert_eq!(direct.specs[0].environment.as_deref(), Some("go-1.23.4"));
-        let other = project.plan("c", Path::new("p"), Vec::new()).unwrap();
-        assert!(other.environment.is_none());
+        let other = project.plan("c", root, Vec::new()).unwrap();
+        assert!(other.environments.is_empty());
         assert_eq!(
             other.specs[0].environment.as_deref(),
             Some("registered-elsewhere")
         );
-        for bad in ["bun@1;rm -rf /", "bun", "nope@1", "bun@"] {
-            assert!(preset(bad).is_err(), "accepted {bad}");
+        let direct = Project::parse("version: 1\ntasks: {a: {command: [go], no_input: true, environment: go@1.23.4, requirements: {os: macos}}}\n").unwrap();
+        let direct = direct.plan("a", root, Vec::new()).unwrap();
+        assert_eq!(direct.environments[0].id, "go-1.23.4");
+        assert_eq!(direct.specs[0].environment.as_deref(), Some("go-1.23.4"));
+        assert!(
+            Project::parse(
+                "version: 1\ntasks: {a: {command: [go], no_input: true, environment: go@1.23.4}}\n"
+            )
+            .is_err()
+        );
+        for bad in ["bun@1;rm -rf /", "bun", "nope@1", "bun@", "rust@stable"] {
+            assert!(preset(bad, Some("linux")).is_err(), "accepted {bad}");
         }
         for name in PRESETS {
-            assert!(preset(&format!("{name}@1.0.0")).is_ok());
+            for os in ["linux", "macos", "windows"] {
+                assert!(preset(&format!("{name}@1.0.0"), Some(os)).is_ok());
+            }
         }
+        assert!(preset("bun@1.0.0", Some("freebsd")).is_err());
         assert!(
             Project::parse("version: 1\nenvironments: {x: {uses: bun@1, setup: [a]}}\ntasks: {}\n")
                 .is_err()
@@ -715,20 +869,20 @@ tasks:
             }),
             ..Default::default()
         };
-        Project::save_task(&file, "first", task("true")).unwrap();
+        Project::save_task(&file, "first", &task("true")).unwrap();
         let text = fs::read_to_string(&file).unwrap();
         fs::write(
             &file,
             format!("# keep me\n{text}defaults: {{timeout_secs: 5}}\n"),
         )
         .unwrap();
-        Project::save_task(&file, "second", task("false")).unwrap();
+        Project::save_task(&file, "second", &task("false")).unwrap();
         let text = fs::read_to_string(&file).unwrap();
         assert!(text.starts_with("# keep me\n"));
         let project = Project::parse(&text).unwrap();
         assert_eq!(project.tasks.len(), 2);
         assert_eq!(project.defaults.timeout_secs, Some(5));
         assert!(!text.contains("null"));
-        assert!(Project::save_task(&file, "second", task("x")).is_err());
+        assert!(Project::save_task(&file, "second", &task("x")).is_err());
     }
 }

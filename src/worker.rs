@@ -1435,7 +1435,12 @@ impl<'a> CacheLease<'a> {
             if fs::symlink_metadata(workdir.join(path)).is_ok() {
                 continue; // The submitted inputs already provide this path.
             }
-            let key = hex::encode(Sha256::digest(format!("{scope}\0{path}")));
+            // A different toolchain or image never reuses another's dependency or build output.
+            let key = hex::encode(Sha256::digest(format!(
+                "{scope}\0{}\0{}\0{path}",
+                spec.environment.as_deref().unwrap_or_default(),
+                spec.container.as_deref().unwrap_or_default()
+            )));
             if !state.caches.lock().unwrap().insert(key.clone()) {
                 eprintln!("cache {path} is in use by another attempt; running without it");
                 continue;
@@ -2745,6 +2750,13 @@ mod tests {
         let third = work("third");
         drop(CacheLease::claim(&state, &other_scope, &third).unwrap());
         assert!(!third.join("deps/target").exists());
+        let other_environment = JobSpec {
+            environment: Some("node-22.12.0".into()),
+            ..spec.clone()
+        };
+        let toolchain = work("toolchain");
+        drop(CacheLease::claim(&state, &other_environment, &toolchain).unwrap());
+        assert!(!toolchain.join("deps/target").exists());
         #[cfg(unix)]
         {
             let fourth = work("fourth");

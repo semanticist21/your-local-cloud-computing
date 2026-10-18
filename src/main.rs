@@ -568,9 +568,18 @@ async fn submit(
     );
     let mut jobs = Vec::new();
     for spec in &specs {
-        let job: Job = client.post("/v1/jobs", spec).await?;
-        eprintln!("job {} ({})", job.id, job.state);
-        jobs.push(job);
+        match client.post::<_, Job>("/v1/jobs", spec).await {
+            Ok(job) => {
+                eprintln!("job {} ({})", job.id, job.state);
+                jobs.push(job);
+            }
+            // Keep already-submitted jobs trackable on stdout instead of orphaning them.
+            Err(error) if !jobs.is_empty() => {
+                report(&jobs, true)?;
+                return Err(error.context("a later target was not submitted; the jobs above are running"));
+            }
+            Err(error) => return Err(error),
+        }
     }
     if detach {
         return Ok(jobs);
@@ -580,6 +589,24 @@ async fn submit(
         done.push(client.wait(&job.id, results, !no_download).await?);
     }
     Ok(done)
+}
+
+/// A `--save-task` input relative to the project directory, as `ylcc.yaml` requires.
+fn task_input(cwd: &Path, input: &Path) -> Result<PathBuf> {
+    let absolute = if input.is_absolute() { input.to_path_buf() } else { cwd.join(input) };
+    let mut relative = PathBuf::new();
+    for part in absolute
+        .strip_prefix(cwd)
+        .with_context(|| format!("input {} is outside the project directory", input.display()))?
+        .components()
+    {
+        match part {
+            std::path::Component::Normal(part) => relative.push(part),
+            std::path::Component::CurDir => {}
+            _ => bail!("input {} must stay inside the project directory", input.display()),
+        }
+    }
+    Ok(if relative.as_os_str().is_empty() { ".".into() } else { relative })
 }
 
 /// Idempotent: an unchanged recipe keeps its revision; workers prepare it on first use.
@@ -745,11 +772,17 @@ async fn execute() -> Result<()> {
                 build_target: r.build_target,
                 emulation: false,
             };
-            let cwd = std::env::current_dir()?;
+            let cwd = platform::command_path(&std::env::current_dir()?.canonicalize()?);
+            let project_file = cwd.join("ylcc.yaml");
+            // A run inside a project shares the project's cache scope, so a saved task stays warm.
+            let project_name = fs::read_to_string(&project_file)
+                .ok()
+                .and_then(|text| Project::parse(&text).ok())
+                .and_then(|project| project.name);
             let preset = r
                 .environment
                 .as_deref()
-                .map(ylcc::project::preset_environment)
+                .map(|name| ylcc::project::preset_environment(name, requirements.os.as_deref()))
                 .transpose()?
                 .flatten();
             let spec = JobSpec {
@@ -763,28 +796,44 @@ async fn execute() -> Result<()> {
                 timeout_secs: r.timeout,
                 priority: r.priority,
                 cache_scope: (!r.cache.is_empty())
-                    .then(|| cwd.file_name().map(|n| n.to_string_lossy().into_owned()))
-                    .flatten(),
+                    .then(|| ylcc::project::project_scope(project_name.as_deref(), &cwd)),
                 cache: r.cache.clone(),
             };
-            let saved = r.save_task.map(|name| {
-                let task = ylcc::project::Task {
-                    command: r.command,
-                    inputs: r.selection.input,
-                    project: r.selection.project,
-                    no_input: r.selection.no_input,
-                    outputs: r.output,
-                    requirements: Some(requirements),
-                    environment: r.environment,
-                    container: r.container,
-                    env: spec.env.clone(),
-                    timeout_secs: r.timeout,
-                    priority: (r.priority != 0).then_some(r.priority),
-                    cache: (!r.cache.is_empty()).then_some(r.cache),
-                    ..Default::default()
-                };
-                (name, task)
-            });
+            let saved = match r.save_task {
+                Some(name) => {
+                    let task = ylcc::project::Task {
+                        command: r.command,
+                        inputs: r
+                            .selection
+                            .input
+                            .iter()
+                            .map(|input| task_input(&cwd, input))
+                            .collect::<Result<_>>()?,
+                        project: r.selection.project,
+                        no_input: r.selection.no_input,
+                        outputs: r.output,
+                        requirements: Some(requirements),
+                        environment: r.environment,
+                        container: r.container,
+                        env: spec.env.clone(),
+                        timeout_secs: r.timeout,
+                        priority: (r.priority != 0).then_some(r.priority),
+                        cache: (!r.cache.is_empty()).then_some(r.cache),
+                        ..Default::default()
+                    };
+                    // Check before submitting, so a run that succeeds is never left unsaveable.
+                    let text = Project::with_task(&project_file, &name, &task)?;
+                    let planned = Project::parse(&text)?.plan(&name, &cwd, snap.files.clone())?;
+                    let (want, got) = (serde_json::to_value(&spec)?, serde_json::to_value(&planned.specs)?);
+                    if got.as_array().is_none_or(|specs| specs.len() != 1 || specs[0] != want) {
+                        bail!(
+                            "ylcc.yaml defaults would change this run once saved (planned {got}); pass matching options or add the task manually"
+                        )
+                    }
+                    Some((name, task))
+                }
+                None => None,
+            };
             if let Some(environment) = &preset {
                 register(&client, environment).await?;
             }
@@ -793,7 +842,7 @@ async fn execute() -> Result<()> {
             if let Some((name, task)) = saved
                 && (r.detach || jobs.iter().all(|job| job.state == "succeeded"))
             {
-                save = Project::save_task(&cwd.join("ylcc.yaml"), &name, task);
+                save = Project::save_task(&project_file, &name, &task);
                 if save.is_ok() {
                     eprintln!("saved task {name} to ylcc.yaml; rerun with: ylcc task run {name}");
                 }
@@ -839,7 +888,7 @@ async fn execute() -> Result<()> {
                 let snap = task.snapshot(&root)?;
                 let plan = project.plan(&name, &root, snap.files.clone())?;
                 let client = Client::new(&hub, &token)?;
-                if let Some(environment) = &plan.environment {
+                for environment in &plan.environments {
                     register(&client, environment).await?;
                 }
                 let jobs = submit(&client, snap, plan.specs, &results, detach, no_download).await?;
@@ -1329,6 +1378,15 @@ mod tests {
         token.into_temp_path()
     }
 
+    #[test]
+    fn task_inputs_become_project_relative() {
+        let cwd = Path::new("/work/app");
+        assert_eq!(task_input(cwd, Path::new("./src")).unwrap(), Path::new("src"));
+        assert_eq!(task_input(cwd, Path::new("/work/app/a/b")).unwrap(), Path::new("a/b"));
+        assert_eq!(task_input(cwd, Path::new(".")).unwrap(), Path::new("."));
+        assert!(task_input(cwd, Path::new("../other")).is_err());
+        assert!(task_input(cwd, Path::new("/elsewhere")).is_err());
+    }
     #[tokio::test]
     async fn doctor_preserves_local_information_when_the_hub_request_fails() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

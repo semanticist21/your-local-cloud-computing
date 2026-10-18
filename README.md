@@ -344,12 +344,13 @@ tasks:
       - {os: macos, arch: aarch64}
 ```
 
-- **Environments** declared in the file are registered when `task run` uses them. Each worker installs one on first use and keeps it, so later runs start immediately. The revision is a hash of the recipe: editing it prepares a new revision, while an unchanged recipe is reused. Presets (`bun`, `node`, `rust`, `go`, `uv`) install into the worker's environment directory using Linux/macOS shell commands; on Windows, write a recipe.
+- **Environments** declared in the file are registered when `task run` uses them. Each worker installs one on first use and keeps it, so later runs start immediately. The revision is a hash of the recipe: editing it prepares a new revision, while an unchanged recipe is reused. A custom recipe's Hub id gets a project suffix (for example `tools-3fa2…`), so projects reusing a name never replace each other's recipe or a separately registered environment.
+- **Presets** (`bun`, `node`, `rust`, `go`, `uv`) install into the worker's environment directory: a shell recipe on Linux/macOS, a PowerShell recipe on Windows x86_64 (id suffix `-windows`). A preset needs an explicit `os` in the requirements or target to pick its recipe. Rust on Windows links MSVC targets only with Visual Studio Build Tools installed on the host.
 - **Defaults** apply to every task that does not set the field itself; `env` maps merge.
 - **Targets** submit one job per entry. The snapshot uploads once. `task run` prints one object for one target or an array for several, and fails if any job fails.
-- **Cache** directories are moved out of the checkout after the job and back into the next one with the same project `name` (default: the YAML directory's name) and path, on the same worker. They are kept after failures too. If another attempt is using a cache, the job runs without it rather than waiting. Caches live under the worker's `caches/` data directory; delete that directory to clear them. A path already present in the inputs is never replaced.
+- **Cache** directories are moved out of the checkout after the job and back into the next one on the same worker with the same project, environment, container and path. The project is its `name` when set (to share caches between requesters), otherwise the YAML directory's absolute path. Caches are kept after failures too. If another attempt is using a cache, the job runs without it rather than waiting. Caches live under the worker's `caches/` data directory; delete that directory to clear them. A path already present in the inputs is never replaced.
 
-Turn a working ad-hoc run into a task with `--save-task NAME`. It appends to `./ylcc.yaml` (creating it if needed, keeping existing comments) after the job succeeds, or at submission with `--detach`. Inputs and commands stay relative to the current directory:
+Turn a working ad-hoc run into a task with `--save-task NAME`. It appends to `./ylcc.yaml` (creating it if needed, keeping existing comments) after the job succeeds, or at submission with `--detach`. Inputs and commands stay relative to the current directory. The run is refused before submission if the file's `defaults` would make the saved task run differently:
 
 ```bash
 ylcc run --input package.json --input bun.lock --input src --os linux --environment bun@1.3.14 \

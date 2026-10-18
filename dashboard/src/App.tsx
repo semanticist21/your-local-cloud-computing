@@ -493,6 +493,12 @@ function JobsPage() {
     [navigate],
   )
   const [query, setQuery] = useState(search.q ?? '')
+  // Back/forward changes the URL's q; adopt it unless it is just our own debounced write.
+  const [syncedQ, setSyncedQ] = useState(search.q)
+  if (search.q !== syncedQ) {
+    setSyncedQ(search.q)
+    if ((query.trim() || undefined) !== search.q) setQuery(search.q ?? '')
+  }
   useEffect(() => {
     const next = query.trim() || undefined
     if (next === search.q) return
@@ -558,7 +564,13 @@ function JobPage() {
   const { jobId } = jobRoute.useParams()
   const { jobs } = useSnapshot()
   const job = jobs.find((candidate) => candidate.id === jobId)
-  const logs = useQuery({ ...jobLogsQuery(jobId, !job || !terminalJobStates.has(job.state)), enabled: Boolean(job) })
+  const finished = Boolean(job && terminalJobStates.has(job.state))
+  const logs = useQuery({ ...jobLogsQuery(jobId, !finished), enabled: Boolean(job) })
+  const queryClient = useQueryClient()
+  // Polling stops at the terminal state; fetch once more so output written after the last poll appears.
+  useEffect(() => {
+    if (finished) void queryClient.invalidateQueries({ queryKey: jobLogsQuery(jobId, false).queryKey })
+  }, [finished, jobId, queryClient])
   const now = useNow()
   const back = <Link className="back-link" to="/jobs"><ArrowLeft size={14} /> Jobs</Link>
   if (!job) {
@@ -570,7 +582,6 @@ function JobPage() {
     )
   }
   const spec = job.spec
-  const finished = terminalJobStates.has(job.state)
   const envKeys = Object.keys(spec.env ?? {}).sort()
   const requirements = Object.entries(spec.requirements ?? {}).filter(([, value]) =>
     value !== null && value !== false && !(Array.isArray(value) && !value.length) && !(typeof value === 'object' && !Array.isArray(value) && !Object.keys(value as object).length))

@@ -232,11 +232,19 @@ def main():
             assert sorted(result(job) for job in counted) == ["inline1", "inline2"], counted
             counted_again, _ = repeat_cli("task", "run", "count")
             assert sorted(result(job) for job in counted_again) == ["inline3", "inline4"]
-            saved, saved_log = repeat_cli("run", "--no-input", *common, "--save-task", "noop", "--", *noop)
-            assert saved["state"] == "succeeded" and "saved task noop" in saved_log
-            listed, _ = repeat_cli("task", "list")
-            assert set(listed) == {"count", "noop"}
-            assert repeat_cli("task", "run", "noop")[0]["state"] == "succeeded"
+            # Defaults (environment, cache) would change this run, so saving is refused before submission.
+            refused = subprocess.run(prefix + ["run", "--no-input", *common, "--save-task", "noop", "--", *noop],
+                                     cwd=repeat, text=True, capture_output=True, timeout=60)
+            assert refused.returncode != 0 and "defaults would change" in refused.stderr, refused.stderr
+            fresh = base / "fresh"
+            fresh.mkdir()
+            (fresh / "input.txt").write_text("saved\n")
+            done = subprocess.run(prefix + ["run", "--input", "./input.txt", "--output", "answer.txt", *common,
+                                  "--save-task", "copy", "--", *python(copy_input)], cwd=fresh, text=True, capture_output=True, timeout=120)
+            assert done.returncode == 0 and "saved task copy" in done.stderr, done.stderr
+            rerun = subprocess.run(prefix + ["task", "run", "copy"], cwd=fresh, text=True, capture_output=True, timeout=120)
+            assert rerun.returncode == 0, rerun.stderr
+            assert result(json.loads(rerun.stdout)) == "saved\n"
 
             paused, _ = cli("workers", "pause", "test-worker")
             assert paused["paused"]

@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
     [ValidatePattern('^v[0-9][A-Za-z0-9._-]*$')]
-    [string]$Version = 'v0.4.6',
+    [string]$Version = 'v0.4.7',
     [string]$Prefix = $(if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'Programs\ylcc' } else { '' })
 )
 $ErrorActionPreference = 'Stop'

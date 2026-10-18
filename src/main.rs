@@ -200,6 +200,10 @@ enum Tasks {
         runtime: String,
         #[arg(long, default_value = "check")]
         name: String,
+        #[arg(long, default_value = "linux")]
+        os: String,
+        #[arg(long, default_value = "x86_64")]
+        arch: String,
         #[arg(long)]
         force: bool,
     },
@@ -577,7 +581,7 @@ async fn diagnostics(hub: &str, token: &Path, local: Capabilities) -> Result<ser
     Ok(value)
 }
 
-fn task_template(runtime: &str, name: &str) -> Result<String> {
+fn task_template(runtime: &str, name: &str, os: &str, arch: &str) -> Result<String> {
     let (command, inputs, trust_command) = match runtime {
         "rust" => (r#"    command: [cargo, test, --locked]"#, r#"    inputs: [Cargo.toml, Cargo.lock, src, tests]"#, "Rust"),
         "node" => (r#"    command: [npm, test]"#, r#"    inputs: [package.json, package-lock.json, src, test]"#, "Node"),
@@ -594,14 +598,16 @@ tasks:
 {command}
 {inputs}
     requirements:
-      os: linux
-      arch: x86_64
+      os: {os}
+      arch: {arch}
       tools: {{}}
     outputs: []
     timeout_secs: 1800
     priority: 0
 "#,
-        name = name
+        name = name,
+        os = os,
+        arch = arch
     ))
 }
 
@@ -719,14 +725,14 @@ async fn execute() -> Result<()> {
                 let (project, _) = Project::load(&file)?;
                 print(&project.tasks)
             }
-            Tasks::Init { file, runtime, name, force } => {
+            Tasks::Init { file, runtime, name, os, arch, force } => {
                 let existed_before = file.exists();
                 if existed_before && !force {
                     bail!("project file already exists: {}; pass --force to overwrite", file.display())
                 }
                 let parent = file.parent().unwrap_or(Path::new("."));
                 fs::create_dir_all(parent)?;
-                let template = task_template(runtime.as_str(), name.as_str())?;
+                let template = task_template(runtime.as_str(), name.as_str(), os.as_str(), arch.as_str())?;
                 fs::write(&file, template)?;
                 print(&serde_json::json!({
                     "file": absolute_path(&file)?,

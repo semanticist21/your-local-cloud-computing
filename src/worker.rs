@@ -2131,6 +2131,10 @@ pub async fn probe() -> Result<Capabilities> {
         "emulator",
         "powershell",
         "python",
+        "bun",
+        "zig",
+        "protoc",
+        "pkg-config",
     ] {
         if let Ok(version) = tool_version(name, &values, None).await {
             tools.insert(name.into(), version);

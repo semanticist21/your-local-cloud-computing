@@ -265,6 +265,7 @@ fn launch_agent(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn service_arguments(
     role: &str,
     hub: &str,
@@ -273,6 +274,7 @@ fn service_arguments(
     id: &str,
     listen: &str,
     max_jobs: usize,
+    policy: Option<&Path>,
 ) -> Result<(Vec<String>, PathBuf)> {
     role_name(role)?;
     if max_jobs == 0 {
@@ -301,6 +303,9 @@ fn service_arguments(
         data_dir.to_string_lossy().into_owned(),
     ];
     if role == "hub" {
+        if policy.is_some() {
+            bail!("--policy applies to workers; the Hub has no command policy")
+        }
         args.extend(["--listen".into(), listen.into()]);
     } else {
         args.extend([
@@ -309,6 +314,12 @@ fn service_arguments(
             "--max-jobs".into(),
             max_jobs.to_string(),
         ]);
+        if let Some(policy) = policy {
+            // Fail at install time rather than in a restart loop.
+            crate::policy::Policy::load(policy)?;
+            let policy = crate::platform::command_path(&policy.canonicalize()?);
+            args.extend(["--policy".into(), policy.to_string_lossy().into_owned()]);
+        }
     }
     for arg in &args {
         checked(arg)?;
@@ -318,6 +329,7 @@ fn service_arguments(
 
 /// Install a service for the current user; no root identity or system service is used.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 pub fn install(
     role: &str,
     hub: &str,
@@ -326,9 +338,10 @@ pub fn install(
     id: &str,
     listen: &str,
     max_jobs: usize,
+    policy: Option<&Path>,
 ) -> Result<()> {
     let (args, data_dir) =
-        service_arguments(role, hub, token_file, data_dir, id, listen, max_jobs)?;
+        service_arguments(role, hub, token_file, data_dir, id, listen, max_jobs, policy)?;
     let path = env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
     match env::consts::OS {
         "linux" => {
@@ -471,12 +484,13 @@ pub fn install_system_user(
     id: &str,
     listen: &str,
     max_jobs: usize,
+    policy: Option<&Path>,
     service_user: &str,
 ) -> Result<()> {
     let label = managed_label(role, service_user)?;
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (label, hub, token_file, data_dir, id, listen, max_jobs);
+        let _ = (label, hub, token_file, data_dir, id, listen, max_jobs, policy);
         bail!(
             "--system-user is supported on macOS; on Linux install a user service under the dedicated account and enable linger"
         )
@@ -559,11 +573,12 @@ pub fn install_system_user(
         }
         prepare_service_data(data_dir, uid)?;
         // Check real access as the target account before touching a running service.
-        for (flag, path) in [
-            ("-r", token_file),
-            ("-w", data_dir),
-            ("-x", env::current_exe()?.as_path()),
-        ] {
+        let executable = env::current_exe()?;
+        let mut access = vec![("-r", token_file), ("-w", data_dir), ("-x", executable.as_path())];
+        if let Some(policy) = policy {
+            access.push(("-r", policy));
+        }
+        for (flag, path) in access {
             let status = Command::new("/usr/bin/sudo")
                 .args(["-n", "-u", service_user, "--", "/bin/test", flag])
                 .arg(path)
@@ -573,7 +588,7 @@ pub fn install_system_user(
             }
         }
         let (args, data_dir) =
-            service_arguments(role, hub, token_file, data_dir, id, listen, max_jobs)?;
+            service_arguments(role, hub, token_file, data_dir, id, listen, max_jobs, policy)?;
         let path = format!(
             "{home}/.local/bin:{home}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         );
@@ -969,10 +984,11 @@ fn stop_task(name: &str, unregister: bool) -> Result<String> {
 /// Start at boot without a login: a Windows S4U task, which only an elevated shell can register.
 #[cfg(not(windows))]
 #[allow(clippy::too_many_arguments)]
-pub fn install_at_startup(_: &str, _: &str, _: &Path, _: &Path, _: &str, _: &str, _: usize) -> Result<()> {
+pub fn install_at_startup(_: &str, _: &str, _: &Path, _: &Path, _: &str, _: &str, _: usize, _: Option<&Path>) -> Result<()> {
     bail!("--at-startup is for Windows; use --system-user on macOS, or a user service with linger on Linux")
 }
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 pub fn install_at_startup(
     role: &str,
     hub: &str,
@@ -981,12 +997,14 @@ pub fn install_at_startup(
     id: &str,
     listen: &str,
     max_jobs: usize,
+    policy: Option<&Path>,
 ) -> Result<()> {
-    install_task(role, hub, token_file, data_dir, id, listen, max_jobs, true)
+    install_task(role, hub, token_file, data_dir, id, listen, max_jobs, policy, true)
 }
 
 /// Windows workers run as the installing user while that user is logged in.
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 pub fn install(
     role: &str,
     hub: &str,
@@ -995,8 +1013,9 @@ pub fn install(
     id: &str,
     listen: &str,
     max_jobs: usize,
+    policy: Option<&Path>,
 ) -> Result<()> {
-    install_task(role, hub, token_file, data_dir, id, listen, max_jobs, false)
+    install_task(role, hub, token_file, data_dir, id, listen, max_jobs, policy, false)
 }
 
 #[cfg(windows)]
@@ -1009,6 +1028,7 @@ fn install_task(
     id: &str,
     listen: &str,
     max_jobs: usize,
+    policy: Option<&Path>,
     at_startup: bool,
 ) -> Result<()> {
     use std::{io::Write, os::windows::fs::OpenOptionsExt};
@@ -1016,7 +1036,7 @@ fn install_task(
     crate::platform::private_dir(&directory)?;
     crate::platform::private_dir(data_dir)?;
     let (args, data_dir) =
-        service_arguments(role, hub, token_file, data_dir, id, listen, max_jobs)?;
+        service_arguments(role, hub, token_file, data_dir, id, listen, max_jobs, policy)?;
     // A running worker holds its log open, so stop it before reopening the log on reinstall.
     let name = powershell_literal(&name)?;
     powershell(&stop_task(&name, false)?)?;

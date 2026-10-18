@@ -56,6 +56,7 @@ import {
   type Job,
   type Role,
   type WorkerInfo,
+  type WorkerPolicy,
 } from './lib/api'
 
 const activeJobStates = new Set(['assigned', 'running'])
@@ -449,8 +450,11 @@ function WorkerPage() {
           <Detail label="Runtimes">{caps.runtimes.length ? caps.runtimes.join(', ') : 'None'}</Detail>
           <Detail label="Containerized">{caps.containerized ? 'Yes' : 'No'}</Detail>
           <Detail label="CPU features">{caps.cpu_features?.length ? `${caps.cpu_features.length} reported` : 'None reported'}</Detail>
+          <Detail label="Command policy">{caps.policy ? <PolicyBadge policy={caps.policy} /> : <span className="muted-text">None (runs any job)</span>}</Detail>
         </dl>
       </section>
+
+      {caps.policy && <PolicySection policy={caps.policy} />}
 
       <section className="content-section">
         <SectionHeading
@@ -501,7 +505,7 @@ function WorkersTable({ workers, jobsByWorker }: { workers: WorkerInfo[]; jobsBy
       <tbody>{workers.map((worker) => (
         <tr key={worker.id} className="clickable-row" onClick={() => navigate({ to: '/workers/$workerId', params: { workerId: worker.id } })}>
           <td><div className="worker-name"><span className={`worker-avatar worker-avatar-${worker.capabilities.os}`}>{osGlyph(worker.capabilities.os)}</span><Link className="table-link" to="/workers/$workerId" params={{ workerId: worker.id }}>{worker.id}</Link></div></td>
-          <td><WorkerState worker={worker} /></td>
+          <td><WorkerState worker={worker} />{worker.capabilities.policy && <> <PolicyBadge policy={worker.capabilities.policy} /></>}</td>
           <td><span className="platform-name">{worker.capabilities.os}</span><span className="platform-arch">{worker.capabilities.arch}</span></td>
           <td><div className="resource-line"><Cpu size={13} /> {worker.capabilities.cpus} CPU <span className="resource-divider">·</span> {formatMemory(worker.capabilities.memory_bytes)}</div></td>
           <td><span className="capacity-value">{jobsByWorker.get(worker.id) ?? 0}<span> / {worker.max_jobs}</span></span></td>
@@ -509,6 +513,32 @@ function WorkersTable({ workers, jobsByWorker }: { workers: WorkerInfo[]; jobsBy
         </tr>
       ))}</tbody>
     </table></div>
+  )
+}
+
+function PolicyBadge({ policy }: { policy: WorkerPolicy }) {
+  return policy.warnings?.length
+    ? <Badge variant="warning" title={policy.warnings.join('\n')}>Restricted (bypassable)</Badge>
+    : <Badge variant="default">Restricted</Badge>
+}
+
+function PolicySection({ policy }: { policy: WorkerPolicy }) {
+  const rule = (items: string[] | undefined, render: (items: string[]) => ReactNode) =>
+    items === undefined ? <span className="muted-text">Unrestricted</span> : items.length === 0 ? <span className="muted-text">None allowed</span> : render(items)
+  return (
+    <section className="content-section">
+      <SectionHeading title="Command policy" detail="Enforced by this worker before it runs anything" />
+      {policy.warnings?.map((warning) => (
+        <div key={warning} className="error-notice" role="note"><CircleAlert size={16} /><span>{warning}</span></div>
+      ))}
+      <dl className="detail-grid">
+        <Detail label="Commands">{rule(policy.commands?.map((argv) => JSON.stringify(argv)), (items) => <code>{items.join('  ')}</code>)}</Detail>
+        <Detail label="Containers">{rule(policy.containers, (items) => <code>{items.join(', ')}</code>)}</Detail>
+        <Detail label="Environments">{rule(policy.environments?.map((pin) => `${pin.id}${pin.sha256 === '*' ? ' (any content)' : ''}`), (items) => items.join(', '))}</Detail>
+        <Detail label="Job env keys">{rule(policy.env, (items) => <code>{items.join(', ')}</code>)}</Detail>
+        <Detail label="Self-update">{policy.self_update === false ? 'Disabled' : 'Allowed'}</Detail>
+      </dl>
+    </section>
   )
 }
 

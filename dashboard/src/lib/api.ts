@@ -12,6 +12,17 @@ export type Capabilities = {
   cpus: number
   memory_bytes: number
   containerized: boolean
+  policy?: WorkerPolicy
+}
+
+/** A worker's command policy; an absent category is unrestricted. */
+export type WorkerPolicy = {
+  commands?: string[][]
+  containers?: string[]
+  environments?: { id: string; sha256: string }[]
+  env?: string[]
+  self_update?: boolean
+  warnings?: string[]
 }
 
 export type WorkerInfo = {

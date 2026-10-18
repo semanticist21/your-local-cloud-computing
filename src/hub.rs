@@ -1224,6 +1224,12 @@ fn candidate(
         );
     }
     reasons.extend(capabilities.mismatch(&spec.requirements));
+    // Routing only: the worker enforces its policy again before running anything.
+    if let Some(policy) = &worker.capabilities.policy
+        && let Err(reason) = policy.check_job(spec, environment)
+    {
+        reasons.push(reason);
+    }
     if let Some(target) = &spec.requirements.build_target
         && capabilities
             .tools
@@ -1308,7 +1314,7 @@ fn router(state: Shared) -> Router {
                 Json(serde_json::json!({
                     "status":"ok",
                     "version":crate::VERSION,
-                    "capabilities":["job_priority", "worker_control", "scoped_tokens", "audit_log"]
+                    "capabilities":["job_priority", "worker_control", "scoped_tokens", "audit_log", "command_policy"]
                 }))
             }),
         )
@@ -3063,6 +3069,39 @@ mod tests {
         assert_eq!(call(&app, "GET", "/v1/jobs", Some(&secret), "").await.0, StatusCode::UNAUTHORIZED);
         let (_, listed) = call(&app, "GET", "/v1/tokens", pool, "").await;
         assert!(listed.as_array().unwrap().iter().all(|t| t.get("secret").is_none() && t.get("hash").is_none()));
+    }
+
+    #[tokio::test]
+    async fn hub_routes_around_worker_policies_and_rejects_jobs_no_worker_allows() {
+        let (_dir, mut store) = test_store();
+        let mut restricted = caps();
+        restricted.policy = Some(crate::policy::Policy::parse("version: 1\ncommands: [[\"true\"]]\nenvironments: []\n").unwrap());
+        let (tx, mut strict_rx) = mpsc::unbounded_channel();
+        store
+            .connect("strict".into(), restricted, 1, vec![], vec![], String::new(), tx, &pool_principal())
+            .unwrap();
+        let denied = JobSpec { command: vec!["sh".into(), "-c".into(), "x".into()], ..spec() };
+        let error = store.add_job(denied.clone(), None).unwrap_err();
+        assert!(error.1.contains("strict: command [\"sh\",\"-c\",\"x\"] is not allowed by worker policy"), "{}", error.1);
+        let allowed = store.add_job(JobSpec { command: vec!["true".into()], ..spec() }, None).unwrap();
+        assert!(matches!(strict_rx.try_recv(), Ok(HubMessage::Run { job, .. }) if job.id == allowed.id));
+        let (_open, mut open_rx) = worker(&mut store, "open");
+        let routed = store.add_job(denied, None).unwrap();
+        assert!(matches!(open_rx.try_recv(), Ok(HubMessage::Run { job, .. }) if job.id == routed.id));
+        assert!(strict_rx.try_recv().is_err());
+
+        // Explicit preparation checks only the environment against each worker's policy.
+        let state = Arc::new(Mutex::new(store));
+        let environment = Environment { id: "native".into(), revision: "1".into(), setup: vec!["true".into()], ..Default::default() };
+        upsert_environment(State(state.clone()), Extension(pool_principal()), Json(environment)).await.unwrap();
+        let prepared = prepare(State(state.clone()), Extension(pool_principal()), Path("native".into()), Json(PrepareRequest::default()))
+            .await
+            .unwrap();
+        assert_eq!(prepared.0.iter().map(|s| s.worker_id.as_str()).collect::<Vec<_>>(), ["open"]);
+        let error = prepare(State(state), Extension(pool_principal()), Path("native".into()), Json(PrepareRequest { worker_id: Some("strict".into()) }))
+            .await
+            .unwrap_err();
+        assert!(error.1.contains("environment native"), "{}", error.1);
     }
 }
 

@@ -313,7 +313,35 @@ def main():
             actions = {e["action"] for e in events}
             assert {"token.create", "token.revoke", "job.submit", "job.priority", "worker.control", "worker.connect", "worker.rejected", "environment.upsert"} <= actions, actions
             assert any(e["action"] == "job.submit" and e["actor"] == "laptop" and e["target"] == submitted["id"] for e in events)
-            print("PASS: native compile, snapshots, dedup, isolation, cancellation, reconnect, persistent environments, YAML task, priority, pause/resume, live concurrency, scoped tokens, audit")
+
+            # Command policy (last: it removes the unrestricted worker). A policy worker refuses
+            # anything outside its allowlist, and the Hub rejects such jobs at submission.
+            stop(worker)
+            until(lambda: not next(w for w in cli("workers")[0] if w["id"] == "test-worker")["online"], timeout=15)
+            for registered in ("test-worker", "second-worker"):
+                cli("workers", "delete", registered)
+            policy_dir = base / "policy"
+            policy_dir.mkdir(mode=0o700)
+            policy_file = policy_dir / "policy.yaml"
+            policy_file.write_text(f"version: 1\ncommands: [{json.dumps([sys.executable, '-c', 'pass'])}]\nenv: []\n")
+            if os.name != "nt":
+                policy_dir.chmod(0o700)
+                policy_file.chmod(0o600)
+            checked, _ = cli("policy", "check", str(policy_file))
+            assert checked["categories"]["commands"] == "restricted" and checked["categories"]["containers"].startswith("unrestricted")
+            assert any("interpreter" in warning for warning in checked["warnings"]), checked
+            strict = start("worker", "--id", "strict-worker", "--data-dir", str(base / "worker-strict"), "--policy", str(policy_file))
+            until(lambda: any(w["id"] == "strict-worker" and w["online"] for w in cli("workers")[0]))
+            advertised = next(w for w in cli("workers")[0] if w["id"] == "strict-worker")["capabilities"]["policy"]
+            assert advertised["commands"] == [[sys.executable, "-c", "pass"]] and advertised["warnings"]
+            allowed, _ = cli("run", "--no-input", *common, "--", *noop)
+            assert allowed["state"] == "succeeded" and allowed["worker_id"] == "strict-worker"
+            refused = cli("run", "--no-input", *common, "--", *python("print('not allowed')"), ok=False)
+            assert "not allowed by worker policy" in refused.stderr, refused.stderr
+            refused_env = cli("run", "--no-input", *common, "--env", "FOO=1", "--", *noop, ok=False)
+            assert "FOO is not allowed" in refused_env.stderr, refused_env.stderr
+            stop(strict)
+            print("PASS: native compile, snapshots, dedup, isolation, cancellation, reconnect, persistent environments, YAML task, priority, pause/resume, live concurrency, scoped tokens, audit, command policy")
         except BaseException:
             for stream in streams:
                 stream.flush()

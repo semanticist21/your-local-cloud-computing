@@ -111,6 +111,9 @@ pub struct Capabilities {
     pub memory_bytes: u64,
     #[serde(default)]
     pub containerized: bool,
+    /// The worker's command policy; absent means it runs everything it is assigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<crate::policy::Policy>,
 }
 impl Capabilities {
     pub fn mismatch(&self, r: &Requirements) -> Vec<String> {

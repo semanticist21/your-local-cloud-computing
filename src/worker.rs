@@ -1,4 +1,5 @@
 use crate::model::*;
+use crate::policy::Policy;
 #[cfg(windows)]
 #[path = "worker_windows.rs"]
 mod windows;
@@ -61,6 +62,8 @@ struct State {
     /// Fixed checkout directories currently used by an attempt.
     workspaces: Mutex<HashSet<String>>,
     events: broadcast::Sender<WorkerMessage>,
+    /// The operator's allowlist from `--policy`; `None` runs everything the Hub assigns.
+    policy: Option<Policy>,
 }
 
 #[derive(Debug)]
@@ -222,6 +225,7 @@ pub async fn run(
     data_dir: PathBuf,
     id: String,
     max_jobs: usize,
+    policy: Option<Policy>,
 ) -> Result<()> {
     identifier(&id)?;
     ensure!(max_jobs > 0, "max-jobs must be positive");
@@ -251,7 +255,14 @@ pub async fn run(
     for child in ["attempts", "blobs", "caches", "environments", "workspaces"] {
         private_dir(&data.join(child))?;
     }
-    let capabilities = probe().await?;
+    let mut capabilities = probe().await?;
+    if let Some(policy) = &policy {
+        eprintln!("worker policy: {}", policy.summary());
+        for warning in &policy.warnings {
+            eprintln!("warning: worker policy: {warning}");
+        }
+        capabilities.policy = Some(policy.clone());
+    }
     let (events, _) = broadcast::channel(4096);
     let state = Arc::new(State {
         hub: hub.trim_end_matches('/').into(),
@@ -272,6 +283,7 @@ pub async fn run(
         caches: Mutex::new(HashSet::new()),
         workspaces: Mutex::new(HashSet::new()),
         events,
+        policy,
     });
     load_state(&state).await?;
     if let Ok(exe) = std::env::current_exe() {
@@ -418,6 +430,10 @@ async fn load_state(state: &Arc<State>) -> Result<()> {
         let result = async {
             let definition: Environment =
                 serde_json::from_reader(File::open(dir.join("definition.json"))?)?;
+            // Environments prepared before a policy existed stay usable only if it allows them.
+            if let Some(policy) = &state.policy {
+                policy.check_environment(&definition).map_err(anyhow::Error::msg)?;
+            }
             let image = if definition.image.is_some() {
                 Some(resolved_image(state, &definition)?)
             } else {
@@ -562,6 +578,10 @@ async fn connection(state: Arc<State>) -> Result<()> {
                     Ok(HubMessage::Evict { environment_id }) => {
                         let state = state.clone();
                         tokio::spawn(async move { if let Err(e) = evict_environment(&state, &environment_id).await { eprintln!("environment eviction: {e:#}"); } });
+                    }
+                    Ok(HubMessage::Update { version }) if state.policy.as_ref().is_some_and(|policy| !policy.self_update) => {
+                        eprintln!("self-update to {version} refused by worker policy");
+                        state.emit(WorkerMessage::UpdateFailed { error: "self-update is disabled by this worker's policy (self_update: false)".into() });
                     }
                     Ok(HubMessage::Update { version }) => {
                         let state = state.clone();
@@ -1257,6 +1277,22 @@ async fn run_attempt(
     mut cancel: watch::Receiver<bool>,
 ) -> Result<(i32, Vec<FileEntry>)> {
     cancelled(&cancel)?;
+    // Before any preparation, pull or input download: a refused job touches nothing.
+    if let Some(policy) = &state.policy {
+        policy.check_job(&job.spec, environment).map_err(anyhow::Error::msg)?;
+        if let Some(environment) = environment {
+            // A ready environment ran the setup in its definition.json; that is what was checked.
+            let definition = state.environment_dir(environment)?.join("definition.json");
+            if definition.exists() {
+                let existing: Environment = serde_json::from_reader(File::open(&definition)?)?;
+                ensure!(
+                    serde_json::to_value(&existing)? == serde_json::to_value(environment)?,
+                    "prepared environment {} differs from the definition the Hub sent; delete the environment and prepare it again",
+                    environment.id
+                );
+            }
+        }
+    }
     for path in job
         .spec
         .inputs
@@ -2221,6 +2257,9 @@ async fn prepare(state: &Arc<State>, environment: &Environment, explicit: bool) 
         );
     }
     let result = async {
+        if let Some(policy) = &state.policy {
+            policy.check_environment(environment).map_err(anyhow::Error::msg)?;
+        }
         let dir = state.environment_dir(environment)?;
         private_dir(&dir)?;
         private_dir(&dir.join("bin"))?;
@@ -2505,6 +2544,7 @@ print(MPSSupportsMTLDevice(device) ? "metal mps" : "metal")"##;
             .unwrap_or(1),
         memory_bytes,
         containerized,
+        policy: None,
     })
 }
 
@@ -2940,6 +2980,7 @@ mod tests {
             caches: Mutex::new(HashSet::new()),
             workspaces: Mutex::new(HashSet::new()),
             events,
+            policy: None,
         })
     }
     #[test]
@@ -3695,6 +3736,87 @@ mod tests {
             fs::read_to_string(attempt.dir.join("work/completed")).unwrap(),
             "ok"
         );
+    }
+    fn policy_job(command: &[&str], environment: Option<&str>) -> Job {
+        Job {
+            id: "job".into(),
+            attempt_id: "attempt".into(),
+            state: "assigned".into(),
+            spec: JobSpec {
+                command: command.iter().map(|s| s.to_string()).collect(),
+                environment: environment.map(Into::into),
+                ..Default::default()
+            },
+            worker_id: None,
+            created_at: 0,
+            updated_at: 0,
+            exit_code: None,
+            error: None,
+            results: vec![],
+            submitted_by: None,
+        }
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn policy_refuses_jobs_before_preparing_or_fetching_anything() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = state_at(temp.path());
+        Arc::get_mut(&mut state).unwrap().policy =
+            Some(Policy::parse("version: 1\ncommands: [[sh, -c, \"printf ok > completed\"]]\n").unwrap());
+        let environment = Environment {
+            id: "tools".into(),
+            revision: "1".into(),
+            setup: vec!["touch \"$YLCC_ENV_DIR/should-not-run\"".into()],
+            ..Default::default()
+        };
+        let mut job = policy_job(&["sh", "-c", "touch pwned"], Some("tools"));
+        job.spec.inputs.push(FileEntry { path: "input".into(), hash: "0".repeat(64), size: 1, mode: 0o644 });
+        let attempt = attempt_at(temp.path(), "attempt");
+        let (_keepalive, receiver) = watch::channel(false);
+        let error = run_attempt(&state, &attempt, &job, Some(&environment), receiver).await.unwrap_err();
+        assert!(format!("{error:#}").contains("not allowed by worker policy"), "{error:#}");
+        assert!(!attempt.dir.join("work").exists());
+        assert!(!state.environment_dir(&environment).unwrap().exists());
+        let allowed = policy_job(&["sh", "-c", "printf ok > completed"], None);
+        let attempt = attempt_at(temp.path(), "allowed");
+        let (_keepalive, receiver) = watch::channel(false);
+        let (exit, _) = run_attempt(&state, &attempt, &allowed, None, receiver).await.unwrap();
+        assert_eq!(exit, 0);
+        assert_eq!(fs::read_to_string(attempt.dir.join("work/completed")).unwrap(), "ok");
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn policy_pins_environment_content_including_prepared_definitions() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = state_at(temp.path());
+        let environment = Environment {
+            id: "tools".into(),
+            revision: "1".into(),
+            setup: vec!["touch \"$YLCC_ENV_DIR/prepared\"".into()],
+            ..Default::default()
+        };
+        // Prepared before the policy existed.
+        prepare(&state, &environment, true).await.unwrap();
+        let digest = crate::policy::environment_digest(&environment);
+        Arc::get_mut(&mut state).unwrap().policy = Some(
+            Policy::parse(&format!("version: 1\nenvironments: [{{id: tools, sha256: \"*\"}}, {{id: pinned, sha256: {digest}}}]\n")).unwrap(),
+        );
+        // Same id and revision, different content: the directory on disk was built from the old one.
+        let swapped = Environment { setup: vec!["touch \"$YLCC_ENV_DIR/evil\"".into()], ..environment.clone() };
+        let attempt = attempt_at(temp.path(), "attempt");
+        let (_keepalive, receiver) = watch::channel(false);
+        let error = run_attempt(&state, &attempt, &policy_job(&["true"], Some("tools")), Some(&swapped), receiver)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("differs from the definition"), "{error:#}");
+        // Explicit preparation of an unpinned recipe fails durably without running its setup.
+        let unpinned = Environment { id: "pinned".into(), setup: vec!["touch \"$YLCC_ENV_DIR/should-not-run\"".into()], ..environment.clone() };
+        let error = prepare(&state, &unpinned, true).await.unwrap_err();
+        assert!(format!("{error:#}").contains("sha256"), "{error:#}");
+        assert_eq!(state.environments.lock().unwrap()["pinned/1"].state, "failed");
+        assert!(!state.environment_dir(&unpinned).unwrap().join("should-not-run").exists());
+        let pinned = Environment { id: "pinned".into(), ..environment.clone() };
+        assert_ne!(crate::policy::environment_digest(&pinned), digest, "the id is part of the content");
     }
     #[tokio::test]
     async fn preparation_definition_error_reports_failure_without_running_setup() {

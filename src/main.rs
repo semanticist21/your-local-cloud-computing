@@ -7,7 +7,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
 };
-use ylcc::{client::Client, model::*, platform, project::Project, snapshot};
+use ylcc::{client::Client, model::*, platform, policy::Policy, project::Project, snapshot};
 
 #[derive(Parser)]
 #[command(
@@ -50,6 +50,9 @@ enum Commands {
         data_dir: Option<PathBuf>,
         #[arg(long, default_value_t = 1)]
         max_jobs: usize,
+        /// Command policy YAML; without it the worker runs every job it is assigned.
+        #[arg(long)]
+        policy: Option<PathBuf>,
     },
     /// Show the input snapshot manifest without submitting a job.
     Manifest(Selection),
@@ -129,10 +132,36 @@ enum Commands {
         #[command(subcommand)]
         command: Tokens,
     },
+    /// Validate a worker command policy or suggest one for a project's tasks.
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
     /// Show recent Hub audit events, newest first (requires an admin token).
     Audit {
         #[arg(long, default_value_t = 100)]
         limit: usize,
+    },
+}
+#[derive(Subcommand)]
+enum PolicyCommand {
+    /// Parse a policy file exactly as `ylcc worker --policy` does and show what it restricts.
+    Check { file: PathBuf },
+    /// Print a policy allowing exactly the given tasks (all tasks by default) and environments.
+    Suggest {
+        #[arg(long, default_value = "ylcc.yaml")]
+        file: PathBuf,
+        #[arg(long)]
+        task: Vec<String>,
+        /// Also allow a preset such as bun@1.3.14, as used by `ylcc run --environment`.
+        #[arg(long, value_name = "NAME@VERSION")]
+        environment: Vec<String>,
+        /// Target OS for --environment presets (presets differ on Windows).
+        #[arg(long)]
+        os: Option<String>,
+        /// Allow inline environments in projects without `name:`; their ids depend on the checkout path.
+        #[arg(long)]
+        allow_path_scoped: bool,
     },
 }
 #[derive(Subcommand)]
@@ -382,6 +411,9 @@ enum Services {
         /// Windows: start at boot without anyone logged in (S4U task; run from an elevated shell).
         #[arg(long, conflicts_with = "system_user")]
         at_startup: bool,
+        /// Worker command policy YAML (see `ylcc policy check`); workers only.
+        #[arg(long)]
+        policy: Option<PathBuf>,
     },
     Uninstall {
         #[arg(long)]
@@ -903,6 +935,66 @@ async fn execute() -> Result<()> {
                 }
             }
         }
+        Commands::Policy { command } => match command {
+            PolicyCommand::Check { file } => {
+                let policy = Policy::load(&file)?;
+                print(&serde_json::json!({
+                    "policy_file": absolute_path(&file)?,
+                    "categories": policy.summary(),
+                    "warnings": policy.warnings,
+                }))
+            }
+            PolicyCommand::Suggest {
+                file,
+                task,
+                environment,
+                os,
+                allow_path_scoped,
+            } => {
+                let mut specs = vec![];
+                let mut environments: Vec<Environment> = vec![];
+                let mut notes = vec![];
+                if file.exists() || environment.is_empty() {
+                    let (project, root) = Project::load(&file)?;
+                    let names: Vec<String> = if task.is_empty() { project.tasks.keys().cloned().collect() } else { task };
+                    let path_scope = format!("-{}", ylcc::project::project_scope(None, &root));
+                    for name in names {
+                        let plan = project.plan(&name, &root, vec![])?;
+                        for environment in plan.environments {
+                            if project.name.is_none() && environment.id.ends_with(&path_scope) {
+                                if !allow_path_scoped {
+                                    bail!(
+                                        "environment {} is named after this checkout's path because {} has no `name:`; add a project name so every checkout gets the same id, or pass --allow-path-scoped",
+                                        environment.id,
+                                        file.display()
+                                    )
+                                }
+                                notes.push(format!("environment {} only matches checkouts at this path", environment.id));
+                            }
+                            if !environments.iter().any(|e| e.id == environment.id) {
+                                environments.push(environment);
+                            }
+                        }
+                        specs.extend(plan.specs);
+                    }
+                }
+                for name in environment {
+                    let preset = ylcc::project::preset_environment(&name, os.as_deref())?
+                        .with_context(|| format!("{name} is not a preset; use NAME@VERSION from `ylcc env presets`"))?;
+                    if !environments.iter().any(|e| e.id == preset.id) {
+                        environments.push(preset);
+                    }
+                }
+                let (yaml, more) = ylcc::policy::suggest(&specs, &environments);
+                notes.extend(more);
+                notes.push("preset digests change when a new ylcc release changes a preset recipe; re-run this command after upgrading".into());
+                for note in notes {
+                    eprintln!("note: {note}");
+                }
+                print!("{yaml}");
+                Ok(())
+            }
+        },
         Commands::Audit { limit } => {
             let client = Client::new(&hub, &token)?;
             require_capability(&client, "audit_log", "the audit log").await?;
@@ -940,14 +1032,17 @@ async fn execute() -> Result<()> {
             id,
             data_dir,
             max_jobs,
+            policy,
         } => {
             let id = id.unwrap_or_else(default_worker_id);
+            let policy = policy.map(|path| Policy::load(&path)).transpose()?;
             ylcc::worker::run(
                 hub,
                 token,
                 data_dir.unwrap_or_else(|| data_path().join("worker")),
                 id,
                 max_jobs,
+                policy,
             )
             .await
         }
@@ -1459,16 +1554,18 @@ async fn execute() -> Result<()> {
                 max_jobs,
                 system_user,
                 at_startup,
+                policy,
             } => {
                 let dir = data_dir.unwrap_or_else(|| data_path().join(&role));
+                let policy = policy.as_deref();
                 if let Some(user) = system_user {
                     ylcc::service::install_system_user(
-                        &role, &hub, &token, &dir, &id, &listen, max_jobs, &user,
+                        &role, &hub, &token, &dir, &id, &listen, max_jobs, policy, &user,
                     )
                 } else if at_startup {
-                    ylcc::service::install_at_startup(&role, &hub, &token, &dir, &id, &listen, max_jobs)
+                    ylcc::service::install_at_startup(&role, &hub, &token, &dir, &id, &listen, max_jobs, policy)
                 } else {
-                    ylcc::service::install(&role, &hub, &token, &dir, &id, &listen, max_jobs)
+                    ylcc::service::install(&role, &hub, &token, &dir, &id, &listen, max_jobs, policy)
                 }
             }
             Services::Uninstall { role, system_user } => {

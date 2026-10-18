@@ -162,10 +162,13 @@ struct RunArgs {
     gpu: Option<String>,
     #[arg(
         long,
-        value_name = "NAME=VERSION",
-        help = "Require an exact tool version, or NAME=* for any detected version"
+        value_name = "NAME[=VERSION]",
+        help = "Require a tool; NAME alone or NAME=* accepts any detected version"
     )]
     tool: Vec<String>,
+    /// Run only on this worker ID (see `ylcc workers`).
+    #[arg(long)]
+    worker: Option<String>,
     #[arg(long)]
     cpu_feature: Vec<String>,
     #[arg(long)]
@@ -281,6 +284,9 @@ enum Jobs {
     },
     Logs {
         id: String,
+        /// Print new stdout/stderr as it arrives until the job ends.
+        #[arg(long)]
+        follow: bool,
     },
     Wait {
         id: String,
@@ -619,6 +625,44 @@ fn pairs(values: Vec<String>) -> Result<BTreeMap<String, String>> {
         })
         .collect()
 }
+/// `NAME` without a version accepts any detected version.
+fn tools(values: Vec<String>) -> BTreeMap<String, String> {
+    values
+        .into_iter()
+        .map(|s| match s.split_once('=') {
+            Some((k, v)) => (k.to_owned(), v.to_owned()),
+            None => (s, "*".to_owned()),
+        })
+        .collect()
+}
+/// Fails when the Hub predates a feature the spec relies on; older Hubs would silently ignore it.
+async fn require_hub_support(client: &Client, spec: &JobSpec) -> Result<()> {
+    let needed: Vec<_> = [
+        (spec.priority != 0, "job_priority", "job priority"),
+        (
+            spec.requirements.worker.is_some(),
+            "job_worker",
+            "worker selection",
+        ),
+    ]
+    .into_iter()
+    .filter(|(used, _, _)| *used)
+    .collect();
+    if needed.is_empty() {
+        return Ok(());
+    }
+    let health: serde_json::Value = client.get("/health").await?;
+    let supported = health["capabilities"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for (_, capability, feature) in needed {
+        if !supported.iter().any(|c| c == capability) {
+            bail!("this Hub does not support {feature}; upgrade the Hub first")
+        }
+    }
+    Ok(())
+}
 fn print<T: Serialize>(v: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
@@ -659,20 +703,8 @@ async fn submit(
     for spec in &specs {
         spec.validate()?;
     }
-    if specs.iter().any(|spec| spec.priority != 0) {
-        let health: serde_json::Value = client.get("/health").await?;
-        let supported = health["capabilities"]
-            .as_array()
-            .is_some_and(|capabilities| {
-                capabilities
-                    .iter()
-                    .any(|capability| capability == "job_priority")
-            });
-        if !supported {
-            bail!(
-                "this Hub does not support job priority; upgrade the Hub before submitting a nonzero priority"
-            )
-        }
+    for spec in &specs {
+        require_hub_support(client, spec).await?;
     }
     let (count, bytes) = client.upload(&snap).await?;
     eprintln!(
@@ -879,11 +911,12 @@ async fn execute() -> Result<()> {
                 os: r.os,
                 arch: r.arch.map(|v| normalize_arch(&v)),
                 abi: r.abi,
-                tools: pairs(r.tool)?,
+                tools: tools(r.tool),
                 gpu: r.gpu,
                 cpu_features: r.cpu_feature,
                 build_target: r.build_target,
                 emulation: false,
+                worker: r.worker,
             };
             let cwd = platform::command_path(&std::env::current_dir()?.canonicalize()?);
             let project_file = cwd.join("ylcc.yaml");
@@ -1059,12 +1092,46 @@ async fn execute() -> Result<()> {
             match command {
                 Jobs::List => print(&c.get::<Vec<Job>>("/v1/jobs").await?),
                 Jobs::Show { id } => print(&c.job(&id).await?),
-                Jobs::Logs { id } => {
+                Jobs::Logs { id, follow: false } => {
                     ylcc::client::segment(&id)?;
                     print(
                         &c.get::<Vec<LogEntry>>(&format!("/v1/jobs/{id}/logs"))
                             .await?,
                     )
+                }
+                Jobs::Logs { id, follow: true } => {
+                    let (mut attempt, mut seen) = (String::new(), 0);
+                    loop {
+                        // Read the state first so the last poll includes every final log entry.
+                        let job = c.job(&id).await?;
+                        if job.attempt_id != attempt {
+                            (attempt, seen) = (job.attempt_id.clone(), 0);
+                        }
+                        let entries: Vec<LogEntry> =
+                            c.get(&format!("/v1/jobs/{id}/logs?after={seen}")).await?;
+                        for entry in entries {
+                            if entry.attempt_id != attempt || entry.seq <= seen {
+                                continue;
+                            }
+                            seen = entry.seq;
+                            if entry.stream == "stdout" {
+                                print!("{}", entry.text);
+                            } else {
+                                eprint!("{}", entry.text);
+                            }
+                        }
+                        std::io::stdout().flush()?;
+                        if matches!(
+                            job.state.as_str(),
+                            "succeeded" | "failed" | "cancelled" | "unknown"
+                        ) {
+                            if job.state != "succeeded" {
+                                bail!("job {} ended {}", job.id, job.state)
+                            }
+                            return Ok(());
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
                 }
                 Jobs::Wait { id, no_download } => {
                     let j = c.wait(&id, &results, !no_download).await?;
@@ -1091,19 +1158,7 @@ async fn execute() -> Result<()> {
                     if !matches!(previous.state.as_str(), "succeeded" | "failed" | "cancelled") {
                         bail!("job {} is not terminal ({})", id, previous.state)
                     }
-                    if previous.spec.priority != 0 {
-                        let health: serde_json::Value = c.get("/health").await?;
-                        let supported = health["capabilities"]
-                            .as_array()
-                            .is_some_and(|capabilities| {
-                                capabilities
-                                    .iter()
-                                    .any(|capability| capability == "job_priority")
-                            });
-                        if !supported {
-                            bail!("this Hub does not support job priority; upgrade the Hub before retrying a nonzero-priority job")
-                        }
-                    }
+                    require_hub_support(&c, &previous.spec).await?;
                     let job: Job = c.post("/v1/jobs", &previous.spec).await?;
                     if detach {
                         print(&job)

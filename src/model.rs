@@ -93,6 +93,9 @@ pub struct Requirements {
     pub build_target: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub emulation: bool,
+    /// Run only on this worker ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Capabilities {
@@ -233,6 +236,12 @@ pub struct Job {
     pub error: Option<String>,
     #[serde(default)]
     pub results: Vec<FileEntry>,
+    /// When the current attempt started running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
+    /// Last stdout/stderr output of the current attempt, recorded at most every few seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_at: Option<u64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerInfo {

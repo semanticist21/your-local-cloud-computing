@@ -138,6 +138,7 @@ fn check_requirement_fields(value: &serde_json::Value) -> std::result::Result<()
                 "cpu_features",
                 "build_target",
                 "emulation",
+                "worker",
             ]
             .contains(&field.as_str())
             {
@@ -377,6 +378,7 @@ fn merge(base: &Requirements, target: &Requirements) -> Requirements {
         (&mut merged.abi, &target.abi),
         (&mut merged.gpu, &target.gpu),
         (&mut merged.build_target, &target.build_target),
+        (&mut merged.worker, &target.worker),
     ] {
         if value.is_some() {
             field.clone_from(value);

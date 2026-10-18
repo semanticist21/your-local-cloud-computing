@@ -1025,6 +1025,9 @@ async fn request_cancel(state: &Arc<State>, job_id: &str, attempt_id: &str) -> R
     state.emit(WorkerMessage::Finished { report });
     Ok(())
 }
+/// Time between SIGTERM and SIGKILL, so a cancelled or timed-out command's traps can clean up.
+#[cfg(unix)]
+const STOP_GRACE: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 30 });
 #[cfg(unix)]
 async fn stop_process(
     child: &mut tokio::process::Child,
@@ -1033,7 +1036,7 @@ async fn stop_process(
 ) -> Result<()> {
     let result = async {
         signal_group(pgid, libc::SIGTERM)?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now() + STOP_GRACE;
         loop {
             let _ = child.try_wait()?;
             if process_group_absent(pgid)? {
@@ -1471,25 +1474,63 @@ async fn run_attempt(
         job.spec.timeout_secs.unwrap_or(24 * 60 * 60),
         container,
     )
-    .await?;
-    cancelled(&cancel)?;
+    .await;
+    if exit
+        .as_ref()
+        .is_err_and(|error| error.downcast_ref::<UncertainCleanup>().is_some())
+    {
+        return exit.map(|exit| (exit, vec![])); // The command may still be writing its outputs.
+    }
+    let exit = exit.and_then(|exit| cancelled(&cancel).map(|()| exit));
+    let uploaded = upload_outputs(
+        state,
+        &workdir,
+        &job.spec.outputs,
+        exit.as_ref().is_ok_and(|e| *e == 0),
+    )
+    .await;
+    match exit {
+        Ok(exit) => Ok((exit, uploaded?)),
+        // Outputs written before a failure, timeout or cancellation still help diagnose it.
+        Err(error) => {
+            match uploaded {
+                Ok(results) => {
+                    attempt.update(|journal| journal.report.results = results)?;
+                }
+                Err(upload) => attempt.log(
+                    state,
+                    "system",
+                    format!("outputs not collected: {upload:#}\n"),
+                )?,
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Uploads declared outputs; unless `required`, a missing output is skipped.
+async fn upload_outputs(
+    state: &State,
+    workdir: &Path,
+    outputs: &[String],
+    required: bool,
+) -> Result<Vec<FileEntry>> {
     let mut files = BTreeMap::new();
-    for output in &job.spec.outputs {
-        if exit != 0
+    for output in outputs {
+        if !required
             && fs::symlink_metadata(workdir.join(output))
                 .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
         {
             continue;
         }
-        collect_output(&workdir, &workdir.join(output), &mut files)?;
+        collect_output(workdir, &workdir.join(output), &mut files)?;
     }
     let mut results = vec![];
     for (_, entry) in files {
-        cancelled(&cancel)?;
         upload_blob(state, &entry.hash, &workdir.join(&entry.path)).await?;
         results.push(entry);
     }
-    Ok((exit, results))
+    Ok(results)
 }
 
 /// Tasks with caches check out into a fixed directory per cache scope, as CI runners do:
@@ -3094,6 +3135,8 @@ mod tests {
             exit_code: None,
             error: None,
             results: vec![],
+            started_at: None,
+            last_output_at: None,
         };
         accept(state.clone(), job, None).unwrap();
         assert!(!attempt.dir.join("work").exists());
@@ -3148,6 +3191,8 @@ mod tests {
             exit_code: None,
             error: None,
             results: vec![],
+            started_at: None,
+            last_output_at: None,
         };
         let (cancel, receiver) = watch::channel(false);
         let (exit, _) = run_attempt(&state, &attempt, &job, None, receiver)
@@ -3407,6 +3452,33 @@ mod tests {
     }
     #[cfg(unix)]
     #[tokio::test]
+    async fn cancellation_lets_term_trap_clean_up() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = state_at(temp.path());
+        let attempt = attempt_at(temp.path(), "attempt");
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "trap 'sleep 0.3; touch cleaned; exit 1' TERM; printf ready > ready; while :; do sleep 0.05; done",
+            ])
+            .current_dir(temp.path());
+        let (cancel, receiver) = watch::channel(false);
+        let cancellation = async {
+            while !temp.path().join("ready").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            cancel.send(true).unwrap();
+        };
+        let (result, _) = tokio::join!(
+            execute(&state, &attempt, command, receiver, 10, None),
+            cancellation
+        );
+        assert!(result.is_err());
+        assert!(temp.path().join("cleaned").exists());
+    }
+    #[cfg(unix)]
+    #[tokio::test]
     async fn cancellation_kills_term_ignoring_child_after_leader_exits() {
         let temp = tempfile::tempdir().unwrap();
         let state = state_at(temp.path());
@@ -3601,6 +3673,8 @@ mod tests {
             exit_code: None,
             error: None,
             results: vec![],
+            started_at: None,
+            last_output_at: None,
         };
         let (_keepalive, receiver) = watch::channel(false);
         let error = run_attempt(&state, &attempt, &job, Some(&environment), receiver)
@@ -3662,6 +3736,8 @@ mod tests {
             exit_code: None,
             error: None,
             results: vec![],
+            started_at: None,
+            last_output_at: None,
         };
         let (_keepalive, receiver) = watch::channel(false);
         let (exit, _) = tokio::time::timeout(

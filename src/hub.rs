@@ -4,7 +4,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{
-        DefaultBodyLimit, Path, State, WebSocketUpgrade,
+        DefaultBodyLimit, Path, Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, StatusCode, header},
@@ -389,6 +389,8 @@ impl Store {
             exit_code: None,
             error: None,
             results: vec![],
+            started_at: None,
+            last_output_at: None,
         };
         self.db
             .execute(
@@ -783,11 +785,13 @@ impl Store {
                     .into();
                     job.error = None;
                     job.updated_at = now();
+                    job.started_at = Some(now());
+                    job.last_output_at = None;
                     self.save_job(&job)?;
                 }
             }
             WorkerMessage::Log { entry } => {
-                if let Some(environment) = entry.job_id.strip_prefix("environment:") {
+                let job = if let Some(environment) = entry.job_id.strip_prefix("environment:") {
                     let (id, revision) = environment
                         .split_once(':')
                         .context("invalid environment log ID")?;
@@ -808,16 +812,17 @@ impl Store {
                     if entry.attempt_id != stable && Uuid::parse_str(&entry.attempt_id).is_err() {
                         bail!("invalid preparation log attempt")
                     }
+                    None
                 } else {
-                    self.assigned(worker, &entry.job_id, &entry.attempt_id)?;
-                }
+                    Some(self.assigned(worker, &entry.job_id, &entry.attempt_id)?)
+                };
                 if entry.seq > i64::MAX as u64
                     || !matches!(entry.stream.as_str(), "stdout" | "stderr" | "system")
                     || entry.text.len() > 1024 * 1024
                 {
                     bail!("invalid log entry")
                 }
-                self.db.execute(
+                let inserted = self.db.execute(
                     "INSERT OR IGNORE INTO logs(job,attempt,seq,data) VALUES(?1,?2,?3,?4)",
                     params![
                         entry.job_id,
@@ -825,7 +830,17 @@ impl Store {
                         entry.seq as i64,
                         encode(&entry)?
                     ],
-                )?;
+                )? == 1;
+                // Throttled so streaming output does not rewrite the job on every chunk; replays are skipped.
+                if let Some(mut job) = job.filter(|job| {
+                    inserted
+                        && entry.stream != "system"
+                        && active(&job.state)
+                        && job.last_output_at.is_none_or(|at| now() >= at + 5)
+                }) {
+                    job.last_output_at = Some(now());
+                    self.save_job(&job)?;
+                }
             }
             WorkerMessage::Finished { report } => self.report(worker, report)?,
             WorkerMessage::Environment { status } => self.receive_status(worker, status)?,
@@ -888,6 +903,14 @@ fn candidate(
         .or(environment.and_then(|environment| environment.image.as_ref()));
     let mut capabilities = worker.capabilities.clone();
     let mut reasons = vec![];
+    if spec
+        .requirements
+        .worker
+        .as_ref()
+        .is_some_and(|id| id != &worker.id)
+    {
+        reasons.push("not the requested worker".into());
+    }
     if container.is_some() {
         if !capabilities
             .runtimes
@@ -1007,7 +1030,7 @@ fn router(state: Shared) -> Router {
                 Json(serde_json::json!({
                     "status":"ok",
                     "version":crate::VERSION,
-                    "capabilities":["job_priority", "worker_control"]
+                    "capabilities":["job_priority", "worker_control", "job_worker"]
                 }))
             }),
         )
@@ -1168,9 +1191,15 @@ async fn job(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult<J
 async fn submit(State(state): State<Shared>, Json(spec): Json<JobSpec>) -> ApiResult<Json<Job>> {
     Ok(Json(lock(&state)?.add_job(spec)?))
 }
+#[derive(Deserialize)]
+struct LogQuery {
+    #[serde(default)]
+    after: u64,
+}
 async fn logs(
     State(state): State<Shared>,
     Path(id): Path<String>,
+    Query(query): Query<LogQuery>,
 ) -> ApiResult<Json<Vec<LogEntry>>> {
     let store = lock(&state)?;
     if store.job(&id)?.is_none() {
@@ -1178,11 +1207,13 @@ async fn logs(
     }
     let mut statement = store
         .db
-        .prepare("SELECT data FROM logs WHERE job=?1 ORDER BY seq")
+        .prepare("SELECT data FROM logs WHERE job=?1 AND seq>?2 ORDER BY seq")
         .map_err(anyhow::Error::from)?;
     let mut entries = vec![];
     for row in statement
-        .query_map([id], |r| r.get::<_, String>(0))
+        .query_map(params![id, query.after.min(i64::MAX as u64) as i64], |r| {
+            r.get::<_, String>(0)
+        })
         .map_err(anyhow::Error::from)?
     {
         entries.push(
@@ -2244,6 +2275,24 @@ mod tests {
         assert!(!candidate(&worker, &job, None).is_empty());
         job.requirements.tools.clear();
         job.requirements.gpu = Some("metal".into());
+        assert!(!candidate(&worker, &job, None).is_empty());
+    }
+    #[test]
+    fn worker_requirement_selects_only_that_worker() {
+        let worker = WorkerInfo {
+            id: "one".into(),
+            capabilities: caps(),
+            max_jobs: 1,
+            paused: false,
+            online: true,
+            last_seen: now(),
+            version: String::new(),
+            update_error: None,
+        };
+        let mut job = spec();
+        job.requirements.worker = Some("one".into());
+        assert!(candidate(&worker, &job, None).is_empty());
+        job.requirements.worker = Some("two".into());
         assert!(!candidate(&worker, &job, None).is_empty());
     }
     #[test]

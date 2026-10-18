@@ -13,7 +13,7 @@ RUN npm run build
 
 FROM rust:1.96-slim-bookworm AS builder
 WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
 COPY --from=dashboard-builder /dashboard/dist ./dashboard/dist
 RUN rustup component add rust-docs \

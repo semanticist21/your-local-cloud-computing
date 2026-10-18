@@ -786,8 +786,17 @@ function AdminOnly({ error }: { error: unknown }) {
   return <EmptyState icon={<LockKeyhole />} title="Requires an admin token" detail={error instanceof ForbiddenError ? error.message : errorMessage(error)} />
 }
 
+/** A revoked token on an admin page ends the session like any other 401. */
+function useDisconnectOnAuthError(error: unknown) {
+  const { disconnect } = rootRoute.useRouteContext()
+  useEffect(() => {
+    if (error instanceof AuthError) disconnect(error.message)
+  }, [error, disconnect])
+}
+
 function AuditPage() {
   const audit = useQuery(auditQuery)
+  useDisconnectOnAuthError(audit.error)
   const events = audit.data ?? []
   return (
     <>
@@ -821,6 +830,7 @@ function AuditTarget({ action, target }: { action: string; target: string }) {
 
 function TokensPage() {
   const tokens = useQuery(tokensQuery)
+  useDisconnectOnAuthError(tokens.error)
   const list = [...(tokens.data ?? [])].sort((a, b) => Number(Boolean(a.revoked_at)) - Number(Boolean(b.revoked_at)) || b.created_at - a.created_at)
   return (
     <>

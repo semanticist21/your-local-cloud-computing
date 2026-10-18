@@ -920,11 +920,25 @@ async fn execute() -> Result<()> {
                         Err(error) => {
                             drop(file);
                             let _ = fs::remove_file(&out);
-                            return Err(error);
+                            return Err(error.context(
+                                "token not saved; if the Hub created it anyway, find it with `ylcc tokens list` and revoke it",
+                            ));
                         }
                     };
-                    writeln!(file, "{}", created.secret)?;
-                    file.sync_all()?;
+                    if let Err(error) = writeln!(file, "{}", created.secret).and_then(|()| file.sync_all()) {
+                        drop(file);
+                        let _ = fs::remove_file(&out);
+                        // A token nobody can read is only a liability.
+                        let revoked = client
+                            .delete_json::<TokenInfo>(&format!("/v1/tokens/{}", created.token.id))
+                            .await;
+                        bail!(
+                            "could not write {}: {error}; token {} {}",
+                            out.display(),
+                            created.token.id,
+                            if revoked.is_ok() { "was revoked" } else { "is still active: revoke it with `ylcc tokens revoke`" }
+                        )
+                    }
                     print(&serde_json::json!({"token": created.token, "token_file": absolute_path(&out)?}))
                 }
                 Tokens::List => print(&client.get::<Vec<TokenInfo>>("/v1/tokens").await?),

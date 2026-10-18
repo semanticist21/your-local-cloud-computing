@@ -178,7 +178,7 @@ export const whoamiQuery = queryOptions({
 export const auditQuery = queryOptions({
   queryKey: ['audit'],
   queryFn: () => get<AuditEvent[]>('/v1/audit?limit=500'),
-  retry: (count, error) => !(error instanceof ForbiddenError) && count < 3,
+  retry: (count, error) => !(error instanceof ForbiddenError || error instanceof AuthError) && count < 3,
   refetchInterval: (query) => (query.state.error instanceof ForbiddenError ? false : pollMs),
   placeholderData: keepPreviousData,
 })
@@ -186,7 +186,7 @@ export const auditQuery = queryOptions({
 export const tokensQuery = queryOptions({
   queryKey: ['tokens'],
   queryFn: () => get<TokenInfo[]>('/v1/tokens'),
-  retry: (count, error) => !(error instanceof ForbiddenError) && count < 3,
+  retry: (count, error) => !(error instanceof ForbiddenError || error instanceof AuthError) && count < 3,
   refetchInterval: (query) => (query.state.error instanceof ForbiddenError ? false : pollMs),
   placeholderData: keepPreviousData,
 })

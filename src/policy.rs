@@ -67,8 +67,12 @@ pub fn environment_digest(environment: &Environment) -> String {
     hex::encode(Sha256::digest(json.as_bytes()))
 }
 
+/// Any component Windows could normalize to `..`: two or more dots, possibly followed by more
+/// dots or spaces, which Win32 path handling trims.
 fn has_parent_component(value: &str) -> bool {
-    value.split(['/', '\\']).any(|part| part == "..")
+    value
+        .split(['/', '\\'])
+        .any(|part| part.starts_with("..") && part.trim_end_matches(['.', ' ']).is_empty())
 }
 /// `"*"` matches anything; a trailing `*` matches a string prefix, except across `..`;
 /// anything else matches exactly.
@@ -466,6 +470,8 @@ mod tests {
         assert!(policy.check_job(&job(&["/opt/tools/lint", "x"]), None).is_ok());
         assert!(policy.check_job(&job(&["/opt/tools/../../bin/sh"]), None).is_err());
         assert!(policy.check_job(&job(&["/opt/tools/..\\..\\bin\\sh"]), None).is_err());
+        assert!(policy.check_job(&job(&["/opt/tools/.. /... /bin/sh"]), None).is_err());
+        assert!(policy.check_job(&job(&["/opt/tools/..lint"]), None).is_ok());
         assert!(policy.check_job(&job(&["make", "test-unit"]), None).is_ok());
         let any = Policy::parse("version: 1\ncommands: [[\"*\"]]\n").unwrap();
         assert!(any.check_job(&job(&["whatever"]), None).is_ok());

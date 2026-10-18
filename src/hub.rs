@@ -375,7 +375,7 @@ impl Store {
             )
             .map_err(anyhow::Error::from)?;
         self.tokens.insert(hash, info.clone());
-        self.audit(
+        self.record(
             by,
             "token.create",
             &info.id,
@@ -388,7 +388,7 @@ impl Store {
                     .map(|worker| format!(" worker={worker}"))
                     .unwrap_or_default()
             )),
-        )?;
+        );
         Ok(CreatedToken { token: info, secret })
     }
     fn list_tokens(&self) -> Result<Vec<TokenInfo>> {
@@ -428,7 +428,7 @@ impl Store {
         for (worker, session) in sessions {
             self.disconnect(&worker, session)?;
         }
-        self.audit(by, "token.revoke", &info.id, Some(info.name.clone()))?;
+        self.record(by, "token.revoke", &info.id, Some(info.name.clone()));
         Ok(info)
     }
     fn audit(
@@ -459,6 +459,13 @@ impl Store {
         }
         Ok(())
     }
+    /// Audits after a change is already committed: a failed audit write is logged rather than
+    /// reported, so a client never retries (and duplicates) a change that took effect.
+    fn record(&mut self, principal: &Principal, action: &str, target: &str, detail: Option<String>) {
+        if let Err(error) = self.audit(principal, action, target, detail) {
+            eprintln!("hub: audit {action} {target} failed: {error:#}");
+        }
+    }
     /// Audits an event a worker connection can trigger at will, within a per-token hourly budget,
     /// so one worker token cannot push older events out of the retention window.
     fn audit_worker(
@@ -469,9 +476,15 @@ impl Store {
         detail: Option<String>,
     ) -> Result<()> {
         let time = now();
+        // Scoped tokens share one budget whatever id they claim; the pool token (admin, and
+        // often every worker's credential in older pools) gets one per worker id.
+        let key = match &principal.token_id {
+            Some(_) => audit_key(principal),
+            None => format!("{}:{target}", audit_key(principal)),
+        };
         let budget = self
             .worker_audit
-            .entry(audit_key(principal))
+            .entry(key)
             .or_insert((time, 0, false));
         if time.saturating_sub(budget.0) >= 3600 {
             *budget = (time, 0, false);
@@ -1471,7 +1484,7 @@ async fn delete_worker(
         return Err(invalid("worker has active jobs; drain it first"));
     }
     guard.delete_worker(&id)?;
-    guard.audit(&principal, "worker.delete", &id, None)?;
+    guard.record(&principal, "worker.delete", &id, None);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1484,7 +1497,7 @@ async fn control_worker(
     let mut store = lock(&state)?;
     let detail = encode(&control)?;
     let worker = store.control_worker(&id, control)?;
-    store.audit(&principal, "worker.control", &id, Some(detail))?;
+    store.record(&principal, "worker.control", &id, Some(detail));
     Ok(Json(worker))
 }
 async fn update_worker(
@@ -1518,7 +1531,7 @@ async fn update_worker(
     }
     worker.update_error = None;
     store.save_worker(&worker)?;
-    store.audit(&principal, "worker.update", &id, Some(version))?;
+    store.record(&principal, "worker.update", &id, Some(version));
     Ok(Json(worker))
 }
 async fn set_priority(
@@ -1528,8 +1541,12 @@ async fn set_priority(
     Json(request): Json<PriorityRequest>,
 ) -> ApiResult<Json<Job>> {
     let mut store = lock(&state)?;
+    let unchanged = store.job(&id)?.is_some_and(|job| job.spec.priority == request.priority);
     let job = store.set_priority(&id, request.priority)?;
-    store.audit(&principal, "job.priority", &id, Some(request.priority.to_string()))?;
+    if unchanged {
+        return Ok(Json(job));
+    }
+    store.record(&principal, "job.priority", &id, Some(request.priority.to_string()));
     Ok(Json(job))
 }
 async fn jobs(State(state): State<Shared>) -> ApiResult<Json<Vec<Job>>> {
@@ -1552,7 +1569,7 @@ async fn submit(
     if let Some(environment) = &job.spec.environment {
         detail.push_str(&format!(" environment={environment}"));
     }
-    store.audit(&principal, "job.submit", &job.id, Some(detail))?;
+    store.record(&principal, "job.submit", &job.id, Some(detail));
     Ok(Json(job))
 }
 async fn logs(
@@ -1617,7 +1634,7 @@ async fn cancel(
         job.updated_at = now();
         store.save_job(&job)?;
         store.schedule()?;
-        store.audit(&principal, "job.cancel", &id, None)?;
+        store.record(&principal, "job.cancel", &id, None);
     }
     Ok(Json(job))
 }
@@ -1699,7 +1716,7 @@ async fn delete_environment(
     identifier(&id).map_err(invalid)?;
     let mut store = lock(&state)?;
     store.delete_environment(&id)?;
-    store.audit(&principal, "environment.delete", &id, None)?;
+    store.record(&principal, "environment.delete", &id, None);
     // Offline workers miss this and reclaim the files through their unused-age collection.
     for session in store.sessions.values() {
         let _ = session.tx.send(HubMessage::Evict { environment_id: id.clone() });
@@ -1776,12 +1793,12 @@ async fn upsert_environment(
         )
         .map_err(anyhow::Error::from)?;
     if inserted > 0 {
-        store.audit(
+        store.record(
             &principal,
             "environment.upsert",
             &format!("{}@{}", environment.id, environment.revision),
             None,
-        )?;
+        );
     }
     store.db.execute("INSERT INTO environments(id,data) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET data=excluded.data", params![environment.id, encode(&environment)?]).map_err(anyhow::Error::from)?;
     store.schedule()?;
@@ -1837,7 +1854,7 @@ async fn prepare(
         )));
     }
     store.schedule()?;
-    store.audit(
+    store.record(
         &principal,
         "environment.prepare",
         &format!("{id}@{}", environment.revision),
@@ -1848,7 +1865,7 @@ async fn prepare(
                 .collect::<Vec<_>>()
                 .join(","),
         ),
-    )?;
+    );
     for status in &mut result {
         *status = store
             .status(&status.worker_id, &environment)?
@@ -3093,7 +3110,7 @@ mod tests {
         // Explicit preparation checks only the environment against each worker's policy.
         let state = Arc::new(Mutex::new(store));
         let environment = Environment { id: "native".into(), revision: "1".into(), setup: vec!["true".into()], ..Default::default() };
-        upsert_environment(State(state.clone()), Extension(pool_principal()), Json(environment)).await.unwrap();
+        let _ = upsert_environment(State(state.clone()), Extension(pool_principal()), Json(environment)).await.unwrap();
         let prepared = prepare(State(state.clone()), Extension(pool_principal()), Path("native".into()), Json(PrepareRequest::default()))
             .await
             .unwrap();

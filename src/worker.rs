@@ -258,6 +258,18 @@ pub async fn run(
     for child in ["attempts", "blobs", "caches", "environments", "workspaces"] {
         private_dir(&data.join(child))?;
     }
+    // Background cache pruning: keep disk usage bounded without interrupting active work.
+    let prune_data = data.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(6 * 60 * 60));
+        loop {
+            interval.tick().await;
+            let data = prune_data.clone();
+            let _ = tokio::task::spawn_blocking(move || prune_worker_cache_root(&data)).await;
+        }
+    });
+    let initial = data.clone();
+    tokio::task::spawn_blocking(move || prune_worker_cache_root(&initial)).await.ok();
     let mut capabilities = probe().await?;
     if let Some(policy) = &policy {
         eprintln!("worker policy: {}", policy.summary());
@@ -3057,6 +3069,53 @@ async fn self_update(state: &Arc<State>, version: &str) -> Result<()> {
     eprintln!("updated to {version}; exiting for the service manager to restart");
     std::process::exit(RESTART_EXIT_CODE)
 }
+
+fn prune_worker_cache_root(data_dir: &std::path::Path) {
+    const MAX_CACHE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+    const TTL_SECS: u64 = 7 * 24 * 60 * 60;
+    let root = data_dir.join("caches");
+    if !root.exists() {
+        return;
+    }
+    let mut files: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue; };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(meta) = entry.metadata() {
+                if let Ok(modified) = meta.modified() {
+                    files.push((path, meta.len(), modified));
+                }
+            }
+        }
+    }
+    let now = std::time::SystemTime::now();
+    let ttl = std::time::Duration::from_secs(TTL_SECS);
+    let mut remaining = Vec::new();
+    for (path, size, modified) in files {
+        if now.duration_since(modified).unwrap_or_default() > ttl {
+            let _ = std::fs::remove_file(&path);
+        } else {
+            remaining.push((path, size, modified));
+        }
+    }
+    let mut total: u64 = remaining.iter().map(|(_, size, _)| *size).sum();
+    remaining.sort_by_key(|item| item.2);
+    for (path, size, _) in remaining {
+        if total <= MAX_CACHE_BYTES {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
+    // Best-effort empty-directory cleanup.
+    let _ = std::fs::remove_dir_all(&root.join("tmp")).ok();
+}
+
 
 #[cfg(test)]
 mod tests {

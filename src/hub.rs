@@ -208,7 +208,7 @@ impl Store {
                 .min(settings.capacity);
             store.save_worker(&worker)?;
         }
-        for mut job in store.jobs(None)? {
+        for mut job in store.jobs(None, None)? {
             if active(&job.state) {
                 job.state = "unknown".into();
                 job.error = Some(
@@ -242,9 +242,18 @@ impl Store {
     fn workers(&self) -> Result<Vec<WorkerInfo>> {
         self.rows("SELECT data FROM workers ORDER BY id")
     }
-    fn jobs(&self, limit: Option<usize>) -> Result<Vec<Job>> {
-        match limit {
-            Some(limit) => {
+    fn jobs(&self, limit: Option<usize>, offset: Option<usize>) -> Result<Vec<Job>> {
+        match (limit, offset) {
+            (Some(limit), Some(offset)) => {
+                let mut statement = self
+                    .db
+                    .prepare("SELECT data FROM jobs ORDER BY rowid DESC LIMIT ?1 OFFSET ?2")?;
+                let rows = statement.query_map(params![limit as i64, offset as i64], |row| {
+                    row.get::<_, String>(0)
+                })?;
+                rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+            }
+            (Some(limit), None) => {
                 let mut statement = self
                     .db
                     .prepare("SELECT data FROM jobs ORDER BY rowid DESC LIMIT ?1")?;
@@ -253,7 +262,7 @@ impl Store {
                 })?;
                 rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
             }
-            None => self.rows("SELECT data FROM jobs ORDER BY rowid"),
+            _ => self.rows("SELECT data FROM jobs ORDER BY rowid"),
         }
     }
     fn environments(&self) -> Result<Vec<Environment>> {
@@ -264,6 +273,14 @@ impl Store {
     }
     fn job(&self, id: &str) -> Result<Option<Job>> {
         self.one("SELECT data FROM jobs WHERE id=?1", id)
+    }
+
+    fn delete_job(&mut self, id: &str) -> ApiResult<()> {
+        let tx = self.db.transaction().map_err(anyhow::Error::from)?;
+        tx.execute("DELETE FROM jobs WHERE id=?1", params![id])
+            .map_err(anyhow::Error::from)?;
+        tx.commit().map_err(anyhow::Error::from)?;
+        Ok(())
     }
     fn environment(&self, id: &str) -> Result<Option<Environment>> {
         self.one("SELECT data FROM environments WHERE id=?1", id)
@@ -316,7 +333,7 @@ impl Store {
     /// Removes an environment with its revisions, worker statuses and preparation logs.
     /// Deleting a missing id succeeds so retries are idempotent; jobs that still use it block deletion.
     fn delete_environment(&mut self, id: &str) -> Result<(), ApiError> {
-        if self.jobs(None)?.iter().any(|job| {
+        if self.jobs(None, None)?.iter().any(|job| {
             matches!(job.state.as_str(), "queued" | "assigned" | "running" | "cancelling")
                 && job.spec.environment.as_deref() == Some(id)
         }) {
@@ -769,7 +786,7 @@ impl Store {
     }
     fn schedule(&mut self) -> Result<()> {
         let workers = self.workers()?;
-        let mut jobs = self.jobs(None)?;
+        let mut jobs = self.jobs(None, None)?;
         // Stable ordering retains the database creation order for equal priorities.
         jobs.sort_by_key(|job| std::cmp::Reverse(job.spec.priority));
         for job in &mut jobs {
@@ -1107,7 +1124,7 @@ impl Store {
                 eprintln!("ignored worker reconciliation report: {error:#}");
             }
         }
-        for mut job in self.jobs(None)? {
+        for mut job in self.jobs(None, None)? {
             if job.worker_id.as_deref() == Some(&id) && active(&job.state) {
                 if !reported.contains(&(job.id.clone(), job.attempt_id.clone())) {
                     job.state = "unknown".into();
@@ -1264,7 +1281,7 @@ impl Store {
             info.last_seen = now();
             self.save_worker(&info)?;
         }
-        for mut job in self.jobs(None)? {
+        for mut job in self.jobs(None, None)? {
             if job.worker_id.as_deref() == Some(worker) && active(&job.state) {
                 job.state = "unknown".into();
                 job.updated_at = now();
@@ -1408,6 +1425,7 @@ fn router(state: Shared) -> Router {
         .route("/v1/workers/{id}/update", post(update_worker))
         .route("/v1/environments/{id}", axum::routing::delete(delete_environment))
         .route("/v1/tokens", get(tokens).post(create_token))
+        .route("/v1/jobs/{id}", axum::routing::delete(delete_job))
         .route("/v1/tokens/{id}", axum::routing::delete(revoke_token))
         .route("/v1/dashboard-password", get(get_dashboard_password).post(set_dashboard_password).delete(delete_dashboard_password))
         .route("/v1/audit", get(audit))
@@ -1641,7 +1659,7 @@ async fn delete_worker(
 ) -> ApiResult<StatusCode> {
     let mut guard = lock(&state)?;
     // Deleting a missing worker succeeds so retries are idempotent.
-    if guard.jobs(None).unwrap_or_default().into_iter().any(|job| {
+    if guard.jobs(None, None).unwrap_or_default().into_iter().any(|job| {
         (job.state == "assigned" || job.state == "running") && job.worker_id.as_deref() == Some(&id)
     }) {
         return Err(invalid("worker has active jobs; drain it first"));
@@ -1715,16 +1733,22 @@ async fn set_priority(
 #[derive(Deserialize, Default)]
 struct JobsQuery {
     limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 async fn jobs(
     State(state): State<Shared>,
     Query(query): Query<JobsQuery>,
 ) -> ApiResult<Json<Vec<Job>>> {
-    Ok(Json(lock(&state)?.jobs(query.limit)?))
+    Ok(Json(lock(&state)?.jobs(query.limit, query.offset)?))
 }
 async fn job(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult<Json<Job>> {
     Ok(Json(lock(&state)?.job(&id)?.ok_or_else(|| missing("job"))?))
+}
+
+async fn delete_job(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    lock(&state)?.delete_job(&id)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 async fn submit(
     State(state): State<Shared>,
@@ -2647,7 +2671,7 @@ mod tests {
             store.set_priority("missing", 0).unwrap_err().0,
             StatusCode::NOT_FOUND
         );
-        let original_order: Vec<_> = store.jobs(None).unwrap().into_iter().map(|j| j.id).collect();
+        let original_order: Vec<_> = store.jobs(None, None).unwrap().into_iter().map(|j| j.id).collect();
         assert_eq!(
             original_order,
             [

@@ -115,6 +115,8 @@ enum Commands {
         #[arg(long, default_value_t = 30)]
         older_than_days: u64,
         #[arg(long)]
+        max_total_mb: Option<u64>,
+        #[arg(long)]
         apply: bool,
     },
     /// Print the Hub dashboard address and token-file location. Does not print the token value.
@@ -1525,24 +1527,67 @@ async fn execute() -> Result<()> {
             let latest = latest || version.is_none();
             update_release(version, latest, true, force, &hub, &token).await
         }
-        Commands::Cleanup { older_than_days, apply } => {
+        Commands::Cleanup { older_than_days, max_total_mb, apply } => {
             use std::time::{Duration, SystemTime};
             let retention_seconds = older_than_days.checked_mul(86400).context("retention period is too large")?;
             let cutoff = SystemTime::now()
                 .checked_sub(Duration::from_secs(retention_seconds))
                 .context("invalid retention period")?;
-            let active_job_ids: std::collections::BTreeSet<String> = {
-                let client = Client::new(&hub, &token).context("failed to connect to the Hub, active jobs cannot be enumerated")?;
-                client
-                    .get::<Vec<Job>>("/v1/jobs")
+            let client = Client::new(&hub, &token).context("failed to connect to the Hub, active jobs cannot be enumerated")?;
+            // Enumerate all jobs page by page so cleanup works with bounded memory.
+            let mut all_jobs: Vec<Job> = Vec::new();
+            let mut offset = 0usize;
+            loop {
+                let page: Vec<Job> = client
+                    .get(&format!("/v1/jobs?limit=500&offset={}", offset))
                     .await
-                    .context("failed to query active Hub jobs, cleanup aborted")?
-                    .into_iter()
-                    .filter(|job| matches!(job.state.as_str(), "queued" | "assigned" | "running"))
-                    .map(|job| job.id)
-                    .collect()
-            };
+                    .context("failed to query Hub jobs for cleanup")?;
+                let count = page.len();
+                all_jobs.extend(page);
+                if count < 500 {
+                    break;
+                }
+                offset += count;
+            }
+            let active_job_ids: std::collections::BTreeSet<String> = all_jobs
+                .iter()
+                .filter(|job| matches!(job.state.as_str(), "queued" | "assigned" | "running"))
+                .map(|job| job.id.clone())
+                .collect();
             let mut skipped_active = Vec::new();
+            let mut job_ids_to_delete: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            // Rule 1: retention age, using job updated_at when available.
+            for job in &all_jobs {
+                if active_job_ids.contains(&job.id) {
+                    continue;
+                }
+                let modified_epoch = job.updated_at;
+                let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(modified_epoch as u64);
+                if modified < cutoff {
+                    job_ids_to_delete.insert(job.id.clone());
+                }
+            }
+            // Rule 2: max total bytes (higher priority than retention).
+            if let Some(max_mb) = max_total_mb {
+                let max_bytes = max_mb.saturating_mul(1024 * 1024);
+                let mut candidates: Vec<&Job> = all_jobs
+                    .iter()
+                    .filter(|job| !active_job_ids.contains(&job.id))
+                    .collect();
+                candidates.sort_by_key(|job| job.created_at);
+                let mut estimated_total: u64 = candidates
+                    .iter()
+                    .map(|job| serde_json::to_vec(job).map(|b| b.len() as u64).unwrap_or(0))
+                    .sum();
+                for job in candidates {
+                    if estimated_total <= max_bytes {
+                        break;
+                    }
+                    let size = serde_json::to_vec(job).map(|b| b.len() as u64).unwrap_or(0);
+                    job_ids_to_delete.insert(job.id.clone());
+                    estimated_total = estimated_total.saturating_sub(size);
+                }
+            }
             let mut candidates = Vec::new();
             if results.exists() {
                 for entry in fs::read_dir(&results)? {
@@ -1556,18 +1601,19 @@ async fn execute() -> Result<()> {
                             skipped_active.push(name.to_string());
                             continue;
                         }
-                    }
-                    let modified = entry.metadata()?.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                    if modified < cutoff {
-                        candidates.push((path, modified));
+                        if job_ids_to_delete.contains(name) {
+                            candidates.push(path);
+                        }
                     }
                 }
             }
-            candidates.sort_by(|a,b| a.0.cmp(&b.0));
             if apply {
-                for (path, _) in &candidates {
+                for path in &candidates {
                     fs::remove_dir_all(path)
                         .with_context(|| format!("remove {}", path.display()))?;
+                }
+                for id in &job_ids_to_delete {
+                    let _ = client.delete(&format!("/v1/jobs/{}", id)).await;
                 }
             }
             print(&serde_json::json!({
@@ -1575,7 +1621,9 @@ async fn execute() -> Result<()> {
                 "older_than_days": older_than_days,
                 "mode": if apply {"applied"} else {"dry-run"},
                 "candidate_count": candidates.len(),
-                "candidates": candidates.iter().map(|(p,_)| p.display().to_string()).collect::<Vec<_>>(),
+                "job_ids_to_delete": job_ids_to_delete.iter().cloned().collect::<Vec<_>>(),
+                "max_total_mb": max_total_mb,
+                "candidates": candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                 "skipped_active_jobs": skipped_active,
                 "note": if apply {"Removed. Rerun without --apply to preview."} else {"No files were deleted; rerun with --apply to remove."}
             }))?;

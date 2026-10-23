@@ -753,9 +753,10 @@ function JobPage() {
 
 function JobsTable({ jobs }: { jobs: Job[] }) {
   const navigate = useNavigate()
+  const now = useNow()
   return (
     <div className="table-scroll"><table className="data-table jobs-table">
-      <thead><tr><th>Job</th><th>State</th><th>Command</th><th>Worker</th><th>Environment</th><th>Submitted by</th><th>Updated</th></tr></thead>
+      <thead><tr><th>Job</th><th>State</th><th>Command</th><th>Worker</th><th>Environment</th><th>Submitted by</th><th>Updated</th><th>Elapsed</th></tr></thead>
       <tbody>{jobs.map((job) => (
         <tr key={job.id} className="clickable-row" onClick={() => navigate({ to: '/jobs/$jobId', params: { jobId: job.id } })}>
           <td><Link className="table-link" to="/jobs/$jobId" params={{ jobId: job.id }}><code className="job-id">{job.id.slice(0, 8)}</code></Link></td>
@@ -767,6 +768,7 @@ function JobsTable({ jobs }: { jobs: Job[] }) {
           <td>{job.spec.environment ?? <span className="muted-text">Native</span>}</td>
           <td>{job.submitted_by ?? <span className="muted-text">—</span>}</td>
           <td className="time-cell"><RelativeTime timestamp={job.updated_at} /></td>
+          <td className="time-cell">{formatDuration(job.created_at, activeJobStates.has(job.state) ? now : job.updated_at)}</td>
         </tr>
       ))}</tbody>
     </table></div>

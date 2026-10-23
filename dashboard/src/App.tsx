@@ -54,6 +54,7 @@ import {
   formatRelative,
   formatTime,
   jobLogsQuery,
+  jobsPage,
   readToken,
   snapshotQuery,
   storeToken,
@@ -586,7 +587,25 @@ function PolicySection({ policy }: { policy: WorkerPolicy }) {
 // ---------- Jobs ----------
 
 function JobsPage() {
-  const { jobs, workers } = useSnapshot()
+  const snapshot = useSnapshot()
+  const workers = snapshot.workers
+  const [loadedJobs, setLoadedJobs] = useState(snapshot.jobs)
+  const [offset, setOffset] = useState(0)
+  const [hasMore, setHasMore] = useState(snapshot.jobs.length >= 200)
+  const moreQuery = useQuery({
+    queryKey: ['jobs-page', offset],
+    queryFn: () => jobsPage(200, offset),
+    enabled: offset > 0,
+  })
+  useEffect(() => {
+    if (!moreQuery.data) return
+    setLoadedJobs((previous) => {
+      const known = new Set(previous.map((job) => job.id))
+      return [...previous, ...moreQuery.data.filter((job) => !known.has(job.id))]
+    })
+    setHasMore(moreQuery.data.length >= 200)
+  }, [moreQuery.data])
+  const jobs = loadedJobs
   const search = jobsRoute.useSearch()
   const navigate = useNavigate({ from: '/jobs' })
   const setSearch = useCallback(
@@ -655,6 +674,13 @@ function JobsPage() {
           <EmptyState icon={<Terminal />} title="No matching jobs" detail="Try a different search or clear the filters." />
         ) : (
           <EmptyState icon={<Terminal />} title="No jobs yet" detail="Submitted jobs and their latest states will appear here." />
+        )}
+        {hasMore && (
+          <div className="filter-row">
+            <Button variant="outline" size="sm" onClick={() => setOffset((value) => value + 200)} disabled={moreQuery.isFetching}>
+              {moreQuery.isFetching ? 'Loading…' : 'Load more'}
+            </Button>
+          </div>
         )}
       </section>
     </>

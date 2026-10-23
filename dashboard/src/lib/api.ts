@@ -181,6 +181,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const dashboardPasswordStatus = () => get<{ set: boolean }>('/v1/dashboard-password')
+export const jobsPage = (limit: number, offset: number) => get<Job[]>(`/v1/jobs?limit=${limit}&offset=${offset}`)
 
 export async function post<T = void>(path: string, body?: unknown): Promise<T> {
   return request<T>(path, {

@@ -212,6 +212,7 @@ a.text-action { text-decoration: none; }
 .filter-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 16px; }
 .field { height: 34px; min-width: 0; padding: 0 10px; border: 1px solid var(--input); border-radius: 5px; color: #25374b; background: #fff; font: inherit; font-size: 12px; }
 .field:hover { border-color: #aab8c6; }
+select.field { padding-right: 26px; }
 .field-search { flex: 1 1 260px; }
 .detail-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 0; border: 1px solid var(--border); border-radius: 6px; background: #fff; }
 .detail-item { min-width: 0; padding: 12px 15px; border-bottom: 1px solid #edf0f3; }

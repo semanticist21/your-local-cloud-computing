@@ -205,7 +205,7 @@ export const snapshotQuery = queryOptions({
   queryFn: async (): Promise<Snapshot> => {
     const [workers, jobs, environments, environmentStatuses] = await Promise.all([
       get<WorkerInfo[]>('/v1/workers'),
-      get<Job[]>('/v1/jobs'),
+      get<Job[]>('/v1/jobs?limit=200'),
       get<Environment[]>('/v1/environments'),
       get<EnvironmentStatus[]>('/v1/environments/status'),
     ])

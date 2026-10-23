@@ -208,7 +208,7 @@ impl Store {
                 .min(settings.capacity);
             store.save_worker(&worker)?;
         }
-        for mut job in store.jobs()? {
+        for mut job in store.jobs(None)? {
             if active(&job.state) {
                 job.state = "unknown".into();
                 job.error = Some(
@@ -242,8 +242,19 @@ impl Store {
     fn workers(&self) -> Result<Vec<WorkerInfo>> {
         self.rows("SELECT data FROM workers ORDER BY id")
     }
-    fn jobs(&self) -> Result<Vec<Job>> {
-        self.rows("SELECT data FROM jobs ORDER BY rowid")
+    fn jobs(&self, limit: Option<usize>) -> Result<Vec<Job>> {
+        match limit {
+            Some(limit) => {
+                let mut statement = self
+                    .db
+                    .prepare("SELECT data FROM jobs ORDER BY rowid DESC LIMIT ?1")?;
+                let rows = statement.query_map(params![limit as i64], |row| {
+                    row.get::<_, String>(0)
+                })?;
+                rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+            }
+            None => self.rows("SELECT data FROM jobs ORDER BY rowid"),
+        }
     }
     fn environments(&self) -> Result<Vec<Environment>> {
         self.rows("SELECT data FROM environments ORDER BY id")
@@ -305,7 +316,7 @@ impl Store {
     /// Removes an environment with its revisions, worker statuses and preparation logs.
     /// Deleting a missing id succeeds so retries are idempotent; jobs that still use it block deletion.
     fn delete_environment(&mut self, id: &str) -> Result<(), ApiError> {
-        if self.jobs()?.iter().any(|job| {
+        if self.jobs(None)?.iter().any(|job| {
             matches!(job.state.as_str(), "queued" | "assigned" | "running" | "cancelling")
                 && job.spec.environment.as_deref() == Some(id)
         }) {
@@ -758,7 +769,7 @@ impl Store {
     }
     fn schedule(&mut self) -> Result<()> {
         let workers = self.workers()?;
-        let mut jobs = self.jobs()?;
+        let mut jobs = self.jobs(None)?;
         // Stable ordering retains the database creation order for equal priorities.
         jobs.sort_by_key(|job| std::cmp::Reverse(job.spec.priority));
         for job in &mut jobs {
@@ -1096,7 +1107,7 @@ impl Store {
                 eprintln!("ignored worker reconciliation report: {error:#}");
             }
         }
-        for mut job in self.jobs()? {
+        for mut job in self.jobs(None)? {
             if job.worker_id.as_deref() == Some(&id) && active(&job.state) {
                 if !reported.contains(&(job.id.clone(), job.attempt_id.clone())) {
                     job.state = "unknown".into();
@@ -1253,7 +1264,7 @@ impl Store {
             info.last_seen = now();
             self.save_worker(&info)?;
         }
-        for mut job in self.jobs()? {
+        for mut job in self.jobs(None)? {
             if job.worker_id.as_deref() == Some(worker) && active(&job.state) {
                 job.state = "unknown".into();
                 job.updated_at = now();
@@ -1630,7 +1641,7 @@ async fn delete_worker(
 ) -> ApiResult<StatusCode> {
     let mut guard = lock(&state)?;
     // Deleting a missing worker succeeds so retries are idempotent.
-    if guard.jobs().unwrap_or_default().into_iter().any(|job| {
+    if guard.jobs(None).unwrap_or_default().into_iter().any(|job| {
         (job.state == "assigned" || job.state == "running") && job.worker_id.as_deref() == Some(&id)
     }) {
         return Err(invalid("worker has active jobs; drain it first"));
@@ -1701,8 +1712,16 @@ async fn set_priority(
     store.record(&principal, "job.priority", &id, Some(request.priority.to_string()));
     Ok(Json(job))
 }
-async fn jobs(State(state): State<Shared>) -> ApiResult<Json<Vec<Job>>> {
-    Ok(Json(lock(&state)?.jobs()?))
+#[derive(Deserialize, Default)]
+struct JobsQuery {
+    limit: Option<usize>,
+}
+
+async fn jobs(
+    State(state): State<Shared>,
+    Query(query): Query<JobsQuery>,
+) -> ApiResult<Json<Vec<Job>>> {
+    Ok(Json(lock(&state)?.jobs(query.limit)?))
 }
 async fn job(State(state): State<Shared>, Path(id): Path<String>) -> ApiResult<Json<Job>> {
     Ok(Json(lock(&state)?.job(&id)?.ok_or_else(|| missing("job"))?))
@@ -2628,7 +2647,7 @@ mod tests {
             store.set_priority("missing", 0).unwrap_err().0,
             StatusCode::NOT_FOUND
         );
-        let original_order: Vec<_> = store.jobs().unwrap().into_iter().map(|j| j.id).collect();
+        let original_order: Vec<_> = store.jobs(None).unwrap().into_iter().map(|j| j.id).collect();
         assert_eq!(
             original_order,
             [

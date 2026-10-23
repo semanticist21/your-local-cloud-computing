@@ -455,6 +455,54 @@ impl Store {
         self.record(by, "token.revoke", &info.id, Some(info.name.clone()));
         Ok(info)
     }
+
+    fn set_dashboard_password(&mut self, password: &str, by: &Principal) -> ApiResult<()> {
+        if password.len() != 64 || !password.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(invalid("password must be a 64-character SHA-256 hex digest"));
+        }
+        let hash = token_hash(password);
+        if self.tokens.contains_key(&hash) {
+            return Err(invalid("this password collides with an existing credential; choose another"));
+        }
+        let tx = self.db.transaction().map_err(anyhow::Error::from)?;
+        tx.execute("DELETE FROM tokens WHERE id=?1", params!["dashboard-password"])
+            .map_err(anyhow::Error::from)?;
+        let info = TokenInfo {
+            id: "dashboard-password".into(),
+            name: "dashboard-password".into(),
+            role: Role::Admin,
+            worker_id: None,
+            created_at: now(),
+            created_by: by.name.clone(),
+            last_used_at: None,
+            revoked_at: None,
+        };
+        tx.execute(
+            "INSERT INTO tokens(id,hash,data) VALUES(?1,?2,?3)",
+            params![info.id, hash, encode(&info)?],
+        ).map_err(anyhow::Error::from)?;
+        tx.commit().map_err(anyhow::Error::from)?;
+        self.tokens.retain(|_, token| token.id != "dashboard-password");
+        self.token_used.remove("dashboard-password");
+        self.tokens.insert(hash, info.clone());
+        self.record(by, "dashboard_password.set", "dashboard-password", None);
+        Ok(())
+    }
+
+    fn delete_dashboard_password(&mut self, by: &Principal) -> ApiResult<()> {
+        let tx = self.db.transaction().map_err(anyhow::Error::from)?;
+        tx.execute("DELETE FROM tokens WHERE id=?1", params!["dashboard-password"])
+            .map_err(anyhow::Error::from)?;
+        tx.commit().map_err(anyhow::Error::from)?;
+        self.tokens.retain(|_, token| token.id != "dashboard-password");
+        self.token_used.remove("dashboard-password");
+        self.record(by, "dashboard_password.delete", "dashboard-password", None);
+        Ok(())
+    }
+
+    fn has_dashboard_password(&self) -> bool {
+        self.tokens.values().any(|t| t.id == "dashboard-password")
+    }
     fn audit(
         &mut self,
         principal: &Principal,
@@ -1350,6 +1398,7 @@ fn router(state: Shared) -> Router {
         .route("/v1/environments/{id}", axum::routing::delete(delete_environment))
         .route("/v1/tokens", get(tokens).post(create_token))
         .route("/v1/tokens/{id}", axum::routing::delete(revoke_token))
+        .route("/v1/dashboard-password", get(get_dashboard_password).post(set_dashboard_password).delete(delete_dashboard_password))
         .route("/v1/audit", get(audit))
         .route_layer(middleware::from_fn_with_state(state.clone(), admin_only));
     let requester = Router::new()
@@ -1512,6 +1561,35 @@ async fn revoke_token(
     Path(id): Path<String>,
 ) -> ApiResult<Json<TokenInfo>> {
     Ok(Json(lock(&state)?.revoke_token(&id, &principal)?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DashboardPasswordRequest {
+    password: String,
+}
+
+async fn get_dashboard_password(
+    State(state): State<Shared>,
+) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(serde_json::json!({ "set": lock(&state)?.has_dashboard_password() })))
+}
+
+async fn set_dashboard_password(
+    State(state): State<Shared>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<DashboardPasswordRequest>,
+) -> ApiResult<StatusCode> {
+    lock(&state)?.set_dashboard_password(&request.password, &principal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_dashboard_password(
+    State(state): State<Shared>,
+    Extension(principal): Extension<Principal>,
+) -> ApiResult<StatusCode> {
+    lock(&state)?.delete_dashboard_password(&principal)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

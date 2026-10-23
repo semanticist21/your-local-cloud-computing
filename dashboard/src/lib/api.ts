@@ -113,9 +113,34 @@ export type Snapshot = {
 
 const tokenKey = 'ylcc-dashboard-token'
 
-export const readToken = () => sessionStorage.getItem(tokenKey) ?? ''
-export const storeToken = (token: string) => sessionStorage.setItem(tokenKey, token)
-export const clearToken = () => sessionStorage.removeItem(tokenKey)
+// Persist across browser sessions on this device: the user explicitly prefers a saved
+// login over re-pasting the pool token. Clearing on disconnect removes it.
+export const readToken = () => sessionStorage.getItem(tokenKey) ?? localStorage.getItem(tokenKey) ?? ''
+export const storeToken = (token: string) => {
+  localStorage.setItem(tokenKey, token)
+  sessionStorage.removeItem(tokenKey)
+}
+export const clearToken = () => {
+  localStorage.removeItem(tokenKey)
+  sessionStorage.removeItem(tokenKey)
+}
+
+export const storeSessionToken = (token: string) => {
+  sessionStorage.setItem(tokenKey, token)
+  localStorage.removeItem(tokenKey)
+}
+
+/** Hashes a user-chosen password in the browser so the raw password is not sent in transit. */
+export async function hashPassword(value: string): Promise<string> {
+  if (!(typeof crypto !== 'undefined' && crypto.subtle)) {
+    throw new Error('Password login requires a secure browser context.')
+  }
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('')
+}
+
 
 /** Moves a `#token=...` handoff from `ylcc dashboard` into sessionStorage and strips it from the URL. */
 export function consumeHashToken() {
@@ -127,28 +152,50 @@ export function consumeHashToken() {
 
 export class AuthError extends Error {
   constructor() {
-    super('This token was rejected. Enter the Hub token to reconnect.')
+    super('This token or password was rejected. Enter the Hub token or dashboard password.')
   }
 }
 
 /** A valid token whose role cannot read this endpoint; the session stays connected. */
 export class ForbiddenError extends Error {}
 
-async function get<T>(path: string): Promise<T> {
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers)
+  headers.set('Authorization', `Bearer ${readToken()}`)
   const response = await fetch(path, {
-    headers: { Authorization: `Bearer ${readToken()}` },
+    ...init,
+    headers,
     cache: 'no-store',
   })
   if (!response.ok) {
     if (response.status === 401) throw new AuthError()
     if (response.status === 403) {
       const body = (await response.json().catch(() => null)) as { error?: string } | null
-      throw new ForbiddenError(body?.error ?? 'This token cannot view this page.')
+      throw new ForbiddenError(body?.error ?? 'This action requires an admin token.')
     }
     const message = await response.text()
     throw new Error(message || `Hub returned ${response.status}`)
   }
+  if (response.status === 204) return undefined as unknown as T
   return response.json() as Promise<T>
+}
+
+export const dashboardPasswordStatus = () => get<{ set: boolean }>('/v1/dashboard-password')
+
+export async function post<T = void>(path: string, body?: unknown): Promise<T> {
+  return request<T>(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+}
+
+export async function del<T = void>(path: string): Promise<T> {
+  return request<T>(path, { method: 'DELETE' })
+}
+
+async function get<T>(path: string): Promise<T> {
+  return request<T>(path)
 }
 
 export const pollMs = 5000

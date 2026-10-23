@@ -41,6 +41,11 @@ import {
   AuthError,
   auditQuery,
   clearToken,
+  del,
+  storeSessionToken,
+  dashboardPasswordStatus,
+  hashPassword,
+  post,
   ForbiddenError,
   errorMessage,
   formatBytes,
@@ -131,8 +136,9 @@ function App() {
     return (
       <ConnectScreen
         error={authError}
-        onConnect={(next) => {
-          storeToken(next)
+        onConnect={(next, persist) => {
+          if (persist) storeToken(next)
+          else storeSessionToken(next)
           setAuthError('')
           setToken(next)
         }}
@@ -145,11 +151,38 @@ function App() {
 const isInsecureRemote = () =>
   window.location.protocol !== 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(window.location.hostname)
 
-function ConnectScreen({ error, onConnect }: { error: string; onConnect: (token: string) => void }) {
+function ConnectScreen({ error, onConnect }: { error: string; onConnect: (token: string, persist?: boolean) => void }) {
   const [token, setToken] = useState('')
-  const submit = (event: FormEvent<HTMLFormElement>) => {
+  const [localError, setLocalError] = useState('')
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
-    if (token.trim()) onConnect(token.trim())
+    const value = token.trim()
+    if (!value) return
+    setLocalError('')
+    try {
+      const probe = async (secret: string) => {
+        const response = await fetch('/v1/whoami', { headers: { Authorization: `Bearer ${secret}` } })
+        return response.ok
+      }
+      if (await probe(value)) {
+        onConnect(value, true)
+        return
+      }
+      let hashed: string
+      try {
+        hashed = await hashPassword(value)
+      } catch (hashError) {
+        setLocalError(hashError instanceof Error ? hashError.message : 'Could not hash password.')
+        return
+      }
+      if (await probe(hashed)) {
+        onConnect(hashed, false)
+        return
+      }
+      setLocalError('That token or password was rejected.')
+    } catch {
+      setLocalError('Could not reach the Hub.')
+    }
   }
 
   return (
@@ -158,10 +191,10 @@ function ConnectScreen({ error, onConnect }: { error: string; onConnect: (token:
         <div className="connect-brand"><span className="brand-mark"><Workflow size={19} /></span><span>YLCC</span></div>
         <div className="connect-icon"><LockKeyhole size={21} /></div>
         <h1>Connect to your Hub</h1>
-        <p className="connect-description">Enter the pool token or a requester token issued with `ylcc tokens create`. Find its local file path with `ylcc dashboard`; it is never displayed by ylcc. Your dashboard reads status from this address.</p>
+        <p className="connect-description">Enter the pool token, a requester token issued with `ylcc tokens create`, or your dashboard password. Find a token file path with `ylcc dashboard`; it is never displayed by ylcc. Your dashboard reads status from this address.</p>
         <div className="endpoint-field"><span className="online-dot" />{window.location.origin}</div>
         <form onSubmit={submit} className="connect-form">
-          <label htmlFor="pool-token">Hub token</label>
+          <label htmlFor="pool-token">Hub token or password</label>
           <input
             id="pool-token"
             type="password"
@@ -169,16 +202,17 @@ function ConnectScreen({ error, onConnect }: { error: string; onConnect: (token:
             autoFocus
             value={token}
             onChange={(event) => setToken(event.target.value)}
-            placeholder="Paste token"
+            placeholder="Paste token or password"
             required
           />
           {error && <p className="form-error" role="alert">{error}</p>}
+          {localError && <p className="form-error" role="alert">{localError}</p>}
           {isInsecureRemote() && <p className="form-warning"><LockKeyhole size={14} /> HTTP is not encrypted. Connect over a trusted private network or HTTPS.</p>}
           <Button className="connect-submit" type="submit" disabled={!token.trim()}>
             Connect to Hub <Check size={16} />
           </Button>
         </form>
-        <div className="session-note"><ShieldCheck size={15} /> Token stays in this browser tab and is cleared when you disconnect. Copy it from your local token file; never paste it into chat or logs.</div>
+        <div className="session-note"><ShieldCheck size={15} /> Token or password stays in this browser and is cleared when you disconnect. Copy it from your local token file; never paste it into chat or logs.</div>
       </section>
       <span className="connect-version">YLCC · self-hosted compute</span>
     </main>
@@ -835,13 +869,83 @@ function AuditTarget({ action, target }: { action: string; target: string }) {
   return <code>{target}</code>
 }
 
+function DashboardPasswordSection() {
+  const queryClient = useQueryClient()
+  const statusQuery = useQuery({
+    queryKey: ['dashboard-password'],
+    queryFn: dashboardPasswordStatus,
+    retry: (count, error) => !(error instanceof ForbiddenError || error instanceof AuthError) && count < 2,
+  })
+  const configured = statusQuery.data?.set === true
+  const [password, setPassword] = useState('')
+  const [status, setStatus] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [removing, setRemoving] = useState(false)
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    const value = password.trim()
+    if (!value) return
+    setSaving(true)
+    setStatus('')
+    try {
+      await post('/v1/dashboard-password', { password: await hashPassword(value) })
+      await queryClient.invalidateQueries({ queryKey: ['dashboard-password'] })
+      setStatus('Password set. You can now log in with it on this or another browser.')
+      setPassword('')
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not set password.')
+    } finally {
+      setSaving(false)
+    }
+  }
+  const remove = async () => {
+    setRemoving(true)
+    setStatus('')
+    try {
+      await del('/v1/dashboard-password')
+      await queryClient.invalidateQueries({ queryKey: ['dashboard-password'] })
+      setStatus('Password removed.')
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not remove password.')
+    } finally {
+      setRemoving(false)
+    }
+  }
+  return (
+    <section className="content-section">
+      <SectionHeading title="Dashboard password" detail={configured ? 'A dashboard password is currently configured.' : 'Optional. Lets you log in with a password instead of pasting a token.'} />
+      {configured && <Button variant="outline" size="sm" onClick={() => void remove()} disabled={removing}>Remove password</Button>}
+      <form onSubmit={submit} className="connect-form">
+        <label htmlFor="dashboard-password">{configured ? 'Replace password' : 'New password'}</label>
+        <input
+          id="dashboard-password"
+          type="password"
+          autoComplete="new-password"
+          value={password}
+          onChange={(event) => setPassword(event.target.value)}
+          placeholder="At least 12 characters"
+          required
+          minLength={12}
+        />
+        {status && <p className={status.startsWith('Password') || status.startsWith('Password removed') ? 'session-note' : 'form-error'} role="status">{status}</p>}
+        <Button className="connect-submit" type="submit" disabled={saving || password.trim().length < 12}>
+          Set password
+        </Button>
+      </form>
+    </section>
+  )
+}
+
+
 function TokensPage() {
   const tokens = useQuery(tokensQuery)
+  const whoami = useQuery(whoamiQuery)
   useDisconnectOnAuthError(tokens.error)
   const list = [...(tokens.data ?? [])].sort((a, b) => Number(Boolean(a.revoked_at)) - Number(Boolean(b.revoked_at)) || b.created_at - a.created_at)
   return (
     <>
       <PageHeading title="Tokens" description="Per-machine tokens. Create and revoke them with `ylcc tokens`; this page is read-only." />
+      {whoami.data?.role === 'admin' && <DashboardPasswordSection />}
       <section className="content-section">
         <SectionHeading title="Issued tokens" detail={tokens.data ? `${list.filter((token) => !token.revoked_at).length} active` : tokens.isError ? 'Unavailable' : 'Loading'} />
         {tokens.isError ? <AdminOnly error={tokens.error} /> : !tokens.data ? <LoadingState compact /> : list.length ? (

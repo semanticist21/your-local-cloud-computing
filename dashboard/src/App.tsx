@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useState, type FormEvent, type ReactNode } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Link,
@@ -592,6 +592,7 @@ function JobsPage() {
   const [loadedJobs, setLoadedJobs] = useState(snapshot.jobs)
   const [offset, setOffset] = useState(0)
   const [hasMore, setHasMore] = useState(snapshot.jobs.length >= 200)
+  const sentinelRef = useRef<HTMLDivElement>(null)
   const moreQuery = useQuery({
     queryKey: ['jobs-page', offset],
     queryFn: () => jobsPage(200, offset),
@@ -605,6 +606,19 @@ function JobsPage() {
     })
     setHasMore(moreQuery.data.length >= 200)
   }, [moreQuery.data])
+
+  useEffect(() => {
+    const sentinel = sentinelRef.current
+    if (!sentinel || !hasMore) return
+    const observer = new IntersectionObserver((entries) => {
+      if (entries[0]?.isIntersecting && !moreQuery.isFetching) {
+        setOffset((value) => value + 200)
+      }
+    }, { rootMargin: '240px' })
+    observer.observe(sentinel)
+    return () => observer.disconnect()
+  }, [hasMore, moreQuery.isFetching])
+
   const jobs = loadedJobs
   const search = jobsRoute.useSearch()
   const navigate = useNavigate({ from: '/jobs' })
@@ -675,13 +689,7 @@ function JobsPage() {
         ) : (
           <EmptyState icon={<Terminal />} title="No jobs yet" detail="Submitted jobs and their latest states will appear here." />
         )}
-        {hasMore && (
-          <div className="filter-row">
-            <Button variant="outline" size="sm" onClick={() => setOffset((value) => value + 200)} disabled={moreQuery.isFetching}>
-              {moreQuery.isFetching ? 'Loading…' : 'Load more'}
-            </Button>
-          </div>
-        )}
+        {hasMore && <div ref={sentinelRef} className="filter-row">{moreQuery.isFetching ? 'Loading more…' : ''}</div>}
       </section>
     </>
   )

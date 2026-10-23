@@ -3071,7 +3071,7 @@ async fn self_update(state: &Arc<State>, version: &str) -> Result<()> {
 }
 
 fn prune_worker_cache_root(data_dir: &std::path::Path) {
-    const MAX_CACHE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+    const MAX_CACHE_BYTES: u64 = 100 * 1024 * 1024 * 1024;
     const TTL_SECS: u64 = 7 * 24 * 60 * 60;
     let root = data_dir.join("caches");
     if !root.exists() {

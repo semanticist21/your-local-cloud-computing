@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useState, type FormEvent, type ReactNode } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Link,
@@ -592,7 +592,6 @@ function JobsPage() {
   const [loadedJobs, setLoadedJobs] = useState(snapshot.jobs)
   const [offset, setOffset] = useState(0)
   const [hasMore, setHasMore] = useState(snapshot.jobs.length >= 200)
-  const sentinelRef = useRef<HTMLDivElement>(null)
   const moreQuery = useQuery({
     queryKey: ['jobs-page', offset],
     queryFn: () => jobsPage(200, offset),
@@ -608,15 +607,14 @@ function JobsPage() {
   }, [moreQuery.data])
 
   useEffect(() => {
-    const sentinel = sentinelRef.current
-    if (!sentinel || !hasMore) return
-    const observer = new IntersectionObserver((entries) => {
-      if (entries[0]?.isIntersecting && !moreQuery.isFetching) {
+    const onScroll = () => {
+      if (!hasMore || moreQuery.isFetching) return
+      if (window.innerHeight + window.scrollY >= document.body.offsetHeight - 240) {
         setOffset((value) => value + 200)
       }
-    }, { rootMargin: '240px' })
-    observer.observe(sentinel)
-    return () => observer.disconnect()
+    }
+    window.addEventListener('scroll', onScroll, { passive: true })
+    return () => window.removeEventListener('scroll', onScroll)
   }, [hasMore, moreQuery.isFetching])
 
   const jobs = loadedJobs
@@ -689,7 +687,7 @@ function JobsPage() {
         ) : (
           <EmptyState icon={<Terminal />} title="No jobs yet" detail="Submitted jobs and their latest states will appear here." />
         )}
-        {hasMore && <div ref={sentinelRef} className="filter-row">{moreQuery.isFetching ? 'Loading more…' : ''}</div>}
+        {hasMore && moreQuery.isFetching && <div className="filter-row">Loading more…</div>}
       </section>
     </>
   )

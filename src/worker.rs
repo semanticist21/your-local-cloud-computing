@@ -258,18 +258,6 @@ pub async fn run(
     for child in ["attempts", "blobs", "caches", "environments", "workspaces"] {
         private_dir(&data.join(child))?;
     }
-    // Background cache pruning: keep disk usage bounded without interrupting active work.
-    let prune_data = data.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(6 * 60 * 60));
-        loop {
-            interval.tick().await;
-            let data = prune_data.clone();
-            let _ = tokio::task::spawn_blocking(move || prune_worker_cache_root(&data)).await;
-        }
-    });
-    let initial = data.clone();
-    tokio::task::spawn_blocking(move || prune_worker_cache_root(&initial)).await.ok();
     let mut capabilities = probe().await?;
     if let Some(policy) = &policy {
         eprintln!("worker policy: {}", policy.summary());
@@ -2832,6 +2820,7 @@ const LAST_USED: &str = "last-used";
 const ATTEMPT_RETENTION: Duration = Duration::from_secs(3 * 24 * 3600);
 const UNUSED_RETENTION: Duration = Duration::from_secs(7 * 24 * 3600);
 const MINIMUM_AGE: Duration = Duration::from_secs(3600);
+const MAX_CACHE_BYTES: u64 = 100 * 1024 * 1024 * 1024;
 const DISK_HIGH: f64 = 0.85;
 const DISK_LOW: f64 = 0.80;
 /// A self-updated worker exits with this status so its service manager starts the new binary.
@@ -2840,6 +2829,24 @@ const RELEASES: &str = "https://github.com/semanticist21/your-local-cloud-comput
 
 fn cache_marker(stored: &Path) -> PathBuf {
     stored.with_extension("used")
+}
+fn cache_size(root: &Path) -> Result<u64> {
+    let mut bytes = 0_u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path)?;
+        if crate::platform::is_link(&metadata) {
+            continue;
+        }
+        if metadata.is_dir() {
+            for entry in fs::read_dir(&path)? {
+                pending.push(entry?.path());
+            }
+        } else if metadata.is_file() {
+            bytes = bytes.saturating_add(metadata.len());
+        }
+    }
+    Ok(bytes)
 }
 fn previous_binary(exe: &Path) -> PathBuf {
     exe.with_extension("old")
@@ -2905,7 +2912,7 @@ fn release_attempt_files(dir: &Path) {
 async fn collect_in_background(state: &Arc<State>) {
     let state = state.clone();
     let usage = |state: &State| crate::platform::disk_usage(&state.data);
-    match tokio::task::spawn_blocking(move || collect_garbage(&state, SystemTime::now(), &usage)).await {
+    match tokio::task::spawn_blocking(move || collect_garbage(&state, SystemTime::now(), MAX_CACHE_BYTES, &usage)).await {
         Ok(Err(error)) => eprintln!("garbage collection: {error:#}"),
         Err(error) => eprintln!("garbage collection: {error}"),
         Ok(Ok(())) => {}
@@ -2914,20 +2921,15 @@ async fn collect_in_background(state: &Arc<State>) {
 
 enum Reclaimable {
     Blob,
-    Cache,
+    Cache(u64),
     Environment(Option<EnvironmentStatus>),
 }
 
-/// Runs only while the worker is idle (it holds the exclusive drain lock), so nothing it
-/// removes is in use. Expired entries always go; under disk pressure, oldest first.
-fn collect_garbage(state: &State, now: SystemTime, usage: &dyn Fn(&State) -> Result<f64>) -> Result<()> {
-    let Ok(_drain) = state.drain.try_write() else {
-        return Ok(());
-    };
+/// Waits for active work to drain, blocking later admissions until collection finishes.
+/// Expired entries always go; under disk pressure or the cache cap, oldest first.
+fn collect_garbage(state: &State, now: SystemTime, cache_limit: u64, usage: &dyn Fn(&State) -> Result<f64>) -> Result<()> {
+    let _drain = state.drain.blocking_write();
     let attempts: Vec<_> = state.attempts.lock().unwrap().iter().map(|(id, attempt)| (id.clone(), attempt.clone())).collect();
-    if attempts.iter().any(|(_, attempt)| matches!(attempt.report().state.as_str(), "assigned" | "running")) {
-        return Ok(());
-    }
     let age = |time: Option<SystemTime>| time.and_then(|time| now.duration_since(time).ok()).unwrap_or_default();
     for (id, attempt) in &attempts {
         // An unknown attempt keeps its records so it can still be reconciled or cancelled.
@@ -2948,6 +2950,7 @@ fn collect_garbage(state: &State, now: SystemTime, usage: &dyn Fn(&State) -> Res
         let path = entry?.path();
         candidates.push((modified(&path), path, Reclaimable::Blob));
     }
+    let mut cache_bytes = 0_u64;
     for entry in fs::read_dir(state.data.join("caches"))? {
         let path = entry?.path();
         if path.extension().is_some_and(|e| e == "used") {
@@ -2956,7 +2959,9 @@ fn collect_garbage(state: &State, now: SystemTime, usage: &dyn Fn(&State) -> Res
             }
             continue;
         }
-        candidates.push((modified(&cache_marker(&path)).or(modified(&path)), path, Reclaimable::Cache));
+        let bytes = cache_size(&path)?;
+        cache_bytes = cache_bytes.saturating_add(bytes);
+        candidates.push((modified(&cache_marker(&path)).or(modified(&path)), path, Reclaimable::Cache(bytes)));
     }
     for environment in fs::read_dir(state.data.join("environments"))? {
         let environment = environment?.path();
@@ -2975,13 +2980,18 @@ fn collect_garbage(state: &State, now: SystemTime, usage: &dyn Fn(&State) -> Res
     let mut pressure = usage(state)? > DISK_HIGH;
     for (used, path, kind) in candidates {
         let unused = age(used);
-        if unused <= MINIMUM_AGE || (!pressure && unused <= UNUSED_RETENTION) {
+        if unused <= MINIMUM_AGE {
             break;
+        }
+        let over_cache_cap = matches!(&kind, Reclaimable::Cache(_)) && cache_bytes > cache_limit;
+        if !pressure && !over_cache_cap && unused <= UNUSED_RETENTION {
+            continue;
         }
         remove_tree(&path)?;
         match kind {
             Reclaimable::Blob => {}
-            Reclaimable::Cache => {
+            Reclaimable::Cache(bytes) => {
+                cache_bytes = cache_bytes.saturating_sub(bytes);
                 let _ = fs::remove_file(cache_marker(&path));
             }
             Reclaimable::Environment(status) => {
@@ -3069,53 +3079,6 @@ async fn self_update(state: &Arc<State>, version: &str) -> Result<()> {
     eprintln!("updated to {version}; exiting for the service manager to restart");
     std::process::exit(RESTART_EXIT_CODE)
 }
-
-fn prune_worker_cache_root(data_dir: &std::path::Path) {
-    const MAX_CACHE_BYTES: u64 = 100 * 1024 * 1024 * 1024;
-    const TTL_SECS: u64 = 7 * 24 * 60 * 60;
-    let root = data_dir.join("caches");
-    if !root.exists() {
-        return;
-    }
-    let mut files: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = Vec::new();
-    let mut stack = vec![root.clone()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue; };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if let Ok(meta) = entry.metadata() {
-                if let Ok(modified) = meta.modified() {
-                    files.push((path, meta.len(), modified));
-                }
-            }
-        }
-    }
-    let now = std::time::SystemTime::now();
-    let ttl = std::time::Duration::from_secs(TTL_SECS);
-    let mut remaining = Vec::new();
-    for (path, size, modified) in files {
-        if now.duration_since(modified).unwrap_or_default() > ttl {
-            let _ = std::fs::remove_file(&path);
-        } else {
-            remaining.push((path, size, modified));
-        }
-    }
-    let mut total: u64 = remaining.iter().map(|(_, size, _)| *size).sum();
-    remaining.sort_by_key(|item| item.2);
-    for (path, size, _) in remaining {
-        if total <= MAX_CACHE_BYTES {
-            break;
-        }
-        if std::fs::remove_file(&path).is_ok() {
-            total = total.saturating_sub(size);
-        }
-    }
-    // Best-effort empty-directory cleanup.
-    let _ = std::fs::remove_dir_all(&root.join("tmp")).ok();
-}
-
 
 #[cfg(test)]
 mod tests {
@@ -3274,7 +3237,7 @@ mod tests {
         })
     }
     #[test]
-    fn garbage_collection_frees_finished_and_unused_files_only_when_idle() {
+    fn garbage_collection_frees_finished_and_unused_files_but_keeps_unknown_records() {
         let temp = tempfile::tempdir().unwrap();
         let state = state_at(temp.path());
         let mut events = state.events.subscribe();
@@ -3308,7 +3271,7 @@ mod tests {
         state.environments.lock().unwrap().insert(env_key("env", "rev"), status);
 
         let idle = |_: &State| Ok(0.5);
-        collect_garbage(&state, SystemTime::now(), &idle).unwrap();
+        collect_garbage(&state, SystemTime::now(), MAX_CACHE_BYTES, &idle).unwrap();
         assert!(!attempt.dir.join("work").exists() && !attempt.dir.join("tmp").exists());
         assert!(attempt.dir.join("journal.json").exists());
         assert!(blob.exists() && cache.exists() && environment.exists());
@@ -3316,11 +3279,8 @@ mod tests {
         let later = SystemTime::now() + Duration::from_secs(8 * 24 * 3600);
         let busy = attempt_at(temp.path(), "busy");
         state.attempts.lock().unwrap().insert("busy".into(), busy.clone());
-        collect_garbage(&state, later, &idle).unwrap();
-        assert!(blob.exists() && attempt.dir.exists(), "an active attempt blocks collection");
-
         busy.update(|journal| journal.report.state = "unknown".into()).unwrap();
-        collect_garbage(&state, later, &idle).unwrap();
+        collect_garbage(&state, later, MAX_CACHE_BYTES, &idle).unwrap();
         assert!(!attempt.dir.exists() && !state.attempts.lock().unwrap().contains_key("done"));
         assert!(busy.dir.exists(), "an unknown attempt stays reconcilable");
         assert!(!blob.exists() && !cache.exists() && !cache_marker(&cache).exists());
@@ -3330,6 +3290,116 @@ mod tests {
             panic!("expected an eviction status")
         };
         assert_eq!(status.state, "evicted");
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_collection_drains_active_work_before_later_admissions() {
+        use futures_util::FutureExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = state_at(temp.path());
+        let now = SystemTime::now();
+        let old = state.data.join("caches/old");
+        let fresh = state.data.join("caches/fresh");
+        for path in [&old, &fresh] {
+            fs::create_dir(path).unwrap();
+            let content = File::create(path.join("dependency")).unwrap();
+            content.set_modified(now - UNUSED_RETENTION - Duration::from_secs(1)).unwrap();
+            File::create(cache_marker(path)).unwrap();
+        }
+        File::options()
+            .write(true)
+            .open(cache_marker(&old))
+            .unwrap()
+            .set_modified(now - MINIMUM_AGE - Duration::from_secs(1))
+            .unwrap();
+        let workspace = state.data.join("workspaces/active");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join("in-use"), "keep until drained").unwrap();
+        let assigned = attempt_at(temp.path(), "queued");
+        fs::write(assigned.dir.join("job.json"), "queued input").unwrap();
+        state.attempts.lock().unwrap().insert("queued".into(), assigned.clone());
+
+        let active = state.drain.read().await;
+        let collector = {
+            let state = state.clone();
+            let old = old.clone();
+            tokio::task::spawn_blocking(move || {
+                collect_garbage(&state, now, MAX_CACHE_BYTES, &|_| Ok(if old.exists() { 0.9 } else { 0.79 }))
+            })
+        };
+        // With a reader held, try_read only fails once the fair writer has queued.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.drain.try_read().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let later_admission = state.drain.read();
+        tokio::pin!(later_admission);
+        assert!(later_admission.as_mut().now_or_never().is_none());
+        assert!(old.exists() && fresh.join("dependency").exists() && workspace.join("in-use").exists());
+        assert!(assigned.dir.join("job.json").exists() && assigned.dir.join("journal.json").exists());
+
+        drop(active);
+        let _later = tokio::time::timeout(Duration::from_secs(5), later_admission).await.unwrap();
+        collector.await.unwrap().unwrap();
+        assert!(!old.exists() && !cache_marker(&old).exists() && !workspace.exists());
+        assert!(fresh.join("dependency").exists() && cache_marker(&fresh).exists(), "a fresh cache marker protects even old dependency files");
+        assert_eq!(assigned.report().state, "assigned");
+        assert_eq!(fs::read_to_string(assigned.dir.join("job.json")).unwrap(), "queued input");
+        assert!(assigned.dir.join("journal.json").exists(), "queued work remains runnable after collection");
+    }
+    #[test]
+    fn cache_cap_uses_whole_lru_caches_and_spares_recent_markers() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = state_at(temp.path());
+        let now = SystemTime::now();
+        let cache_limit = 100;
+        let old = state.data.join("caches/old");
+        let middle = state.data.join("caches/middle");
+        let fresh = state.data.join("caches/fresh");
+        for (path, hours) in [(&old, 4), (&middle, 2), (&fresh, 0)] {
+            fs::create_dir(path).unwrap();
+            let content = File::create(path.join("dependency")).unwrap();
+            content.set_len(60).unwrap();
+            content.set_modified(now - UNUSED_RETENTION - Duration::from_secs(1)).unwrap();
+            File::create(cache_marker(path)).unwrap().set_modified(now - Duration::from_secs(hours * 3600)).unwrap();
+        }
+        let blob = state.data.join("blobs/keep");
+        File::create(&blob).unwrap().set_modified(now - Duration::from_secs(3 * 3600)).unwrap();
+        let low_disk_usage = |_: &State| Ok(0.5);
+        collect_garbage(&state, now, cache_limit, &low_disk_usage).unwrap();
+        assert!(!old.exists() && !cache_marker(&old).exists());
+        assert!(!middle.exists() && !cache_marker(&middle).exists(), "a non-cache between LRU caches must not stop budget collection");
+        assert!(blob.exists(), "the cache cap does not evict blobs before their own retention");
+        assert!(fresh.join("dependency").exists() && cache_marker(&fresh).exists(), "the marker protects old dependency files as a whole cache");
+
+        File::options().write(true).open(fresh.join("dependency")).unwrap().set_len(cache_limit + 1).unwrap();
+        collect_garbage(&state, now, cache_limit, &low_disk_usage).unwrap();
+        assert!(fresh.join("dependency").exists(), "minimum age protects even an over-budget recent cache");
+    }
+    #[test]
+    #[cfg(unix)]
+    fn cache_cap_does_not_count_or_follow_links_outside_the_cache() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = state_at(temp.path());
+        let now = SystemTime::now();
+        let external = state.data.join("external");
+        fs::create_dir(&external).unwrap();
+        File::create(external.join("keep")).unwrap().set_len(100).unwrap();
+        let cache = state.data.join("caches/keep");
+        fs::create_dir(&cache).unwrap();
+        fs::write(cache.join("dependency"), "keep").unwrap();
+        symlink(&external, cache.join("linked-directory")).unwrap();
+        symlink(external.join("keep"), cache.join("linked-file")).unwrap();
+        File::create(cache_marker(&cache)).unwrap().set_modified(now - Duration::from_secs(2 * 3600)).unwrap();
+
+        collect_garbage(&state, now, 100, &|_| Ok(0.5)).unwrap();
+        assert!(cache.join("dependency").exists() && cache_marker(&cache).exists(), "external logical bytes do not put this cache over budget");
+        assert!(external.join("keep").exists(), "external files remain untouched");
     }
     #[test]
     fn disk_pressure_evicts_least_recently_used_until_below_the_low_mark() {
@@ -3342,13 +3412,13 @@ mod tests {
             file.set_modified(now - Duration::from_secs(hours * 3600)).unwrap();
         }
         let usage = |state: &State| Ok(if fs::read_dir(state.data.join("blobs")).unwrap().count() == 3 { 0.9 } else { 0.79 });
-        collect_garbage(&state, now, &usage).unwrap();
+        collect_garbage(&state, now, MAX_CACHE_BYTES, &usage).unwrap();
         assert!(!blobs.join("old").exists());
         assert!(blobs.join("mid").exists() && blobs.join("new").exists());
         let full = |_: &State| Ok(0.99);
         let fresh = blobs.join("fresh");
         fs::write(&fresh, "").unwrap();
-        collect_garbage(&state, now, &full).unwrap();
+        collect_garbage(&state, now, MAX_CACHE_BYTES, &full).unwrap();
         assert!(fresh.exists(), "anything used within the minimum age is spared");
     }
     #[test]

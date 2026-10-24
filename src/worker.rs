@@ -296,6 +296,7 @@ pub async fn run(
     {
         let state = state.clone();
         tokio::spawn(async move {
+            collect_in_background(&state).await;
             let mut interval = tokio::time::interval(Duration::from_secs(3600));
             loop {
                 interval.tick().await;
@@ -2834,13 +2835,17 @@ fn cache_size(root: &Path) -> Result<u64> {
     let mut bytes = 0_u64;
     let mut pending = vec![root.to_path_buf()];
     while let Some(path) = pending.pop() {
-        let metadata = fs::symlink_metadata(&path)?;
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
         if crate::platform::is_link(&metadata) {
             continue;
         }
         if metadata.is_dir() {
-            for entry in fs::read_dir(&path)? {
-                pending.push(entry?.path());
+            if let Ok(entries) = fs::read_dir(&path) {
+                for entry in entries.flatten() {
+                    pending.push(entry.path());
+                }
             }
         } else if metadata.is_file() {
             bytes = bytes.saturating_add(metadata.len());

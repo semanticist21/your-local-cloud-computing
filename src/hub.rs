@@ -174,6 +174,13 @@ impl Store {
             CREATE TABLE IF NOT EXISTS tokens (id TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS audit (seq INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS metrics (worker TEXT NOT NULL, at INTEGER NOT NULL, cpu REAL NOT NULL, memory_used INTEGER NOT NULL, memory_total INTEGER NOT NULL, load REAL NOT NULL, disk REAL NOT NULL, PRIMARY KEY(worker, at)) WITHOUT ROWID;")?;
+        // Existing history has no byte counts; zero keeps those samples explicitly unknown.
+        for column in ["disk_used", "disk_total"] {
+            if !db.prepare("SELECT name FROM pragma_table_info('metrics') WHERE name=?1")?
+                .exists([column])? {
+                db.execute(&format!("ALTER TABLE metrics ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"), [])?;
+            }
+        }
         let mut store = Self {
             db,
             blobs: data.join("blobs"),
@@ -315,7 +322,8 @@ impl Store {
         let range = range.clamp(60, METRICS_RETENTION);
         let step = (range / 300).max(15) as i64;
         let mut statement = self.db.prepare(
-            "SELECT at/?3*?3, avg(cpu), avg(memory_used), max(memory_total), avg(load), avg(disk)
+            "SELECT at/?3*?3, avg(cpu), avg(memory_used), max(memory_total), avg(load), avg(disk),
+                    coalesce(avg(CASE WHEN disk_total>0 THEN disk_used END), 0), max(disk_total)
              FROM metrics WHERE worker=?1 AND at>=?2 GROUP BY at/?3 ORDER BY 1",
         )?;
         let rows = statement.query_map(params![worker, (now() - range) as i64, step], |r| {
@@ -326,6 +334,8 @@ impl Store {
                 memory_total: r.get::<_, i64>(3)? as u64,
                 load: r.get(4)?,
                 disk_percent: r.get(5)?,
+                disk_used: r.get::<_, f64>(6)? as u64,
+                disk_total: r.get::<_, i64>(7)? as u64,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1249,8 +1259,8 @@ impl Store {
             WorkerMessage::Metrics { metrics: m } => {
                 let at = now() as i64;
                 self.db.execute(
-                    "INSERT OR REPLACE INTO metrics VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                    params![worker, at, m.cpu_percent, m.memory_used as i64, m.memory_total as i64, m.load, m.disk_percent],
+                    "INSERT OR REPLACE INTO metrics(worker,at,cpu,memory_used,memory_total,load,disk,disk_used,disk_total) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    params![worker, at, m.cpu_percent, m.memory_used as i64, m.memory_total as i64, m.load, m.disk_percent, m.disk_used as i64, m.disk_total as i64],
                 )?;
                 self.db.execute(
                     "DELETE FROM metrics WHERE worker=?1 AND at<?2",
@@ -2937,23 +2947,42 @@ mod tests {
         let old = (now() - METRICS_RETENTION - 60) as i64;
         store
             .db
-            .execute("INSERT INTO metrics VALUES('one',?1,1,1,1,1,1)", [old])
+            .execute("INSERT INTO metrics(worker,at,cpu,memory_used,memory_total,load,disk) VALUES('one',?1,1,1,1,1,1)", [old])
             .unwrap();
-        let metrics = WorkerMetrics { cpu_percent: 40.0, memory_used: 2, memory_total: 8, ..Default::default() };
+        let metrics = WorkerMetrics { cpu_percent: 40.0, memory_used: 2, memory_total: 8, disk_percent: 50.0, disk_used: 40, disk_total: 80, ..Default::default() };
         store.receive("one", session, WorkerMessage::Metrics { metrics }).unwrap();
         let total: i64 = store.db.query_row("SELECT count(*) FROM metrics", [], |r| r.get(0)).unwrap();
         assert_eq!(total, 1, "samples older than the retention are deleted");
         // Two samples inside one 15 s bucket average into one point.
         let bucket = (now() as i64 - 600) / 15 * 15;
-        for (offset, cpu) in [(1, 10.0), (2, 30.0)] {
-            store.db.execute("INSERT INTO metrics VALUES('one',?1,?2,2,8,0,0)", params![bucket + offset, cpu]).unwrap();
+        for (offset, cpu, used) in [(1, 10.0, 20), (2, 30.0, 40)] {
+            store.db.execute("INSERT INTO metrics VALUES('one',?1,?2,2,8,0,50,?3,80)", params![bucket + offset, cpu, used]).unwrap();
         }
+        // An older worker in the same bucket must not dilute known byte counts.
+        store.db.execute("INSERT INTO metrics(worker,at,cpu,memory_used,memory_total,load,disk) VALUES('one',?1,20,2,8,0,50)", [bucket + 3]).unwrap();
         let samples = store.metrics("one", 3600).unwrap();
         assert_eq!(samples.len(), 2);
+        assert_eq!((samples[0].disk_used, samples[0].disk_total), (30, 80));
+        assert_eq!((samples[1].disk_used, samples[1].disk_total), (40, 80));
         assert_eq!((samples[0].at as i64, samples[0].cpu_percent), (bucket, 20.0));
         assert_eq!((samples[1].cpu_percent, samples[1].memory_total), (40.0, 8));
         store.delete_worker("one").unwrap();
         assert!(store.metrics("one", 3600).unwrap().is_empty());
+    }
+    #[test]
+    fn legacy_metrics_history_survives_upgrade_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Connection::open(dir.path().join("hub.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE metrics (worker TEXT NOT NULL, at INTEGER NOT NULL, cpu REAL NOT NULL, memory_used INTEGER NOT NULL, memory_total INTEGER NOT NULL, load REAL NOT NULL, disk REAL NOT NULL, PRIMARY KEY(worker,at)) WITHOUT ROWID;").unwrap();
+        db.execute("INSERT INTO metrics VALUES('old',?1,10,2,8,1,25)", [now() as i64]).unwrap();
+        drop(db);
+        for _ in 0..2 {
+            let store = Store::open(dir.path().to_path_buf(), "token".into()).unwrap();
+            let samples = store.metrics("old", 3600).unwrap();
+            assert_eq!(samples.len(), 1);
+            assert_eq!((samples[0].memory_used, samples[0].memory_total, samples[0].disk_percent), (2, 8, 25.0));
+            assert_eq!((samples[0].disk_used, samples[0].disk_total), (0, 0));
+        }
     }
     #[test]
     fn worker_requirement_selects_only_that_worker() {

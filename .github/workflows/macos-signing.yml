@@ -1,0 +1,31 @@
+name: macOS signing
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [scripts/sign-macos.py, scripts/test-sign-macos.py, .github/workflows/macos-signing.yml]
+permissions:
+  contents: read
+jobs:
+  signing:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 scripts/test-sign-macos.py
+      # The unsigned pre-migration release is an intentional compatibility fixture.
+      - name: Download a checked baseline without rebuilding Rust
+        run: bash scripts/install.sh --version v0.5.5 --prefix "$RUNNER_TEMP/signing-fixture"
+      - name: Sign and notarize the actual CLI
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: python3 scripts/sign-macos.py "$RUNNER_TEMP/signing-fixture/bin/ylcc"
+      - run: '"$RUNNER_TEMP/signing-fixture/bin/ylcc" --version'

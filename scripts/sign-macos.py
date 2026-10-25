@@ -14,6 +14,7 @@ import tempfile
 import zipfile
 
 IDENTIFIER = "com.kobbokkom.ylcc"
+CREDENTIALS = ["APPLE_CERTIFICATE", "APPLE_CERTIFICATE_PASSWORD", "APPLE_ID", "APPLE_PASSWORD", "APPLE_TEAM_ID"]
 
 
 def run(*args, stdin=None, timeout=60):
@@ -22,6 +23,13 @@ def run(*args, stdin=None, timeout=60):
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"{Path(args[0]).name} timed out; output withheld to protect credentials") from None
     if result.returncode:
+        if Path(args[0]).name == "codesign":
+            detail = result.stderr
+            for name in CREDENTIALS:
+                if value := os.environ.get(name):
+                    detail = detail.replace(value, "<redacted>")
+            detail = re.sub(r"Developer ID Application:[^\r\n]+", "Developer ID Application: <redacted>", detail)
+            raise RuntimeError(f"codesign exited {result.returncode}: {detail.strip()}")
         raise RuntimeError(f"{Path(args[0]).name} exited {result.returncode}; output withheld to protect credentials")
     return result
 
@@ -34,8 +42,7 @@ def security(*args):
 
 def sign(binary):
     binary = Path(binary).resolve(strict=True)
-    required = ["APPLE_CERTIFICATE", "APPLE_CERTIFICATE_PASSWORD", "APPLE_ID", "APPLE_PASSWORD", "APPLE_TEAM_ID"]
-    if not all(os.environ.get(name) for name in required):
+    if not all(os.environ.get(name) for name in CREDENTIALS):
         raise ValueError("release signing credentials are missing")
     team = os.environ["APPLE_TEAM_ID"]
     if not re.fullmatch(r"[A-Z0-9]{10}", team):

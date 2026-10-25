@@ -65,6 +65,7 @@ import {
   tokensQuery,
   useNow,
   whoamiQuery,
+  workerUpdateProgress,
   type EnvironmentStatus,
   type JobSummary,
   type JobSearch,
@@ -479,7 +480,7 @@ function WorkerPage() {
 
   return (
     <>
-      <PageHeading title={worker.id} back={back} description={<WorkerState worker={worker} />}><ResumeWorker worker={worker} /></PageHeading>
+      <PageHeading title={worker.id} back={back} description={<WorkerState worker={worker} activeJobs={counts?.active ?? 0} />}><ResumeWorker worker={worker} /></PageHeading>
       <section className="content-section">
         <dl className="detail-grid">
           <Detail label="Platform">{caps.os} · <code>{caps.arch}</code>{caps.abi && <> · <code>{caps.abi}</code></>}</Detail>
@@ -491,7 +492,7 @@ function WorkerPage() {
           <Detail label="Containerized">{caps.containerized ? 'Yes' : 'No'}</Detail>
           <Detail label="CPU features">{caps.cpu_features?.length ? `${caps.cpu_features.length} reported` : 'None reported'}</Detail>
           <Detail label="Command policy">{caps.policy ? <PolicyBadge policy={caps.policy} /> : <span className="muted-text">None (runs any job)</span>}</Detail>
-          <Detail label="YLCC version"><WorkerUpdate worker={worker} /></Detail>
+          <Detail label="YLCC version"><WorkerUpdate worker={worker} activeJobs={counts?.active ?? 0} /></Detail>
         </dl>
       </section>
 
@@ -554,11 +555,11 @@ function WorkersTable({ workers, jobsByWorker }: { workers: WorkerInfo[]; jobsBy
       <tbody>{workers.map((worker) => (
         <tr key={worker.id} className="clickable-row" onClick={() => navigate({ to: '/workers/$workerId', params: { workerId: worker.id } })}>
           <td><div className="worker-name"><span className={`worker-avatar worker-avatar-${worker.capabilities.os}`}>{osGlyph(worker.capabilities.os)}</span><Link className="table-link" to="/workers/$workerId" params={{ workerId: worker.id }}>{worker.id}</Link></div></td>
-          <td onClick={(event) => event.stopPropagation()}><WorkerState worker={worker} />{worker.capabilities.policy && <> <PolicyBadge policy={worker.capabilities.policy} /></>}<ResumeWorker worker={worker} /></td>
+          <td onClick={(event) => event.stopPropagation()}><WorkerState worker={worker} activeJobs={jobsByWorker.get(worker.id) ?? 0} />{worker.capabilities.policy && <> <PolicyBadge policy={worker.capabilities.policy} /></>}<ResumeWorker worker={worker} /></td>
           <td><span className="platform-name">{worker.capabilities.os}</span><span className="platform-arch">{worker.capabilities.arch}</span></td>
           <td><div className="resource-line"><Cpu size={13} /> {worker.capabilities.cpus} CPU <span className="resource-divider">·</span> {formatMemory(worker.capabilities.memory_bytes)}</div></td>
           <td><span className="capacity-value">{jobsByWorker.get(worker.id) ?? 0}<span> / {worker.max_jobs}</span></span></td>
-          <td onClick={(event) => event.stopPropagation()}><WorkerUpdate worker={worker} /></td>
+          <td onClick={(event) => event.stopPropagation()}><WorkerUpdate worker={worker} activeJobs={jobsByWorker.get(worker.id) ?? 0} /></td>
           <td className="time-cell"><RelativeTime timestamp={worker.last_seen} /></td>
         </tr>
       ))}</tbody>
@@ -590,7 +591,7 @@ function ResumeWorker({ worker }: { worker: WorkerInfo }) {
   )
 }
 
-function WorkerUpdate({ worker }: { worker: WorkerInfo }) {
+function WorkerUpdate({ worker, activeJobs }: { worker: WorkerInfo; activeJobs: number }) {
   const queryClient = useQueryClient()
   const whoami = useQuery(whoamiQuery)
   const admin = whoami.data?.role === 'admin'
@@ -600,6 +601,7 @@ function WorkerUpdate({ worker }: { worker: WorkerInfo }) {
   useDisconnectOnAuthError(error)
   const target = release.data?.version
   const current = worker.version?.split('+')[0]
+  const progress = workerUpdateProgress(worker, activeJobs)
   const available = target && (!current || current.localeCompare(target.slice(1), undefined, { numeric: true }) < 0)
   const reason = !available ? '' : worker.capabilities.containerized ? 'This worker runs from a container image, so the dashboard cannot replace its binary. After jobs finish, pull the new release image and recreate the container with its existing data volume.'
     : worker.capabilities.policy?.self_update === false ? 'Self-update is disabled by worker policy.'
@@ -618,8 +620,11 @@ function WorkerUpdate({ worker }: { worker: WorkerInfo }) {
   return (
     <div className="worker-update">
       <code>{worker.version || 'Unknown'}</code>
-      {worker.updating ? (
-        <span className="worker-update-note" role="status"><RefreshCw size={12} className="spin" />{worker.online ? 'Updating' : 'Awaiting reconnection'} to {worker.updating}</span>
+      {progress ? (
+        <span className="worker-update-note" role="status">
+          {progress.phase === 'updating' ? <RefreshCw size={12} className="spin" /> : <Clock3 size={12} />}
+          <span>{progress.detail}{progress.phase === 'draining' && <> <Link className="text-action" to="/jobs" search={{ worker: worker.id }}>View jobs</Link></>}</span>
+        </span>
       ) : admin && (
         <>
           {available && <Button size="sm" variant="outline" disabled={submitting || Boolean(reason)} title={reason || 'Running jobs finish before the worker restarts. You can close this page.'} onClick={() => void update()}>{submitting ? 'Starting…' : `Update to ${target}`}</Button>}
@@ -1114,8 +1119,9 @@ function RelativeTime({ timestamp }: { timestamp: number }) {
   return <time dateTime={new Date(milliseconds).toISOString()} title={formatTime(timestamp)}>{formatRelative(timestamp, now)}</time>
 }
 
-function WorkerState({ worker }: { worker: WorkerInfo }) {
-  if (worker.updating) return <Badge variant="warning"><span className="badge-dot" />Updating</Badge>
+function WorkerState({ worker, activeJobs }: { worker: WorkerInfo; activeJobs: number }) {
+  const progress = workerUpdateProgress(worker, activeJobs)
+  if (progress) return <Badge variant="warning"><span className="badge-dot" />{progress.label}</Badge>
   if (!worker.online) return <Badge variant="muted"><span className="badge-dot" />Offline</Badge>
   if (worker.paused) return <Badge variant="warning"><span className="badge-dot" />Paused</Badge>
   return <Badge variant="success"><span className="badge-dot" />Online</Badge>

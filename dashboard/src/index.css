@@ -298,5 +298,6 @@ select.field { padding-right: 26px; }
 .metric-chart figcaption strong { color: var(--foreground); font-size: 15px; font-variant-numeric: tabular-nums; }
 .section-heading > .range-switch { flex-direction: row; align-items: stretch; gap: 0; flex-shrink: 0; }
 .worker-update { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; max-width: 280px; white-space: normal; overflow-wrap: anywhere; }
-.worker-update-note { display: inline-flex; align-items: center; gap: 5px; color: var(--muted-foreground, #59677b); font-size: 12px; }
+.worker-update-note { display: inline-flex; align-items: baseline; gap: 5px; color: var(--muted-foreground, #59677b); font-size: 12px; }
+.worker-update-note > svg { flex-shrink: 0; align-self: flex-start; margin-top: 2px; }
 .worker-resume { display: inline-flex; flex-direction: column; align-items: flex-start; gap: 4px; margin-left: 8px; }

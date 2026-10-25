@@ -387,7 +387,7 @@ function OverviewPage() {
   const queuedCount = jobList.stats?.states.queued ?? 0
   const failedCount = jobList.stats?.states.failed ?? 0
   const jobsByWorker = countActiveJobs(jobList.stats)
-  const schedulable = onlineWorkers.filter((worker) => !worker.paused)
+  const schedulable = onlineWorkers.filter((worker) => !worker.paused && !worker.updating)
   const totalCapacity = schedulable.reduce((sum, worker) => sum + worker.max_jobs, 0)
   const availableSlots = schedulable.reduce((sum, worker) => sum + Math.max(worker.max_jobs - (jobsByWorker.get(worker.id) ?? 0), 0), 0)
   const readyStatuses = environmentStatuses.filter((status) => status.state === 'ready').length
@@ -404,7 +404,7 @@ function OverviewPage() {
           <Metric icon={<Activity />} label="Active jobs" value={String(activeCount)} note={queuedCount ? `${queuedCount} waiting in queue` : 'Queue is clear'} tone="orange" />
         </Link>
         <div className="metric-item">
-          <Metric icon={<Cpu />} label="Available slots" value={String(availableSlots)} note={`${totalCapacity} on unpaused workers`} tone="green" />
+          <Metric icon={<Cpu />} label="Available slots" value={String(availableSlots)} note={`${totalCapacity} ready to accept jobs`} tone="green" />
         </div>
         <Link className="metric-item metric-link" to="/environments">
           <Metric icon={<Boxes />} label="Ready environments" value={String(readyStatuses)} note={`${environmentStatuses.length} worker installs reported`} tone="slate" />

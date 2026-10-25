@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version="${YLCC_VERSION:-v0.5.7}"
+version="${YLCC_VERSION:-v0.5.8}"
 prefix="${YLCC_PREFIX:-${HOME:?HOME is required}/.local}"
 while (($#)); do
   case "$1" in
     --version) version="${2:?--version requires a value}"; shift 2 ;;
     --prefix) prefix="${2:?--prefix requires a value}"; shift 2 ;;
-    -h|--help) printf 'Usage: install.sh [--version v0.5.7] [--prefix ~/.local]\n'; exit 0 ;;
+    -h|--help) printf 'Usage: install.sh [--version v0.5.8] [--prefix ~/.local]\n'; exit 0 ;;
     *) printf 'Unknown option: %s\n' "$1" >&2; exit 1 ;;
   esac
 done
-case "$version" in v[0-9]*) ;; *) printf 'Expected a release tag such as v0.5.7\n' >&2; exit 1 ;; esac
+case "$version" in v[0-9]*) ;; *) printf 'Expected a release tag such as v0.5.8\n' >&2; exit 1 ;; esac
 [[ "$version" != *[!a-zA-Z0-9._-]* ]] || { printf 'Invalid release tag\n' >&2; exit 1; }
 case "$(uname -s)" in Linux) os=linux ;; Darwin) os=macos ;; *) printf 'Supported systems: Linux and macOS\n' >&2; exit 1 ;; esac
 case "$(uname -m)" in x86_64|amd64) arch=x86_64 ;; arm64|aarch64) arch=aarch64 ;; *) printf 'Supported architectures: x86_64 and arm64\n' >&2; exit 1 ;; esac

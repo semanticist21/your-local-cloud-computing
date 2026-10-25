@@ -24,7 +24,7 @@ use std::{
     io::BufReader,
     path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{io::AsyncWriteExt, sync::mpsc};
 use tokio_util::io::ReaderStream;
@@ -746,6 +746,40 @@ impl Store {
         self.schedule()?;
         Ok(worker)
     }
+    fn start_worker_update(&mut self, id: &str, version: String) -> ApiResult<WorkerInfo> {
+        if !valid_release_version(&version) {
+            return Err(invalid("version must be a release tag such as v0.5.7"));
+        }
+        let mut worker = self.one::<WorkerInfo>("SELECT data FROM workers WHERE id=?1", id)?
+            .ok_or_else(|| missing("worker"))?;
+        let refusal = if worker.capabilities.containerized {
+            Some("container workers require recreation from the new release image")
+        } else if worker.capabilities.policy.as_ref().is_some_and(|policy| !policy.self_update) {
+            Some("self-update is disabled by this worker's policy")
+        } else if !worker.online {
+            Some("worker is offline")
+        } else if worker.version.is_empty() {
+            Some("upgrade this older worker locally before using remote updates")
+        } else if worker.updating.as_ref().is_some_and(|target| target != &version) {
+            Some("worker is already updating to another version")
+        } else { None };
+        if let Some(error) = refusal { return Err(ApiError(StatusCode::CONFLICT, error.into())); }
+        if worker.updating.is_some() || worker.version == version.trim_start_matches('v') {
+            return Ok(worker);
+        }
+        let tx = self.sessions.get(id).ok_or_else(|| ApiError(StatusCode::CONFLICT, "worker connection closed".into()))?.tx.clone();
+        // Persist the scheduling hold before delivery; it survives browser and Hub restarts.
+        worker.updating = Some(version.clone());
+        worker.update_error = None;
+        self.save_worker(&worker)?;
+        if tx.send(HubMessage::Update { version }).is_err() {
+            worker.updating = None;
+            worker.update_error = Some("worker connection closed before update delivery".into());
+            self.save_worker(&worker)?;
+            return Err(ApiError(StatusCode::CONFLICT, worker.update_error.unwrap()));
+        }
+        Ok(worker)
+    }
     fn set_priority(&mut self, id: &str, priority: i32) -> ApiResult<Job> {
         validate_priority(priority).map_err(invalid)?;
         let mut job = self.job(id)?.ok_or_else(|| missing("job"))?;
@@ -878,7 +912,7 @@ impl Store {
         }
         for worker in workers
             .iter()
-            .filter(|worker| worker.online && !worker.paused)
+            .filter(|worker| worker.online && !worker.paused && worker.updating.is_none())
         {
             let Some(tx) = self.sessions.get(&worker.id).filter(|s| !s.reconciling).map(|s| s.tx.clone()) else {
                 continue;
@@ -1172,6 +1206,9 @@ impl Store {
         }
         let session = Uuid::new_v4();
         let previous = self.one::<WorkerInfo>("SELECT data FROM workers WHERE id=?1", &id)?;
+        let updating = previous.as_ref().and_then(|worker| worker.updating.clone())
+            .filter(|target| version != target.trim_start_matches('v'));
+        let update_error = previous.as_ref().and_then(|worker| worker.update_error.clone());
         let mut settings = match previous {
             Some(worker) => self.worker_settings(&worker)?,
             None => WorkerSettings::default(),
@@ -1201,7 +1238,8 @@ impl Store {
             online: true,
             last_seen: now(),
             version,
-            update_error: None,
+            updating,
+            update_error,
         })?;
         let reported: BTreeSet<_> = attempts
             .iter()
@@ -1399,6 +1437,7 @@ impl Store {
             }
             WorkerMessage::UpdateFailed { error } => {
                 if let Some(mut info) = self.one::<WorkerInfo>("SELECT data FROM workers WHERE id=?1", worker)? {
+                    info.updating = None;
                     info.update_error = Some(error);
                     self.save_worker(&info)?;
                 }
@@ -1563,6 +1602,7 @@ fn router(state: Shared) -> Router {
         .route("/v1/workers/{id}", axum::routing::delete(delete_worker))
         .route("/v1/workers/{id}/control", post(control_worker))
         .route("/v1/workers/{id}/update", post(update_worker))
+        .route("/v1/releases/latest", get(latest_release))
         .route("/v1/environments/{id}", axum::routing::delete(delete_environment))
         .route("/v1/tokens", get(tokens).post(create_token))
         .route("/v1/jobs/{id}", axum::routing::delete(delete_job))
@@ -1828,33 +1868,22 @@ async fn update_worker(
     Path(id): Path<String>,
     Json(request): Json<UpdateRequest>,
 ) -> ApiResult<Json<WorkerInfo>> {
-    let version = request.version;
-    if !version.starts_with('v')
-        || version.len() > 64
-        || !version[1..].bytes().all(|c| c.is_ascii_alphanumeric() || c == b'.' || c == b'-')
-    {
-        return Err(invalid("version must be a release tag such as v0.4.6"));
-    }
     let mut store = lock(&state)?;
-    let mut worker = store
-        .one::<WorkerInfo>("SELECT data FROM workers WHERE id=?1", &id)?
-        .ok_or_else(|| missing("worker"))?;
-    if worker.capabilities.containerized {
-        return Err(ApiError(
-            StatusCode::CONFLICT,
-            "container workers update by recreating the container from the new release image".into(),
-        ));
-    }
-    let Some(session) = store.sessions.get(&id).filter(|_| worker.online) else {
-        return Err(ApiError(StatusCode::CONFLICT, "worker is offline".into()));
-    };
-    if session.tx.send(HubMessage::Update { version: version.clone() }).is_err() {
-        return Err(ApiError(StatusCode::CONFLICT, "worker connection closed".into()));
-    }
-    worker.update_error = None;
-    store.save_worker(&worker)?;
-    store.record(&principal, "worker.update", &id, Some(version));
+    let worker = store.start_worker_update(&id, request.version.clone())?;
+    store.record(&principal, "worker.update", &id, Some(request.version));
     Ok(Json(worker))
+}
+async fn latest_release() -> ApiResult<Json<UpdateRequest>> {
+    static CACHE: std::sync::LazyLock<tokio::sync::Mutex<Option<(Instant, String)>>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
+    let mut cache = CACHE.lock().await;
+    if let Some((_, version)) = cache.as_ref().filter(|(at, _)| at.elapsed() < Duration::from_secs(300)) {
+        return Ok(Json(UpdateRequest { version: version.clone() }));
+    }
+    let version = crate::client::resolve_latest_release_version().await
+        .map_err(|error| ApiError(StatusCode::BAD_GATEWAY, format!("cannot check the latest release: {error:#}")))?;
+    *cache = Some((Instant::now(), version.clone()));
+    Ok(Json(UpdateRequest { version }))
 }
 async fn set_priority(
     State(state): State<Shared>,
@@ -2488,6 +2517,77 @@ mod tests {
             )
             .unwrap();
         store.schedule().unwrap();
+    }
+
+    #[test]
+    fn updates_hold_assignments_survive_restart_and_preserve_operator_pause() {
+        for paused in [false, true] {
+            let (dir, mut store) = test_store();
+            let (_session, mut rx) = worker(&mut store, "one");
+            let mut info = store.workers().unwrap().remove(0);
+            info.version = "0.5.5".into();
+            store.save_worker(&info).unwrap();
+            let running = store.add_job(spec(), None).unwrap();
+            assert!(matches!(rx.try_recv().unwrap(), HubMessage::Run { .. }));
+            store.control_worker("one", WorkerControl { paused: Some(paused), ..Default::default() }).unwrap();
+            store.start_worker_update("one", "v0.5.7".into()).unwrap();
+            assert!(matches!(rx.try_recv().unwrap(), HubMessage::Update { version } if version == "v0.5.7"));
+            store.start_worker_update("one", "v0.5.7".into()).unwrap();
+            assert!(rx.try_recv().is_err());
+            assert_eq!(store.start_worker_update("one", "v0.5.8".into()).unwrap_err().0, StatusCode::CONFLICT);
+            let queued = store.add_job(spec(), None).unwrap();
+            finish(&mut store, &running);
+            assert_eq!(store.job(&queued.id).unwrap().unwrap().state, "queued");
+            assert!(rx.try_recv().is_err());
+            drop(store);
+            let mut store = Store::open(dir.path().into(), "test-token-long-enough".into()).unwrap();
+            assert_eq!(store.workers().unwrap()[0].updating.as_deref(), Some("v0.5.7"));
+            // A network reconnect on the old version is not update completion.
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            store.connect("one".into(), caps(), 1, vec![], vec![], "0.5.5".into(), tx, &pool_principal(), false).unwrap();
+            assert!(store.workers().unwrap()[0].updating.is_some());
+            assert!(rx.try_recv().is_err());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            store.connect("one".into(), caps(), 1, vec![], vec![], "0.5.7".into(), tx, &pool_principal(), false).unwrap();
+            let info = store.workers().unwrap().remove(0);
+            assert!(info.updating.is_none());
+            assert_eq!(info.paused, paused);
+            assert_eq!(store.job(&queued.id).unwrap().unwrap().state, if paused { "queued" } else { "assigned" });
+            assert_eq!(rx.try_recv().is_ok(), !paused);
+        }
+    }
+
+    #[test]
+    fn failed_updates_release_the_hold_and_refuse_unsupported_workers() {
+        let (_dir, mut store) = test_store();
+        let (session, mut rx) = worker(&mut store, "one");
+        let mut info = store.workers().unwrap().remove(0);
+        info.version = "0.5.5".into();
+        store.save_worker(&info).unwrap();
+        for tag in ["", "v", "../v1", "v1/../../x", "v한글"] {
+            assert_eq!(store.start_worker_update("one", tag.into()).unwrap_err().0, StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        store.start_worker_update("one", "v0.5.7".into()).unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), HubMessage::Update { .. }));
+        let queued = store.add_job(spec(), None).unwrap();
+        store.receive("one", session, WorkerMessage::UpdateFailed { error: "checksum mismatch".into() }).unwrap();
+        let mut info = store.workers().unwrap().remove(0);
+        assert!(info.updating.is_none());
+        assert_eq!(info.update_error.as_deref(), Some("checksum mismatch"));
+        assert_eq!(store.job(&queued.id).unwrap().unwrap().state, "assigned");
+        assert!(matches!(rx.try_recv().unwrap(), HubMessage::Run { .. }));
+        for (online, containerized) in [(false, false), (true, true)] {
+            info.online = online;
+            info.capabilities.containerized = containerized;
+            store.save_worker(&info).unwrap();
+            assert_eq!(store.start_worker_update("one", "v0.5.7".into()).unwrap_err().0, StatusCode::CONFLICT);
+        }
+        info.online = true;
+        info.capabilities.containerized = false;
+        info.capabilities.policy = Some(crate::policy::Policy::parse("version: 1\nself_update: false\n").unwrap());
+        store.save_worker(&info).unwrap();
+        assert_eq!(store.start_worker_update("one", "v0.5.7".into()).unwrap_err().0, StatusCode::CONFLICT);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -3222,6 +3322,7 @@ mod tests {
             online: true,
             last_seen: now(),
             version: String::new(),
+            updating: None,
             update_error: None,
         };
         let mut job = spec();
@@ -3290,6 +3391,7 @@ mod tests {
             online: true,
             last_seen: now(),
             version: String::new(),
+            updating: None,
             update_error: None,
         };
         let mut job = spec();
@@ -3702,6 +3804,9 @@ mod tests {
             ("DELETE", "/v1/environments/x", Some(laptop.as_str()), StatusCode::FORBIDDEN),
             ("GET", "/v1/tokens", Some(laptop.as_str()), StatusCode::FORBIDDEN),
             ("GET", "/v1/audit", Some(laptop.as_str()), StatusCode::FORBIDDEN),
+            ("GET", "/v1/releases/latest", None, StatusCode::UNAUTHORIZED),
+            ("GET", "/v1/releases/latest", Some(laptop.as_str()), StatusCode::FORBIDDEN),
+            ("GET", "/v1/releases/latest", Some(builder.as_str()), StatusCode::FORBIDDEN),
             ("GET", "/v1/tokens", pool, StatusCode::OK),
             ("GET", "/v1/audit?limit=5", pool, StatusCode::OK),
             ("GET", "/v1/audit?bogus=1", pool, StatusCode::BAD_REQUEST),
@@ -3712,6 +3817,9 @@ mod tests {
         ] {
             let (status, body) = call(&app, method, uri, token, "").await;
             assert_eq!(status, expected, "{method} {uri} with {token:?}: {body}");
+        }
+        for token in [Some(laptop.as_str()), Some(builder.as_str())] {
+            assert_eq!(call(&app, "POST", "/v1/workers/w1/update", token, r#"{"version":"v0.5.7"}"#).await.0, StatusCode::FORBIDDEN);
         }
         let (status, body) = call(&app, "GET", "/v1/whoami", Some(&laptop), "").await;
         assert_eq!(status, StatusCode::OK);

@@ -32,6 +32,9 @@ export type WorkerInfo = {
   paused: boolean
   online: boolean
   last_seen: number
+  version?: string
+  updating?: string | null
+  update_error?: string | null
 }
 
 export type FileEntry = { path: string; hash: string; size: number; mode: number }
@@ -231,6 +234,13 @@ async function get<T>(path: string): Promise<T> {
 }
 
 export const pollMs = 5000
+
+export const latestReleaseQuery = queryOptions({
+  queryKey: ['latest-release'],
+  queryFn: () => get<{ version: string }>('/v1/releases/latest'),
+  staleTime: 300_000,
+  retry: 1,
+})
 
 export const snapshotQuery = queryOptions({
   queryKey: ['snapshot'],

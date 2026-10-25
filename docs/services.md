@@ -56,7 +56,8 @@ Workers follow the usual CI/cluster retention rules, without configuration:
 
 - An attempt's checkout, `TMPDIR`/`TMP`/`TEMP` directory and private environment are removed as soon as it finishes and its outputs are uploaded. Its journal and logs stay for 3 days; `unknown` attempts stay until reconciled.
 - Input blobs, task caches and environment revisions unused for 7 days are removed, like GitHub Actions cache eviction.
-- When the data filesystem is over 85% full, the least recently used of those go first until it is under 80%, as the kubelet does for images. Anything used within the last hour is never evicted, so a disk filled by something else does not make every job rebuild.
+- Task caches over 100 GiB trigger eviction of whole caches, oldest first, even if recently used. This is a cleanup trigger, not a job admission limit.
+- When the data filesystem is over 85% full, the least recently used of those go first until it is under 80%, as the kubelet does for images. Entries used within the last hour are spared unless task caches exceed their own cap, so a disk filled by something else does not make every job rebuild.
 - Deleting an environment from the catalogue removes its files from connected workers immediately; offline workers drop them by age.
 
-Collection runs hourly, after each attempt and at startup, and only while the worker is idle. An evicted environment is prepared again by the next job that needs it.
+Collection runs hourly, after each attempt and at startup. Busy workers skip routine collection; under disk pressure, collection waits for active work to finish and runs before later attempts. An evicted environment is prepared again by the next job that needs it.

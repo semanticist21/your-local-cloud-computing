@@ -333,6 +333,10 @@ pub struct WorkerMetrics {
     pub load: f64,
     /// Used fraction of the worker data directory's filesystem, 0 to 100.
     pub disk_percent: f64,
+    #[serde(default)]
+    pub disk_used: u64,
+    #[serde(default)]
+    pub disk_total: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -584,6 +588,13 @@ mod tests {
             })
             .is_empty()
         );
+    }
+    #[test]
+    fn older_worker_metrics_have_unknown_disk_bytes() {
+        let metrics: WorkerMetrics = serde_json::from_value(serde_json::json!({
+            "cpu_percent":10, "memory_used":2, "memory_total":8, "load":1, "disk_percent":25
+        })).unwrap();
+        assert_eq!((metrics.disk_used, metrics.disk_total), (0, 0));
     }
     #[test]
     fn priorities_are_bounded_and_old_records_default_to_normal() {

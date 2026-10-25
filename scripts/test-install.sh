@@ -41,7 +41,7 @@ while (($#)); do
   esac
 done
 case "$url" in
-  https://github.com/semanticist21/your-local-cloud-computing/releases/download/v0.5.4/*) ;;
+  https://github.com/semanticist21/your-local-cloud-computing/releases/download/v0.5.5/*) ;;
   *) printf 'Unexpected release URL: %s\n' "$url" >&2; exit 1 ;;
 esac
 cp "$TEST_RELEASE/${url##*/}" "$destination"

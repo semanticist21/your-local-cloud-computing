@@ -650,13 +650,16 @@ impl Sampler {
         };
         self.cpu = cpu;
         let (memory_used, memory_total) = memory_usage().unwrap_or_default();
+        let (disk_used, disk_total) = crate::platform::disk_space(data).unwrap_or_default();
         WorkerMetrics {
             at: 0,
             cpu_percent,
             memory_used,
             memory_total,
             load: load_average().unwrap_or_default(),
-            disk_percent: crate::platform::disk_usage(data).map_or(0.0, |used| used * 100.0),
+            disk_percent: if disk_total > 0 { disk_used as f64 * 100.0 / disk_total as f64 } else { 0.0 },
+            disk_used,
+            disk_total,
         }
     }
 }
@@ -3428,6 +3431,8 @@ mod tests {
         assert!((0.0..=100.0).contains(&metrics.cpu_percent), "{metrics:?}");
         assert!(metrics.memory_total > 0 && metrics.memory_used > 0, "{metrics:?}");
         assert!(metrics.memory_used <= metrics.memory_total, "{metrics:?}");
+        assert!(metrics.disk_total > 0 && metrics.disk_used <= metrics.disk_total, "{metrics:?}");
+        assert!((metrics.disk_percent - metrics.disk_used as f64 * 100.0 / metrics.disk_total as f64).abs() < 0.001);
         assert!(metrics.disk_percent > 0.0 && metrics.disk_percent <= 100.0, "{metrics:?}");
     }
     #[tokio::test]

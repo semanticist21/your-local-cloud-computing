@@ -254,6 +254,8 @@ export type WorkerMetrics = {
   memory_total: number
   load: number
   disk_percent: number
+  disk_used?: number
+  disk_total?: number
 }
 
 /** Averaged samples for the last `range` seconds; workers report every 15 s. */

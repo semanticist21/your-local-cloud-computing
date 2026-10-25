@@ -13,6 +13,7 @@ type Series = {
   title: string
   value: (sample: WorkerMetrics) => number
   format: (value: number) => string
+  details?: (sample: WorkerMetrics) => string | undefined
   max?: number
 }
 
@@ -26,12 +27,13 @@ export default function WorkerMetricsCharts({ workerId, os }: { workerId: string
     { title: 'CPU', value: (s) => s.cpu_percent, format: (v) => `${v.toFixed(0)}%`, max: 100 },
     {
       title: 'Memory',
+      details: (s) => s.memory_total ? `${formatBytes(s.memory_used)} / ${formatBytes(s.memory_total)}` : undefined,
       value: (s) => (s.memory_total ? (s.memory_used / s.memory_total) * 100 : 0),
       format: (v) => `${v.toFixed(0)}%`,
       max: 100,
     },
     ...(os === 'windows' ? [] : [{ title: 'Load (1 min)', value: (s: WorkerMetrics) => s.load, format: (v: number) => v.toFixed(2) }]),
-    { title: 'Disk', value: (s) => s.disk_percent, format: (v) => `${v.toFixed(0)}%`, max: 100 },
+    { title: 'Disk', value: (s) => s.disk_percent, format: (v) => `${v.toFixed(0)}%`, details: (s) => s.disk_total ? `${formatBytes(s.disk_used ?? 0)} / ${formatBytes(s.disk_total)}` : undefined, max: 100 },
   ]
   const tick = (at: number) =>
     new Intl.DateTimeFormat('en', range > 86400 ? { month: 'short', day: 'numeric' } : { hour: '2-digit', minute: '2-digit' }).format(new Date(at * 1000))
@@ -58,7 +60,7 @@ export default function WorkerMetricsCharts({ workerId, os }: { workerId: string
       ) : (
         <div className="metrics-grid">
           {series.map((item) => {
-            const data = samples.map((sample) => ({ at: sample.at, value: item.value(sample) }))
+            const data = samples.map((sample) => ({ ...sample, value: item.value(sample) }))
             return (
               <figure key={item.title} className="metric-chart">
                 <figcaption>
@@ -72,7 +74,10 @@ export default function WorkerMetricsCharts({ workerId, os }: { workerId: string
                     <YAxis domain={[0, item.max ?? 'auto']} ticks={item.max ? [0, 50, 100] : undefined} width={34} tick={{ fontSize: 10, fill: '#718094' }} tickLine={false} axisLine={false} tickFormatter={(v: number) => (item.max ? `${v}%` : `${v}`)} />
                     <Tooltip
                       labelFormatter={(at) => new Date(Number(at) * 1000).toLocaleString()}
-                      formatter={(value) => [item.format(Number(value)), item.title]}
+                      formatter={(value, _name, entry) => {
+                        const details = item.details?.(entry.payload)
+                        return [`${item.format(Number(value))}${details ? ` · ${details}` : ''}`, item.title]
+                      }}
                       contentStyle={{ fontSize: 12, borderRadius: 5, borderColor: '#dce2e9' }}
                     />
                     <Area type="monotone" dataKey="value" stroke="#1759a8" strokeWidth={1.5} fill="#1759a8" fillOpacity={0.12} isAnimationActive={false} />

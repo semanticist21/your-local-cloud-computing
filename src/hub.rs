@@ -2081,7 +2081,8 @@ async fn worker_socket(
     Extension(principal): Extension<Principal>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    ws.max_message_size(2 * 1024 * 1024)
+    // Reconnect snapshots aggregate retained results; allow the bounded WebSocket default.
+    ws.max_message_size(64 * 1024 * 1024)
         .on_upgrade(move |socket| socket_loop(state, socket, principal))
 }
 async fn socket_loop(state: Shared, mut socket: WebSocket, principal: Principal) {
@@ -2169,6 +2170,10 @@ async fn socket_loop(state: Shared, mut socket: WebSocket, principal: Principal)
             incoming = stream.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
+                        if text.len() > 2 * 1024 * 1024 {
+                            eprintln!("worker message rejected: live event exceeds 2 MiB");
+                            break;
+                        }
                         last_message = Instant::now();
                         let result = match serde_json::from_str::<WorkerMessage>(&text) {
                             Ok(message) => match state.lock() { Ok(mut store) => store.receive(&worker_id, session, message), Err(_) => break },
@@ -3048,6 +3053,60 @@ mod tests {
             .unwrap();
         store.schedule().unwrap();
         assert_eq!(store.job(&queued.id).unwrap().unwrap().state, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn large_reconnect_snapshots_preserve_outcomes_without_enlarging_live_events() {
+        use tokio_tungstenite::tungstenite::{Message as ClientMessage, client::IntoClientRequest};
+
+        let (_dir, mut store) = test_store();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = store.connect("one".into(), caps(), 4, vec![], vec![], "old".into(), tx, &pool_principal()).unwrap();
+        let reports: Vec<_> = (0..4).map(|_| {
+            let job = store.add_job(spec(), None).unwrap();
+            AttemptReport {
+                job_id: job.id,
+                attempt_id: job.attempt_id,
+                state: "failed".into(),
+                exit_code: Some(1),
+                error: Some("x".repeat(768 * 1024)),
+                results: vec![],
+            }
+        }).collect();
+        store.disconnect("one", session).unwrap();
+        let state = Arc::new(Mutex::new(store));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut request = format!("ws://{}/v1/worker/ws", listener.local_addr().unwrap()).into_client_request().unwrap();
+        request.headers_mut().insert("Authorization", "Bearer test-token-long-enough".parse().unwrap());
+        let server_state = state.clone();
+        let server = tokio::spawn(async move { axum::serve(listener, router(server_state)).await.unwrap() });
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let hello = encode(&WorkerMessage::Hello {
+            worker_id: "one".into(), capabilities: caps(), max_jobs: 4,
+            attempts: reports.clone(), environments: vec![], version: "new".into(),
+        }).unwrap();
+        assert!(hello.len() > 2 * 1024 * 1024);
+        socket.send(ClientMessage::Text(hello.into())).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !state.lock().unwrap().workers().unwrap()[0].online {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("a recent result snapshot must not prevent reconnecting");
+        for report in &reports {
+            let job = state.lock().unwrap().job(&report.job_id).unwrap().unwrap();
+            assert_eq!(job.state, "failed");
+            assert_eq!(job.error, report.error);
+        }
+
+        let oversized = encode(&WorkerMessage::UpdateFailed { error: "x".repeat(3 * 1024 * 1024) }).unwrap();
+        socket.send(ClientMessage::Text(oversized.into())).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.lock().unwrap().workers().unwrap()[0].online {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("oversized live events must still be rejected");
+        assert!(state.lock().unwrap().workers().unwrap()[0].update_error.is_none());
+        server.abort();
     }
 
     #[tokio::test]

@@ -2930,10 +2930,12 @@ enum Reclaimable {
     Environment(Option<EnvironmentStatus>),
 }
 
-/// Waits for active work to drain, blocking later admissions until collection finishes.
+/// Skips busy workers so background collection never queues ahead of new attempts.
 /// Expired entries always go; under disk pressure or the cache cap, oldest first.
 fn collect_garbage(state: &State, now: SystemTime, cache_limit: u64, usage: &dyn Fn(&State) -> Result<f64>) -> Result<()> {
-    let _drain = state.drain.blocking_write();
+    let Ok(_drain) = state.drain.try_write() else {
+        return Ok(());
+    };
     let attempts: Vec<_> = state.attempts.lock().unwrap().iter().map(|(id, attempt)| (id.clone(), attempt.clone())).collect();
     let age = |time: Option<SystemTime>| time.and_then(|time| now.duration_since(time).ok()).unwrap_or_default();
     for (id, attempt) in &attempts {
@@ -3297,9 +3299,7 @@ mod tests {
         assert_eq!(status.state, "evicted");
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn queued_collection_drains_active_work_before_later_admissions() {
-        use futures_util::FutureExt;
-
+    async fn busy_collection_skips_without_blocking_later_admissions() {
         let temp = tempfile::tempdir().unwrap();
         let state = state_at(temp.path());
         let now = SystemTime::now();
@@ -3319,7 +3319,7 @@ mod tests {
             .unwrap();
         let workspace = state.data.join("workspaces/active");
         fs::create_dir(&workspace).unwrap();
-        fs::write(workspace.join("in-use"), "keep until drained").unwrap();
+        fs::write(workspace.join("in-use"), "keep until idle").unwrap();
         let assigned = attempt_at(temp.path(), "queued");
         fs::write(assigned.dir.join("job.json"), "queued input").unwrap();
         state.attempts.lock().unwrap().insert("queued".into(), assigned.clone());
@@ -3332,23 +3332,16 @@ mod tests {
                 collect_garbage(&state, now, MAX_CACHE_BYTES, &|_| Ok(if old.exists() { 0.9 } else { 0.79 }))
             })
         };
-        // With a reader held, try_read only fails once the fair writer has queued.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while state.drain.try_read().is_ok() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        let later_admission = state.drain.read();
-        tokio::pin!(later_admission);
-        assert!(later_admission.as_mut().now_or_never().is_none());
+        let collected = tokio::time::timeout(Duration::from_secs(5), collector).await;
+        let later_admission = state.drain.try_read();
         assert!(old.exists() && fresh.join("dependency").exists() && workspace.join("in-use").exists());
         assert!(assigned.dir.join("job.json").exists() && assigned.dir.join("journal.json").exists());
 
         drop(active);
-        let _later = tokio::time::timeout(Duration::from_secs(5), later_admission).await.unwrap();
-        collector.await.unwrap().unwrap();
+        collected.expect("collection must skip a busy worker").unwrap().unwrap();
+        let later = later_admission.expect("collection must leave free slots usable");
+        drop(later);
+        collect_garbage(&state, now, MAX_CACHE_BYTES, &|_| Ok(if old.exists() { 0.9 } else { 0.79 })).unwrap();
         assert!(!old.exists() && !cache_marker(&old).exists() && !workspace.exists());
         assert!(fresh.join("dependency").exists() && cache_marker(&fresh).exists(), "a fresh cache marker protects even old dependency files");
         assert_eq!(assigned.report().state, "assigned");

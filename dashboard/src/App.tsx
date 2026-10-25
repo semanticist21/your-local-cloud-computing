@@ -46,6 +46,7 @@ import {
   dashboardPasswordStatus,
   hashPassword,
   post,
+  pollMs,
   ForbiddenError,
   errorMessage,
   formatBytes,
@@ -55,7 +56,7 @@ import {
   formatTime,
   jobLogsQuery,
   jobQuery,
-  jobPageSize,
+  jobListQuery,
   jobsHistoryQuery,
   readToken,
   snapshotQuery,
@@ -64,7 +65,9 @@ import {
   useNow,
   whoamiQuery,
   type EnvironmentStatus,
-  type Job,
+  type JobSummary,
+  type JobSearch,
+  type JobStats,
   type Role,
   type WorkerInfo,
   type WorkerPolicy,
@@ -76,7 +79,6 @@ const jobStates = ['queued', 'assigned', 'running', 'cancelling', 'succeeded', '
 
 // ---------- Routes ----------
 
-type JobSearch = { q?: string; state?: string; worker?: string }
 const optionalString = (value: unknown) => (typeof value === 'string' && value ? value : undefined)
 
 const rootRoute = createRootRouteWithContext<{ disconnect: (message?: string) => void }>()({ component: Shell })
@@ -266,7 +268,7 @@ function Shell() {
         <nav className="nav-list" aria-label="Dashboard views">
           <NavLink to="/" icon={<LayoutDashboard />} label="Overview" exact />
           <NavLink to="/workers" icon={<Server />} label="Workers" count={data?.workers.length} />
-          <NavLink to="/jobs" icon={<Activity />} label="Jobs" count={data?.jobs.length} />
+          <NavLink to="/jobs" icon={<Activity />} label="Jobs" count={data?.jobList.total} />
           <NavLink to="/environments" icon={<Boxes />} label="Environments" count={data?.environments.length} />
           {principal?.role === 'admin' && (
             <>
@@ -377,12 +379,13 @@ function PageHeading({ title, description, back, children }: { title: ReactNode;
 // ---------- Overview ----------
 
 function OverviewPage() {
-  const { workers, jobs, environmentStatuses } = useSnapshot()
+  const { workers, jobList, environmentStatuses } = useSnapshot()
+  const jobs = jobList.jobs
   const onlineWorkers = workers.filter((worker) => worker.online)
-  const activeJobs = jobs.filter((job) => activeJobStates.has(job.state))
-  const queuedCount = jobs.filter((job) => job.state === 'queued').length
-  const failedCount = jobs.filter((job) => job.state === 'failed').length
-  const jobsByWorker = countActiveJobs(jobs)
+  const activeCount = (jobList.stats?.states.assigned ?? 0) + (jobList.stats?.states.running ?? 0)
+  const queuedCount = jobList.stats?.states.queued ?? 0
+  const failedCount = jobList.stats?.states.failed ?? 0
+  const jobsByWorker = countActiveJobs(jobList.stats)
   const schedulable = onlineWorkers.filter((worker) => !worker.paused)
   const totalCapacity = schedulable.reduce((sum, worker) => sum + worker.max_jobs, 0)
   const availableSlots = schedulable.reduce((sum, worker) => sum + Math.max(worker.max_jobs - (jobsByWorker.get(worker.id) ?? 0), 0), 0)
@@ -397,7 +400,7 @@ function OverviewPage() {
           <Metric icon={<Server />} label="Online workers" value={`${onlineWorkers.length} / ${workers.length}`} note={workers.length ? `${workers.length - onlineWorkers.length} offline` : 'No workers registered'} tone="blue" />
         </Link>
         <Link className="metric-item metric-link" to="/jobs" search={{ state: 'active' }}>
-          <Metric icon={<Activity />} label="Active jobs" value={String(activeJobs.length)} note={queuedCount ? `${queuedCount} waiting in queue` : 'Queue is clear'} tone="orange" />
+          <Metric icon={<Activity />} label="Active jobs" value={String(activeCount)} note={queuedCount ? `${queuedCount} waiting in queue` : 'Queue is clear'} tone="orange" />
         </Link>
         <div className="metric-item">
           <Metric icon={<Cpu />} label="Available slots" value={String(availableSlots)} note={`${totalCapacity} on unpaused workers`} tone="green" />
@@ -422,7 +425,7 @@ function OverviewPage() {
       </section>
 
       <section className="content-section">
-        <SectionHeading title="Recent jobs" detail={`${jobs.length} total`} action={<Link className="text-action" to="/jobs">All jobs<span aria-hidden="true">→</span></Link>} />
+        <SectionHeading title="Recent jobs" detail={`${jobList.total} total`} action={<Link className="text-action" to="/jobs">All jobs<span aria-hidden="true">→</span></Link>} />
         {recentJobs.length ? <JobsTable jobs={recentJobs} /> : (
           <EmptyState icon={<Terminal />} title="No jobs yet" detail="Jobs submitted to this pool will appear here." />
         )}
@@ -431,25 +434,21 @@ function OverviewPage() {
   )
 }
 
-function countActiveJobs(jobs: Job[]) {
-  const counts = new Map<string, number>()
-  for (const job of jobs) {
-    if (job.worker_id && activeJobStates.has(job.state)) counts.set(job.worker_id, (counts.get(job.worker_id) ?? 0) + 1)
-  }
-  return counts
+function countActiveJobs(stats: JobStats | undefined) {
+  return new Map(Object.entries(stats?.workers ?? {}).map(([worker, counts]) => [worker, counts.active]))
 }
 
 // ---------- Workers ----------
 
 function WorkersPage() {
-  const { workers, jobs } = useSnapshot()
+  const { workers, jobList } = useSnapshot()
   const sorted = [...workers].sort((a, b) => Number(b.online) - Number(a.online) || a.id.localeCompare(b.id))
   return (
     <>
       <PageHeading title="Workers" description="Connected machines and their available capacity." />
       <section className="content-section">
         <SectionHeading title="Registered workers" detail={`${workers.filter((worker) => worker.online).length} online now`} />
-        {workers.length ? <WorkersTable workers={sorted} jobsByWorker={countActiveJobs(jobs)} /> : (
+        {workers.length ? <WorkersTable workers={sorted} jobsByWorker={countActiveJobs(jobList.stats)} /> : (
           <EmptyState icon={<Server />} title="No workers registered" detail="Workers appear after they connect to this Hub." />
         )}
       </section>
@@ -459,7 +458,8 @@ function WorkersPage() {
 
 function WorkerPage() {
   const { workerId } = workerRoute.useParams()
-  const { workers, jobs, environmentStatuses } = useSnapshot()
+  const { workers, jobList, environmentStatuses } = useSnapshot()
+  const history = useQuery(jobListQuery({ worker: workerId }))
   const worker = workers.find((candidate) => candidate.id === workerId)
   const back = <Link className="back-link" to="/workers"><ArrowLeft size={14} /> Workers</Link>
   if (!worker) {
@@ -471,8 +471,8 @@ function WorkerPage() {
     )
   }
   const caps = worker.capabilities
-  const workerJobs = jobs.filter((job) => job.worker_id === worker.id).sort((a, b) => b.updated_at - a.updated_at)
-  const active = workerJobs.filter((job) => activeJobStates.has(job.state))
+  const workerJobs = [...(history.data?.jobs ?? [])].sort((a, b) => b.updated_at - a.updated_at)
+  const counts = jobList.stats?.workers[worker.id]
   const statuses = environmentStatuses.filter((status) => status.worker_id === worker.id)
   const tools = Object.entries(caps.tools).sort(([a], [b]) => a.localeCompare(b))
 
@@ -483,7 +483,7 @@ function WorkerPage() {
         <dl className="detail-grid">
           <Detail label="Platform">{caps.os} · <code>{caps.arch}</code>{caps.abi && <> · <code>{caps.abi}</code></>}</Detail>
           <Detail label="Resources">{caps.cpus} CPU · {formatMemory(caps.memory_bytes)}</Detail>
-          <Detail label="Running jobs">{active.length} / {worker.max_jobs}</Detail>
+          <Detail label="Running jobs">{counts?.active ?? 0} / {worker.max_jobs}</Detail>
           <Detail label="Last seen"><RelativeTime timestamp={worker.last_seen} /></Detail>
           <Detail label="GPU">{caps.gpu.length ? caps.gpu.join(', ') : 'None'}</Detail>
           <Detail label="Runtimes">{caps.runtimes.length ? caps.runtimes.join(', ') : 'None'}</Detail>
@@ -502,10 +502,14 @@ function WorkerPage() {
       <section className="content-section">
         <SectionHeading
           title="Jobs on this worker"
-          detail={`${active.length} active · ${workerJobs.length} total`}
+          detail={`${counts?.active ?? 0} active · ${counts?.total ?? 0} total`}
           action={workerJobs.length > 0 && <Link className="text-action" to="/jobs" search={{ worker: worker.id }}>View in jobs<span aria-hidden="true">→</span></Link>}
         />
-        {workerJobs.length ? <JobsTable jobs={workerJobs.slice(0, 10)} /> : (
+        {history.isPending ? <LoadingState compact /> : history.isError && !history.data ? (
+          <EmptyState icon={<CircleAlert />} title="Could not load jobs" detail={errorMessage(history.error)}>
+            <Button variant="outline" onClick={() => void history.refetch()}>Try again</Button>
+          </EmptyState>
+        ) : workerJobs.length ? <JobsTable jobs={workerJobs.slice(0, 10)} /> : (
           <EmptyState icon={<Terminal />} title="No jobs yet" detail="Jobs assigned to this worker will appear here." />
         )}
       </section>
@@ -591,14 +595,30 @@ function JobsPage() {
   const snapshot = useSnapshot()
   const workers = snapshot.workers
   const loadMoreRef = useRef<HTMLDivElement>(null)
-  const moreQuery = useInfiniteQuery(jobsHistoryQuery)
-  const hasMore = moreQuery.data ? moreQuery.hasNextPage : snapshot.jobs.length >= jobPageSize
+  const search = jobsRoute.useSearch()
+  const filtering = Boolean(search.q || search.state || search.worker)
+  const moreQuery = useInfiniteQuery({
+    ...jobsHistoryQuery(search),
+    refetchInterval: filtering ? pollMs : false,
+    initialData: filtering ? undefined : () => ({ pages: [snapshot.jobList], pageParams: [0] }),
+  })
+  const queryClient = useQueryClient()
+  useEffect(() => {
+    if (filtering) return
+    queryClient.setQueryData(jobsHistoryQuery().queryKey, (previous) => previous && ({
+      ...previous,
+      pages: [{ ...snapshot.jobList, jobs: [...new Map([
+        ...previous.pages[0].jobs, ...snapshot.jobList.jobs,
+      ].map((job) => [job.id, job])).values()] }, ...previous.pages.slice(1)],
+    }))
+  }, [snapshot.jobList, filtering, queryClient])
+  const hasMore = moreQuery.hasNextPage
   const { fetchNextPage, isFetching, isError, dataUpdatedAt } = moreQuery
   const jobs = [...new Map([
-    ...(moreQuery.data?.pages.flat() ?? []),
-    ...snapshot.jobs,
+    ...(moreQuery.data?.pages.flatMap((page) => page.jobs) ?? []),
+    ...(!filtering ? snapshot.jobList.jobs : []),
   ].map((job) => [job.id, job])).values()]
-  const search = jobsRoute.useSearch()
+  const total = filtering ? (moreQuery.data?.pages[0]?.total ?? 0) : snapshot.jobList.total
   const navigate = useNavigate({ from: '/jobs' })
   const setSearch = useCallback(
     (patch: JobSearch) => void navigate({ search: (previous) => ({ ...previous, ...patch }), replace: true }),
@@ -618,16 +638,7 @@ function JobsPage() {
     return () => window.clearTimeout(timer)
   }, [query, search.q, setSearch])
 
-  const needle = search.q?.toLowerCase()
-  const filtered = jobs
-    .filter((job) => {
-      if (search.state && (search.state === 'active' ? !activeJobStates.has(job.state) : job.state !== search.state)) return false
-      if (search.worker && job.worker_id !== search.worker) return false
-      if (!needle) return true
-      return [job.id, job.state, job.worker_id ?? '', job.spec.environment ?? '', job.submitted_by ?? '', ...job.spec.command].join(' ').toLowerCase().includes(needle)
-    })
-    .sort((a, b) => b.created_at - a.created_at)
-  const filtering = Boolean(search.q || search.state || search.worker)
+  const filtered = jobs.sort((a, b) => b.created_at - a.created_at)
   const workerIds = [...new Set([...workers.map((worker) => worker.id), ...(search.worker ? [search.worker] : [])])].sort()
 
   useEffect(() => {
@@ -670,14 +681,14 @@ function JobsPage() {
         </div>
         <SectionHeading
           title="Job history"
-          detail={`${filtered.length} of ${jobs.length} jobs`}
+          detail={`${jobs.length} of ${total} jobs`}
         />
-        {filtered.length ? <JobsTable jobs={filtered} /> : jobs.length ? (
+        {moreQuery.isPending ? <LoadingState compact /> : filtered.length ? <JobsTable jobs={filtered} /> : filtering ? (
           <EmptyState icon={<Terminal />} title="No matching jobs" detail="Try a different search or clear the filters." />
         ) : (
           <EmptyState icon={<Terminal />} title="No jobs yet" detail="Submitted jobs and their latest states will appear here." />
         )}
-        {hasMore && <div ref={loadMoreRef} className="jobs-pagination">
+        {(hasMore || isError) && <div ref={loadMoreRef} className="jobs-pagination">
           {isFetching ? <LoadingState compact label="Loading more jobs…" /> : <>
             {isError && <span role="alert">Could not load more jobs: {errorMessage(moreQuery.error)}</span>}
             <Button variant="outline" onClick={() => void fetchNextPage({ cancelRefetch: false })}>
@@ -692,10 +703,8 @@ function JobsPage() {
 
 function JobPage() {
   const { jobId } = jobRoute.useParams()
-  const { jobs } = useSnapshot()
-  const recentJob = jobs.find((candidate) => candidate.id === jobId)
-  const details = useQuery({ ...jobQuery(jobId), enabled: !recentJob })
-  const job = recentJob ?? details.data
+  const details = useQuery(jobQuery(jobId))
+  const job = details.data
   const finished = Boolean(job && terminalJobStates.has(job.state))
   const logs = useQuery({ ...jobLogsQuery(jobId, !finished), enabled: Boolean(job) })
   const queryClient = useQueryClient()
@@ -785,7 +794,7 @@ function JobPage() {
   )
 }
 
-function JobsTable({ jobs }: { jobs: Job[] }) {
+function JobsTable({ jobs }: { jobs: JobSummary[] }) {
   const navigate = useNavigate()
   const now = useNow()
   return (
@@ -795,11 +804,11 @@ function JobsTable({ jobs }: { jobs: Job[] }) {
         <tr key={job.id} className="clickable-row" onClick={() => navigate({ to: '/jobs/$jobId', params: { jobId: job.id } })}>
           <td><Link className="table-link" to="/jobs/$jobId" params={{ jobId: job.id }}><code className="job-id">{job.id.slice(0, 8)}</code></Link></td>
           <td><StatusBadge state={job.state} /></td>
-          <td><code className="command-cell" title={job.spec.command.join(' ')}>{job.spec.command.join(' ') || '—'}</code></td>
+          <td><code className="command-cell" title={job.command}>{job.command || '—'}</code></td>
           <td>{job.worker_id
             ? <Link className="table-link" to="/workers/$workerId" params={{ workerId: job.worker_id }} onClick={(event) => event.stopPropagation()}>{job.worker_id}</Link>
             : <span className="muted-text">Unassigned</span>}</td>
-          <td>{job.spec.environment ?? <span className="muted-text">Native</span>}</td>
+          <td>{job.environment ?? <span className="muted-text">Native</span>}</td>
           <td>{job.submitted_by ?? <span className="muted-text">—</span>}</td>
           <td className="time-cell"><RelativeTime timestamp={job.updated_at} /></td>
           <td className="time-cell">{formatDuration(job.created_at, activeJobStates.has(job.state) ? now : job.updated_at)}</td>

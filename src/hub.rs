@@ -85,6 +85,7 @@ const AUDIT_RETENTION: i64 = 10_000;
 /// Worker-caused audit events (connect, rejected) allowed per token per hour.
 const WORKER_AUDIT_PER_HOUR: u32 = 20;
 struct Store {
+    limits: TransferLimits,
     db: Connection,
     blobs: PathBuf,
     token: String,
@@ -163,6 +164,7 @@ fn audit_key(principal: &Principal) -> String {
 
 impl Store {
     fn open(data: PathBuf, token: String) -> Result<Self> {
+        let limits = TransferLimits::from_env()?;
         crate::worker::private_dir(&data)?;
         crate::worker::private_dir(&data.join("blobs"))?;
         let db = Connection::open(data.join("hub.sqlite"))?;
@@ -186,6 +188,7 @@ impl Store {
             }
         }
         let mut store = Self {
+            limits,
             db,
             blobs: data.join("blobs"),
             token,
@@ -1596,6 +1599,7 @@ pub async fn run(listen: String, data_dir: PathBuf, token_file: PathBuf) -> Resu
     Ok(())
 }
 fn router(state: Shared) -> Router {
+    let limits = state.lock().unwrap().limits;
     // Every /v1 route belongs to exactly one role group; a route outside these groups would be
     // unauthenticated, so add new routes to the narrowest group that fits.
     let admin = Router::new()
@@ -1641,16 +1645,17 @@ fn router(state: Shared) -> Router {
         .route("/{*path}", get(dashboard_asset))
         .route(
             "/health",
-            get(|| async {
+            get(move || async move {
                 Json(serde_json::json!({
                     "status":"ok",
                     "version":crate::VERSION,
+                    "transfer_limits":limits,
                     "capabilities":["job_priority", "worker_control", "scoped_tokens", "audit_log", "command_policy", "job_worker", "worker_metrics", "incremental_reconnect"]
                 }))
             }),
         )
         .merge(protected)
-        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(limits.http_json))
         .with_state(state)
 }
 async fn dashboard_index() -> Response {
@@ -2289,12 +2294,21 @@ async fn worker_socket(
     State(state): State<Shared>,
     Extension(principal): Extension<Principal>,
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
 ) -> Response {
+    let peer_metadata = match headers.get(METADATA_LIMIT_HEADER) {
+        None => LEGACY_METADATA_BYTES,
+        Some(value) => match value.to_str().ok().and_then(|value| value.parse::<usize>().ok()).filter(|bytes| *bytes > 0 && *bytes <= isize::MAX as usize) {
+            Some(bytes) => bytes,
+            None => return invalid("invalid worker metadata receive limit").into_response(),
+        },
+    };
+    let limits = match lock(&state) { Ok(store) => store.limits, Err(error) => return error.into_response() };
     // Legacy snapshots stay compatible; modern peers stream large metadata separately.
-    ws.max_message_size(WS_MESSAGE_BYTES).max_frame_size(WS_MESSAGE_BYTES)
-        .on_upgrade(move |socket| socket_loop(state, socket, principal))
+    ws.max_message_size(limits.websocket).max_frame_size(limits.websocket)
+        .on_upgrade(move |socket| socket_loop(state, socket, principal, peer_metadata))
 }
-async fn socket_loop(state: Shared, mut socket: WebSocket, principal: Principal) {
+async fn socket_loop(state: Shared, mut socket: WebSocket, principal: Principal, peer_metadata: usize) {
     let hello = tokio::time::timeout(Duration::from_secs(15), socket.recv()).await;
     let Ok(Some(Ok(Message::Text(text)))) = hello else {
         return;
@@ -2368,10 +2382,11 @@ async fn socket_loop(state: Shared, mut socket: WebSocket, principal: Principal)
         };
         session
     };
-    let blobs = match state.lock() { Ok(store) => store.blobs.clone(), Err(_) => return };
+    let (blobs, limits) = match state.lock() { Ok(store) => (store.blobs.clone(), store.limits), Err(_) => return };
     let (mut sink, mut stream) = socket.split();
     let (pong_tx, mut pong_rx) = mpsc::channel(8);
     let writer = async {
+        let send_metadata = limits.metadata.min(peer_metadata);
         let mut ticker = tokio::time::interval(Duration::from_secs(15));
         loop {
             let message = tokio::select! {
@@ -2379,9 +2394,9 @@ async fn socket_loop(state: Shared, mut socket: WebSocket, principal: Principal)
                     let Some(outgoing) = outgoing else { break };
                     let (file, hash) = crate::snapshot::json_blob(&blobs, &outgoing)?;
                     let size = file.as_file().metadata()?.len();
-                    if size > METADATA_BYTES {
+                    if size > send_metadata as u64 {
                         let mut store = state.lock().map_err(|_| anyhow::anyhow!("hub store unavailable"))?;
-                        let reason = "metadata exceeds the 256 MiB decode budget";
+                        let reason = metadata_error(send_metadata);
                         match &outgoing {
                             HubMessage::Run { job, .. } => {
                                 let mut current = store.assigned(&worker_id, &job.id, &job.attempt_id)?;
@@ -2444,7 +2459,7 @@ async fn socket_loop(state: Shared, mut socket: WebSocket, principal: Principal)
                         validate_hash(&hash)?;
                         let path = blobs.join(&hash);
                         message = tokio::task::spawn_blocking(move || -> Result<WorkerMessage> {
-                            anyhow::ensure!(std::fs::metadata(&path)?.len() <= METADATA_BYTES, "metadata exceeds the 256 MiB decode budget");
+                            anyhow::ensure!(std::fs::metadata(&path)?.len() <= limits.metadata as u64, "{}", metadata_error(limits.metadata));
                             anyhow::ensure!(crate::snapshot::hash_file(&path)? == hash, "metadata SHA-256 mismatch");
                             let message = serde_json::from_reader(BufReader::new(std::fs::File::open(path)?))?;
                             anyhow::ensure!(matches!(message, WorkerMessage::Finished { .. } | WorkerMessage::Environment { .. } | WorkerMessage::UpdateFailed { .. }), "unsupported metadata message");
@@ -3526,6 +3541,7 @@ mod tests {
             }
         }).collect();
         store.disconnect("one", session).unwrap();
+        store.limits.websocket = 4 * 1024 * 1024;
         let state = Arc::new(Mutex::new(store));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut request = format!("ws://{}/v1/worker/ws", listener.local_addr().unwrap()).into_client_request().unwrap();
@@ -3558,6 +3574,11 @@ mod tests {
             }
         }).await.expect("valid live metadata must not be rejected by the removed 2 MiB guard");
         assert!(state.lock().unwrap().workers().unwrap()[0].online);
+        let above_configured_limit = encode(&WorkerMessage::UpdateFailed { error: "x".repeat(5 * 1024 * 1024) }).unwrap();
+        let _ = socket.send(ClientMessage::Text(above_configured_limit.into())).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.lock().unwrap().workers().unwrap()[0].online { tokio::task::yield_now().await; }
+        }).await.expect("configured WebSocket limit must reject an oversized frame");
         server.abort();
     }
 

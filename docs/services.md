@@ -68,4 +68,26 @@ Collection runs hourly, after each attempt and at startup. Busy workers skip rou
 
 Current workers send a small Hello, reconcile attempt identities/states, then recover logs from the Hub's contiguous stored cursor and send changed results separately. A single writer orders each attempt's logs before its completion report; command reception and heartbeats continue during backfill. Streamed assignments are journaled before download, survive reconnection/restart and are cancelled with their attempt. Old workers retain the legacy handshake until updated.
 
-JSON metadata above 1 MiB moves through the SHA-256 verified blob transport. The 1 MiB threshold chooses transport, not acceptance. One decoded metadata object has a 256 MiB memory-protection budget, with room for a job and environment each submitted through the existing 64 MiB HTTP JSON budget. It is an explicit operational bound, not a bound on how many output files a command can produce. An oversized completion becomes an explicit failed attempt; original results stay in its worker journal until normal retention expires. Artifact file bodies are streamed without this JSON budget. WebSocket message/frame bounds are both 64 MiB, individual log text remains limited to 1 MiB, and older workers cannot receive an inline Run above their 16 MiB frame bound: that operation fails with an update instruction instead of disconnecting the worker.
+JSON metadata above 1 MiB moves through the SHA-256 verified blob transport. This chooses transport, not acceptance or throughput: a larger result is streamed in full. Artifact file bodies are streamed without a total-size cap.
+
+Hub and worker processes read these optional environment variables once at startup. Values are positive whole numbers in MiB (1 MiB = 1,048,576 bytes); invalid, zero or overflowing values stop startup with the variable name. `/health` reports the Hub's effective `transfer_limits` in bytes.
+
+| Environment variable | Default | Applies to |
+| --- | --- | --- |
+| `YLCC_WS_MAX_MIB` | 128 | Incoming WebSocket messages and frames, on Hub and worker |
+| `YLCC_HTTP_JSON_MAX_MIB` | 128 | Incoming Hub HTTP JSON request bodies |
+| `YLCC_METADATA_MAX_MIB` | 512 | One serialized metadata object before decoding or sending, on Hub and worker |
+
+For example, to allow 256 MiB WebSocket/HTTP JSON and 1 GiB metadata:
+
+```bash
+export YLCC_WS_MAX_MIB=256
+export YLCC_HTTP_JSON_MAX_MIB=256
+export YLCC_METADATA_MAX_MIB=1024
+ylcc --token-file /absolute/path/token hub --data-dir /absolute/path/hub
+# Set the same values in each worker process's environment before starting it.
+```
+
+Set these in the actual service environment: systemd `Environment=` overrides, launchd `EnvironmentVariables`, the Windows task's environment, or container `environment`/`-e`. Exporting in an interactive shell does not change an already installed/running service; restart the affected service after changing its configuration. Each side advertises its metadata receive budget; senders use the smaller local/peer budget and treat older peers without this advertisement as having a 256 MiB budget. Oversized Run/Prepare/completion metadata fails that operation explicitly. WebSocket receive budgets remain local; use matching values across the pool, and older versions retain their fixed limits. Allow room for both the job and environment plus their JSON envelope within the metadata budget. Larger JSON budgets allow higher memory use, multiplied by concurrent transfers; decoded JSON can occupy more memory than its serialized bytes.
+
+An oversized completion becomes an explicit failed attempt; original results stay in its worker journal until normal retention expires. Individual log text remains limited to 1 MiB (workers emit 8 KiB chunks). Older workers cannot receive an inline Run above their 16 MiB frame bound: that operation fails with an update instruction instead of disconnecting the worker.

@@ -13,7 +13,7 @@ use std::{
     io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}},
     time::{Duration, SystemTime},
 };
 use tokio::{
@@ -46,6 +46,8 @@ struct Attempt {
     cancel: watch::Sender<bool>,
 }
 struct State {
+    limits: TransferLimits,
+    peer_metadata: AtomicUsize,
     hub: String,
     token: String,
     data: PathBuf,
@@ -235,6 +237,7 @@ pub async fn run(
     policy: Option<Policy>,
     metrics: bool,
 ) -> Result<()> {
+    let limits = TransferLimits::from_env()?;
     identifier(&id)?;
     ensure!(max_jobs > 0, "max-jobs must be positive");
     crate::client::validate_hub(&hub)?;
@@ -273,6 +276,8 @@ pub async fn run(
     }
     let (events, _) = broadcast::channel(4096);
     let state = Arc::new(State {
+        limits,
+        peer_metadata: AtomicUsize::new(LEGACY_METADATA_BYTES),
         hub: hub.trim_end_matches('/').into(),
         token,
         data,
@@ -505,10 +510,16 @@ async fn connection(state: Arc<State>) -> Result<()> {
         .headers_mut()
         .insert("Authorization", format!("Bearer {}", state.token).parse()?);
     let events = state.events.subscribe();
-    let capabilities = hub_capabilities(&state).await;
+    request.headers_mut().insert(METADATA_LIMIT_HEADER, state.limits.metadata.to_string().parse()?);
+    let health = hub_health(&state).await;
+    let capabilities: Vec<String> = serde_json::from_value(health["capabilities"].clone()).unwrap_or_default();
+    let peer_metadata = health["transfer_limits"]["metadata"].as_u64()
+        .and_then(|bytes| usize::try_from(bytes).ok()).filter(|bytes| *bytes > 0 && *bytes <= isize::MAX as usize)
+        .unwrap_or(LEGACY_METADATA_BYTES);
+    state.peer_metadata.store(peer_metadata, Ordering::Relaxed);
     let incremental = capabilities.iter().any(|c| c == "incremental_reconnect");
     let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
-        .max_message_size(Some(WS_MESSAGE_BYTES)).max_frame_size(Some(WS_MESSAGE_BYTES));
+        .max_message_size(Some(state.limits.websocket)).max_frame_size(Some(state.limits.websocket));
     let (socket, _) = tokio_tungstenite::connect_async_with_config(request, Some(config), false).await?;
     let (mut sink, mut source) = socket.split();
     sink.send(Message::Text(serde_json::to_string(&state.hello(incremental))?.into())).await?;
@@ -636,24 +647,24 @@ fn handle_hub_message(state: &Arc<State>, message: HubMessage, cancelled: &Mutex
 
 type ResumeMap = Arc<Mutex<HashMap<(String, String), (u64, bool, bool)>>>;
 
-fn oversized_metadata(state: &State, message: &WorkerMessage) -> Result<WorkerMessage> {
-    let reason = "metadata exceeds the 256 MiB decode budget; original results remain in the worker journal";
+fn oversized_metadata(state: &State, message: &WorkerMessage, limit: usize) -> Result<WorkerMessage> {
+    let reason = format!("{}; original results remain in the worker journal", metadata_error(limit));
     Ok(match message {
         WorkerMessage::Finished { report } => {
             if let Some(attempt) = state.attempts.lock().unwrap().get(&report.attempt_id).cloned() {
-                attempt.update(|journal| { journal.report.state = "failed".into(); journal.report.error = Some(reason.into()); })?;
+                attempt.update(|journal| { journal.report.state = "failed".into(); journal.report.error = Some(reason.clone()); })?;
             }
             WorkerMessage::Finished { report: AttemptReport { job_id: report.job_id.clone(), attempt_id: report.attempt_id.clone(), state: "failed".into(), exit_code: None, error: Some(reason.into()), results: vec![] } }
         },
         WorkerMessage::Environment { status } => {
             let mut status = status.clone();
-            status.state = "failed".into(); status.error = Some("environment diagnostic exceeds the 256 MiB decode budget".into());
+            status.state = "failed".into(); status.error = Some(metadata_error(limit));
             atomic_json(&state.data.join("environments").join(&status.environment_id).join(&status.revision).join("status.json"), &status)?;
             state.environments.lock().unwrap().insert(env_key(&status.environment_id, &status.revision), status.clone());
             WorkerMessage::Environment { status }
         },
         WorkerMessage::UpdateFailed { .. } => {
-            let message = WorkerMessage::UpdateFailed { error: "self-update diagnostic exceeds the 256 MiB decode budget; inspect the worker service log".into() };
+            let message = WorkerMessage::UpdateFailed { error: format!("{}; inspect the worker service log", metadata_error(limit)) };
             state.transient.lock().unwrap().insert("update".into(), message.clone());
             message
         },
@@ -663,8 +674,9 @@ fn oversized_metadata(state: &State, message: &WorkerMessage) -> Result<WorkerMe
 
 async fn send_worker(state: &State, tx: &tokio::sync::mpsc::Sender<String>, message: &WorkerMessage, incremental: bool) -> Result<String> {
     let (mut file, mut hash) = crate::snapshot::json_blob(&state.data.join("blobs"), message)?;
-    if file.as_file().metadata()?.len() > METADATA_BYTES {
-        (file, hash) = crate::snapshot::json_blob(&state.data.join("blobs"), &oversized_metadata(state, message)?)?;
+    let limit = state.limits.metadata.min(state.peer_metadata.load(Ordering::Relaxed));
+    if file.as_file().metadata()?.len() > limit as u64 {
+        (file, hash) = crate::snapshot::json_blob(&state.data.join("blobs"), &oversized_metadata(state, message, limit)?)?;
     }
     let text = if incremental && file.as_file().metadata()?.len() > WS_INLINE_BYTES as u64 {
         ensure!(matches!(message, WorkerMessage::Finished { .. } | WorkerMessage::Environment { .. } | WorkerMessage::UpdateFailed { .. }), "unsupported large worker message");
@@ -838,12 +850,12 @@ async fn replay_attempt(state: &State, attempt: &Attempt, tx: &tokio::sync::mpsc
     Ok(true)
 }
 
-async fn hub_capabilities(state: &State) -> Vec<String> {
+async fn hub_health(state: &State) -> serde_json::Value {
     let health = async {
         let response = state.client.get(format!("{}/health", state.hub)).send().await?;
         response.error_for_status()?.json::<serde_json::Value>().await
     };
-    health.await.ok().and_then(|health| serde_json::from_value(health["capabilities"].clone()).ok()).unwrap_or_default()
+    health.await.unwrap_or_default()
 }
 
 /// CPU usage is the change in cumulative ticks between two samples.
@@ -1010,8 +1022,8 @@ fn resume_delivery(state: Arc<State>, attempt: Arc<Attempt>) {
     });
 }
 async fn ensure_metadata(state: &State, hash: &str) -> Result<PathBuf> {
-    let path = ensure_blob_bounded(state, hash, None, Some(METADATA_BYTES)).await?;
-    ensure!(fs::metadata(&path)?.len() <= METADATA_BYTES, "metadata exceeds the 256 MiB decode budget");
+    let path = ensure_blob_bounded(state, hash, None, Some(state.limits.metadata as u64)).await?;
+    ensure!(fs::metadata(&path)?.len() <= state.limits.metadata as u64, "{}", metadata_error(state.limits.metadata));
     Ok(path)
 }
 
@@ -2182,7 +2194,7 @@ async fn ensure_blob_bounded(state: &State, hash: &str, size: Option<u64>, limit
     validate_hash(hash)?;
     let path = state.data.join("blobs").join(hash);
     if path.exists() {
-        ensure!(limit.is_none_or(|limit| fs::metadata(&path).is_ok_and(|meta| meta.len() <= limit)), "metadata exceeds the 256 MiB decode budget");
+        ensure!(limit.is_none_or(|limit| fs::metadata(&path).is_ok_and(|meta| meta.len() <= limit)), "{}", metadata_error(state.limits.metadata));
         verify_file(&path, hash, size)?;
         return Ok(path);
     }
@@ -2193,7 +2205,7 @@ async fn ensure_blob_bounded(state: &State, hash: &str, size: Option<u64>, limit
         .send()
         .await?
         .error_for_status()?;
-    ensure!(limit.is_none_or(|limit| response.content_length().is_none_or(|length| length <= limit)), "metadata exceeds the 256 MiB decode budget");
+    ensure!(limit.is_none_or(|limit| response.content_length().is_none_or(|length| length <= limit)), "{}", metadata_error(state.limits.metadata));
     let temporary = tempfile::NamedTempFile::new_in(state.data.join("blobs"))?;
     let temp = temporary.path().to_owned();
     let result = async {
@@ -2208,7 +2220,7 @@ async fn ensure_blob_bounded(state: &State, hash: &str, size: Option<u64>, limit
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             written += chunk.len() as u64;
-            ensure!(limit.is_none_or(|limit| written <= limit), "metadata exceeds the 256 MiB decode budget");
+            ensure!(limit.is_none_or(|limit| written <= limit), "{}", metadata_error(state.limits.metadata));
             ensure!(
                 size.is_none_or(|size| written <= size),
                 "blob exceeds declared size"
@@ -3467,6 +3479,8 @@ mod tests {
         }
         let (events, _) = broadcast::channel(100);
         Arc::new(State {
+            limits: TransferLimits::default(),
+            peer_metadata: AtomicUsize::new(LEGACY_METADATA_BYTES),
             hub: "http://127.0.0.1:1".into(),
             token: "test-token".into(),
             data: data.into(),
@@ -3555,7 +3569,7 @@ mod tests {
             journal.report.results.push(FileEntry { path: "out/a".into(), hash: "a".repeat(64), size: 0, mode: 0o600 });
         }).unwrap();
         state.attempts.lock().unwrap().insert("done".into(), attempt.clone());
-        let WorkerMessage::Finished { report } = oversized_metadata(&state, &WorkerMessage::Finished { report }).unwrap() else { panic!() };
+        let WorkerMessage::Finished { report } = oversized_metadata(&state, &WorkerMessage::Finished { report }, state.limits.metadata).unwrap() else { panic!() };
         assert_eq!(report.state, "failed"); assert!(report.results.is_empty());
         assert_eq!(attempt.report().results.len(), 1);
         assert_eq!(attempt.report().state, "failed");
@@ -3564,6 +3578,27 @@ mod tests {
         state.emit(WorkerMessage::Environment { status: EnvironmentStatus { worker_id: "test".into(), environment_id: "env".into(), revision: "v1".into(), state: "ready".into(), error: None } });
         assert_eq!(state.transient.lock().unwrap().len(), 1);
         assert!(state.transient.lock().unwrap().contains_key("environment:env/v2"));
+    }
+
+    #[tokio::test]
+    async fn smaller_peer_metadata_budget_sends_a_small_failure_and_retains_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state_at(dir.path());
+        Arc::get_mut(&mut state).unwrap().limits.metadata = 3 * 1024 * 1024;
+        state.peer_metadata.store(1024 * 1024, Ordering::Relaxed);
+        let attempt = attempt_at(dir.path(), "done");
+        let report = attempt.update(|journal| {
+            journal.report.state = "failed".into();
+            journal.report.error = Some("x".repeat(2 * 1024 * 1024));
+            journal.report.results.push(FileEntry { path: "out/a".into(), hash: "a".repeat(64), size: 0, mode: 0o600 });
+        }).unwrap();
+        state.attempts.lock().unwrap().insert("done".into(), attempt.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        send_worker(&state, &tx, &WorkerMessage::Finished { report }, true).await.unwrap();
+        let WorkerMessage::Finished { report } = serde_json::from_str(&rx.recv().await.unwrap()).unwrap() else { panic!() };
+        assert!(report.error.unwrap().contains("1 MiB"));
+        assert!(report.results.is_empty());
+        assert_eq!(attempt.report().results.len(), 1);
     }
 
     #[cfg(unix)]
@@ -3617,8 +3652,10 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         Arc::get_mut(&mut state).unwrap().hub = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        state.peer_metadata.store(1024 * 1024, Ordering::Relaxed);
         let socket = tokio::spawn(connection(state.clone()));
         connected.notified().await;
+        assert_eq!(state.peer_metadata.load(Ordering::Relaxed), LEGACY_METADATA_BYTES, "a legacy Hub without advertised bounds resets the previous peer budget");
         let mut job = policy_job(&["sh", "-c", "sleep 30"], None);
         job.id = "live".into(); job.attempt_id = "live".into();
         commands.send(HubMessage::Run { job: Box::new(job), environment: None }).await.unwrap();
@@ -3717,10 +3754,11 @@ mod tests {
     #[tokio::test]
     async fn cached_metadata_is_rejected_before_decoding_when_over_budget() {
         let dir = tempfile::tempdir().unwrap();
-        let state = state_at(dir.path());
+        let mut state = state_at(dir.path());
+        Arc::get_mut(&mut state).unwrap().limits.metadata = 3 * 1024 * 1024;
         let hash = "a".repeat(64);
-        File::create(state.data.join("blobs").join(&hash)).unwrap().set_len(METADATA_BYTES + 1).unwrap();
-        assert!(ensure_metadata(&state, &hash).await.unwrap_err().to_string().contains("256 MiB"));
+        File::create(state.data.join("blobs").join(&hash)).unwrap().set_len(state.limits.metadata as u64 + 1).unwrap();
+        assert!(ensure_metadata(&state, &hash).await.unwrap_err().to_string().contains("3 MiB"));
     }
 
     #[test]

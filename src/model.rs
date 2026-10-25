@@ -645,9 +645,58 @@ mod tests {
     }
 }
 
-// Transport bounds apply to control frames; manifests travel as streamed blobs.
-pub const WS_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+// Above this threshold, modern peers stream metadata through the blob transport.
 pub const WS_INLINE_BYTES: usize = 1024 * 1024;
-// A JobSpec and environment can each fill the 64 MiB HTTP JSON budget.
-// Keep their envelope bounded too; artifact bodies are streamed without this decode budget.
-pub const METADATA_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct TransferLimits {
+    pub websocket: usize,
+    pub http_json: usize,
+    pub metadata: usize,
+}
+impl Default for TransferLimits {
+    fn default() -> Self {
+        Self { websocket: 128 * 1024 * 1024, http_json: 128 * 1024 * 1024, metadata: 512 * 1024 * 1024 }
+    }
+}
+impl TransferLimits {
+    pub fn from_env() -> anyhow::Result<Self> {
+        let mut limits = Self::default();
+        for (name, bytes) in [
+            ("YLCC_WS_MAX_MIB", &mut limits.websocket),
+            ("YLCC_HTTP_JSON_MAX_MIB", &mut limits.http_json),
+            ("YLCC_METADATA_MAX_MIB", &mut limits.metadata),
+        ] {
+            match std::env::var(name) {
+                Ok(value) => *bytes = parse_limit_mib(name, &value)?,
+                Err(std::env::VarError::NotPresent) => {},
+                Err(error) => anyhow::bail!("{name}: {error}"),
+            }
+        }
+        Ok(limits)
+    }
+}
+pub fn metadata_error(bytes: usize) -> String {
+    format!("metadata exceeds the {} MiB decode budget (YLCC_METADATA_MAX_MIB)", bytes / (1024 * 1024))
+}
+// Releases before configurable bounds decode at most 256 MiB, including during rolling upgrades.
+pub const LEGACY_METADATA_BYTES: usize = 256 * 1024 * 1024;
+pub const METADATA_LIMIT_HEADER: &str = "ylcc-metadata-max-bytes";
+fn parse_limit_mib(name: &str, value: &str) -> anyhow::Result<usize> {
+    let bytes = value.parse::<usize>().ok().filter(|mib| *mib > 0)
+        .and_then(|mib| mib.checked_mul(1024 * 1024))
+        .filter(|bytes| *bytes <= isize::MAX as usize);
+    bytes.ok_or_else(|| anyhow::anyhow!("{name} must be a positive whole number of MiB that fits in this platform's address space"))
+}
+
+#[cfg(test)]
+mod transfer_limit_tests {
+    use super::*;
+    #[test]
+    fn mib_limits_reject_invalid_values_and_overflow() {
+        assert_eq!(parse_limit_mib("test", "1024").unwrap(), 1024 * 1024 * 1024);
+        for value in ["", "0", "-1", "1.5", "128MB", " 128", &usize::MAX.to_string()] {
+            assert!(parse_limit_mib("test", value).unwrap_err().to_string().contains("test"));
+        }
+    }
+}

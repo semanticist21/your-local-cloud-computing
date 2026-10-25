@@ -42,10 +42,10 @@ def main():
         processes = []
         streams = []
 
-        def start(role, *args, token_file=token):
+        def start(role, *args, token_file=token, env=None):
             stream = (base / f"{role}-{len(streams)}.log").open("w+")
             streams.append(stream)
-            process = subprocess.Popen(using(token_file) + [role, *args], stdout=stream, stderr=stream, start_new_session=os.name != "nt")
+            process = subprocess.Popen(using(token_file) + [role, *args], stdout=stream, stderr=stream, start_new_session=os.name != "nt", env=None if env is None else {**os.environ, **env})
             processes.append(process)
             return process
 
@@ -125,8 +125,32 @@ def main():
             return bool(status.stdout.strip()) and not status.stdout.strip().startswith("Z")
 
         try:
+            # Environment limits are read once, validated before touching persistent data, and enforced by HTTP.
+            for variable in ["YLCC_WS_MAX_MIB", "YLCC_HTTP_JSON_MAX_MIB", "YLCC_METADATA_MAX_MIB"]:
+                for role in ["hub", "worker"]:
+                    invalid_data = base / f"invalid-{role}"
+                    invalid = subprocess.run(prefix + [role, "--data-dir", str(invalid_data)],
+                                             env={**os.environ, variable: "0"}, capture_output=True, text=True, timeout=10)
+                    assert invalid.returncode != 0 and variable in invalid.stderr, invalid.stderr
+                    assert not invalid_data.exists()
+            hub = start("hub", "--listen", f"127.0.0.1:{port}", "--data-dir", str(base / "hub"),
+                        env={"YLCC_WS_MAX_MIB": "192", "YLCC_HTTP_JSON_MAX_MIB": "1", "YLCC_METADATA_MAX_MIB": "768"})
+            until(lambda: cli("workers")[0] == [])
+            with urllib.request.urlopen(hub_url + "/health") as response:
+                limits = json.load(response)["transfer_limits"]
+            assert limits == {"websocket": 192 * 1024 * 1024, "http_json": 1024 * 1024, "metadata": 768 * 1024 * 1024}, limits
+            request = urllib.request.Request(hub_url + "/v1/blobs/missing", data=json.dumps({"hashes": [], "padding": "x" * (1024 * 1024)}).encode(),
+                                             headers={"Authorization": "Bearer " + token.read_text().strip(), "Content-Type": "application/json"}, method="POST")
+            try:
+                urllib.request.urlopen(request).close()
+                raise AssertionError("configured HTTP JSON limit was not enforced")
+            except urllib.error.HTTPError as error:
+                assert error.code == 413, error
+            stop(hub)
             hub = start("hub", "--listen", f"127.0.0.1:{port}", "--data-dir", str(base / "hub"))
             until(lambda: cli("workers")[0] == [])
+            with urllib.request.urlopen(hub_url + "/health") as response:
+                assert json.load(response)["transfer_limits"] == {"websocket": 128 * 1024 * 1024, "http_json": 128 * 1024 * 1024, "metadata": 512 * 1024 * 1024}
             worker = start("worker", "--id", "test-worker", "--data-dir", str(base / "worker"))
             until(lambda: any(w["online"] for w in cli("workers")[0]))
             os_name = "windows" if os.name == "nt" else "macos" if sys.platform == "darwin" else "linux"
@@ -309,7 +333,7 @@ def main():
                 request = urllib.request.Request(hub_url + path, data=body, headers=headers, method=method)
                 with urllib.request.urlopen(request, timeout=60) as response:
                     return json.load(response)
-            huge_spec = {"command": python("raise SystemExit(23)"), "requirements": {"os": os_name, "arch": arch, "worker": "second-worker"}, "env": {"LARGE_METADATA": "x" * (17 * 1024 * 1024)}}
+            huge_spec = {"command": python("raise SystemExit(23)"), "requirements": {"os": os_name, "arch": arch, "worker": "second-worker"}, "env": {"LARGE_METADATA": "x" * (65 * 1024 * 1024)}}
             huge_run = api("POST", "/v1/jobs", huge_spec)
             def huge_outcome():
                 current = state(huge_run)
@@ -317,7 +341,7 @@ def main():
             outcome = until(huge_outcome)
             assert outcome["state"] == "failed", {"state": outcome["state"], "error": (outcome.get("error") or "")[:500]}
             huge_journal = base / "worker2" / "attempts" / huge_run["attempt_id"]
-            assert len(json.loads((huge_journal / "job.json").read_text())["env"]["LARGE_METADATA"]) == 17 * 1024 * 1024
+            assert len(json.loads((huge_journal / "job.json").read_text())["env"]["LARGE_METADATA"]) == 65 * 1024 * 1024
             assert json.loads((huge_journal / "journal.json").read_text()).get("delivery") is None
             # Reconcile a >2 MiB successful file manifest and a >16 MiB failure without aggregate Hello.
             large, _ = cli("run", "--no-input", *common, "--worker", "second-worker", "--output", "out", "--", *python("from pathlib import Path; Path('out').mkdir()"))
@@ -374,6 +398,46 @@ def main():
             actions = {e["action"] for e in events}
             assert {"token.create", "token.revoke", "job.submit", "job.priority", "worker.control", "worker.connect", "worker.rejected", "environment.upsert"} <= actions, actions
             assert any(e["action"] == "job.submit" and e["actor"] == "laptop" and e["target"] == submitted["id"] for e in events)
+
+            # Differing receiver budgets must fail only the operation, not enter reconnect/replay loops.
+            mismatch, _ = cli("run", "--no-input", *common, "--worker", "test-worker", "--", *noop)
+            stop(worker)
+            stop(hub)
+            mismatch_journal = base / "worker" / "attempts" / mismatch["attempt_id"] / "journal.json"
+            journal = json.loads(mismatch_journal.read_text())
+            journal["report"].update(state="failed", error="x" * (2 * 1024 * 1024), exit_code=1)
+            mismatch_journal.write_text(json.dumps(journal))
+            database = sqlite3.connect(base / "hub" / "hub.sqlite")
+            stored = json.loads(database.execute("SELECT data FROM jobs WHERE id=?", (mismatch["id"],)).fetchone()[0])
+            stored.update(state="unknown", error=None, exit_code=None)
+            database.execute("UPDATE jobs SET data=? WHERE id=?", (json.dumps(stored), mismatch["id"]))
+            database.commit()
+            database.close()
+            hub = start("hub", "--listen", f"127.0.0.1:{port}", "--data-dir", str(base / "hub"), env={"YLCC_METADATA_MAX_MIB": "1"})
+            until(lambda: cli("workers")[0])
+            worker = start("worker", "--id", "test-worker", "--data-dir", str(base / "worker"), env={"YLCC_METADATA_MAX_MIB": "4"})
+            until(lambda: state(mismatch)["state"] == "failed")
+            assert "1 MiB" in state(mismatch)["error"]
+            after_mismatch, _ = cli("run", "--no-input", *common, "--worker", "test-worker", "--", *noop)
+            assert after_mismatch["state"] == "succeeded"
+            stop(worker)
+            stop(hub)
+            hub = start("hub", "--listen", f"127.0.0.1:{port}", "--data-dir", str(base / "hub"))
+            until(lambda: cli("workers")[0])
+            worker = start("worker", "--id", "test-worker", "--data-dir", str(base / "worker"), env={"YLCC_METADATA_MAX_MIB": "1"})
+            until(lambda: any(w["id"] == "test-worker" and w["online"] for w in cli("workers")[0]))
+            limit_environment = base / "limit-environment.json"
+            limit_environment.write_text(json.dumps({"id": "limit-tools", "revision": "v1", "requirements": {"os": os_name, "arch": arch}, "env": {"PAD": "x" * (2 * 1024 * 1024)}}))
+            cli("env", "add", str(limit_environment))
+            cli("env", "prepare", "limit-tools", "--worker", "test-worker")
+            failed_prepare = until(lambda: next((s for s in cli("env", "status")[0] if s["environment_id"] == "limit-tools" and s["state"] == "failed"), None))
+            assert "1 MiB" in failed_prepare["error"]
+            too_large = api("POST", "/v1/jobs", {"command": noop, "requirements": {"os": os_name, "arch": arch, "worker": "test-worker"}, "env": {"PAD": "x" * (2 * 1024 * 1024)}})
+            until(lambda: state(too_large)["state"] == "failed")
+            assert "1 MiB" in state(too_large)["error"]
+            after_mismatch, _ = cli("run", "--no-input", *common, "--worker", "test-worker", "--", *noop)
+            assert after_mismatch["state"] == "succeeded"
+            cli("env", "delete", "limit-tools")
 
             # Command policy (last: it removes the unrestricted worker). A policy worker refuses
             # anything outside its allowlist, and the Hub rejects such jobs at submission.

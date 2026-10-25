@@ -11,8 +11,11 @@ import pathlib, re, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PINNED = ["README.md", "README.ko.md", "docs/install.md", "docs/ko/install.md",
+          "docs/services.md", "docs/ko/services.md",
           "scripts/install.sh", "scripts/install.ps1", "scripts/test-install.sh", "scripts/test-install.ps1"]
+IMAGE_PINNED = ["compose.yaml", "examples/quadlet/ylcc-worker.container", "docs/containers.md", "docs/ko/containers.md"]
 TAG = re.compile(r"\bv\d+\.\d+\.\d+\b")
+IMAGE_TAG = re.compile(r"(ghcr\.io/semanticist21/your-local-cloud-computing|ylcc-runtime-client):(\d+\.\d+\.\d+)")
 PACKAGE = re.compile(r'^version = "([^"]+)"', re.M)
 
 
@@ -21,10 +24,14 @@ def current():
 
 
 def check():
-    expected, bad = f"v{current()}", []
+    version = current()
+    expected, bad = f"v{version}", []
     for name in PINNED:
         for number, line in enumerate((ROOT / name).read_text().splitlines(), 1):
             bad += [f"{name}:{number}: {tag} != {expected}" for tag in TAG.findall(line) if tag != expected]
+    for name in IMAGE_PINNED:
+        for number, line in enumerate((ROOT / name).read_text().splitlines(), 1):
+            bad += [f"{name}:{number}: {tag} != {version}" for _, tag in IMAGE_TAG.findall(line) if tag != version]
     print("\n".join(bad) or f"all release pins are {expected}")
     return not bad
 
@@ -40,6 +47,9 @@ def bump(version):
     for name in PINNED:
         path = ROOT / name
         path.write_text(TAG.sub(f"v{version}", path.read_text()))
+    for name in IMAGE_PINNED:
+        path = ROOT / name
+        path.write_text(IMAGE_TAG.sub(lambda match: f"{match.group(1)}:{version}", path.read_text()))
     subprocess.run(["cargo", "update", "--workspace", "--offline"], cwd=ROOT, check=True)
     assert check()
     subprocess.run(["git", "commit", "-qam", f"release: v{version}"], cwd=ROOT, check=True)

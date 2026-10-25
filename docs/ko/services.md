@@ -49,7 +49,7 @@ macOS의 [파일 접근 개인정보 보호 제어](https://support.apple.com/en
 
 ```bash
 ylcc workers update --all                      # 최신 게시 릴리스, 워커를 하나씩
-ylcc workers update mac-build --version v0.4.6
+ylcc workers update mac-build --version v0.5.10
 ```
 
 현재 허브에서는 CLI도 같은 허브 관리 배정 보류 기능을 사용하며, 워커의 저장된 일시정지 설정을 바꾸지 않습니다. 이전 허브에서는 원래 실행 중이던 워커를 잠시 정지했다가 재개하므로 명령이 끝날 때까지 CLI 연결을 유지하세요. 각 워커는 실행 중인 잡을 마친 뒤, 자기 OS/아키텍처용 릴리스 아카이브를 내려받아 릴리스의 `SHA256SUMS`와 새 바이너리의 `--version`으로 확인하고, 자기 실행 파일을 교체한 다음 상태 75로 종료합니다. systemd(`Restart=on-failure`), launchd(`KeepAlive`), Windows 태스크 러너가 새 바이너리로 다시 시작합니다. 명령은 다음 워커로 넘어가며 실패하면 거기서 멈춥니다. 실행 파일이 있는 디렉터리는 워커 계정이 쓸 수 있어야 하므로, 워커 바이너리는 root 소유 디렉터리가 아니라 그 계정 아래(예: `~/.local/bin`)에 설치하세요. macOS에서는 소유권이 맞아도 외장 볼륨 접근이 거부될 수 있습니다. 위의 전체 디스크 접근 권한 절차를 확인하세요. 컨테이너 워커는 건너뜁니다. 새 릴리스 이미지로 다시 만드세요. 허브는 먼저 허브 호스트에서 `ylcc update --apply`로 올리세요. `workers`가 워커별 `version`을 보여 줍니다.

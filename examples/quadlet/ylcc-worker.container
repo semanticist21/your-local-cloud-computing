@@ -4,7 +4,7 @@ After=network-online.target
 
 [Container]
 RunInit=true
-Image=ghcr.io/semanticist21/your-local-cloud-computing:0.2.0
+Image=ghcr.io/semanticist21/your-local-cloud-computing:0.5.10
 ContainerName=ylcc-worker
 UserNS=keep-id:uid=10001,gid=10001
 Volume=ylcc-worker-data:/data

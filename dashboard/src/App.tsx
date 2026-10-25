@@ -479,7 +479,7 @@ function WorkerPage() {
 
   return (
     <>
-      <PageHeading title={worker.id} back={back} description={<WorkerState worker={worker} />} />
+      <PageHeading title={worker.id} back={back} description={<WorkerState worker={worker} />}><ResumeWorker worker={worker} /></PageHeading>
       <section className="content-section">
         <dl className="detail-grid">
           <Detail label="Platform">{caps.os} · <code>{caps.arch}</code>{caps.abi && <> · <code>{caps.abi}</code></>}</Detail>
@@ -554,7 +554,7 @@ function WorkersTable({ workers, jobsByWorker }: { workers: WorkerInfo[]; jobsBy
       <tbody>{workers.map((worker) => (
         <tr key={worker.id} className="clickable-row" onClick={() => navigate({ to: '/workers/$workerId', params: { workerId: worker.id } })}>
           <td><div className="worker-name"><span className={`worker-avatar worker-avatar-${worker.capabilities.os}`}>{osGlyph(worker.capabilities.os)}</span><Link className="table-link" to="/workers/$workerId" params={{ workerId: worker.id }}>{worker.id}</Link></div></td>
-          <td><WorkerState worker={worker} />{worker.capabilities.policy && <> <PolicyBadge policy={worker.capabilities.policy} /></>}</td>
+          <td onClick={(event) => event.stopPropagation()}><WorkerState worker={worker} />{worker.capabilities.policy && <> <PolicyBadge policy={worker.capabilities.policy} /></>}<ResumeWorker worker={worker} /></td>
           <td><span className="platform-name">{worker.capabilities.os}</span><span className="platform-arch">{worker.capabilities.arch}</span></td>
           <td><div className="resource-line"><Cpu size={13} /> {worker.capabilities.cpus} CPU <span className="resource-divider">·</span> {formatMemory(worker.capabilities.memory_bytes)}</div></td>
           <td><span className="capacity-value">{jobsByWorker.get(worker.id) ?? 0}<span> / {worker.max_jobs}</span></span></td>
@@ -563,6 +563,30 @@ function WorkersTable({ workers, jobsByWorker }: { workers: WorkerInfo[]; jobsBy
         </tr>
       ))}</tbody>
     </table></div>
+  )
+}
+
+function ResumeWorker({ worker }: { worker: WorkerInfo }) {
+  const queryClient = useQueryClient()
+  const whoami = useQuery(whoamiQuery)
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<unknown>(null)
+  useDisconnectOnAuthError(error)
+  if (!worker.paused || whoami.data?.role !== 'admin') return null
+  const resume = async () => {
+    setSubmitting(true)
+    setError(null)
+    try {
+      await post(`/v1/workers/${encodeURIComponent(worker.id)}/control`, { paused: false })
+      await queryClient.invalidateQueries({ queryKey: ['snapshot'] })
+    } catch (failure) { setError(failure) }
+    finally { setSubmitting(false) }
+  }
+  return (
+    <div className="worker-resume">
+      <Button size="sm" variant="outline" disabled={submitting} onClick={() => void resume()}>{submitting ? 'Resuming…' : 'Resume'}</Button>
+      {error != null && <span className="form-error" role="alert">{errorMessage(error)}</span>}
+    </div>
   )
 }
 

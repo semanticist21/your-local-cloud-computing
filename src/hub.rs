@@ -1650,7 +1650,7 @@ fn router(state: Shared) -> Router {
                     "status":"ok",
                     "version":crate::VERSION,
                     "transfer_limits":limits,
-                    "capabilities":["job_priority", "worker_control", "scoped_tokens", "audit_log", "command_policy", "job_worker", "worker_metrics", "incremental_reconnect"]
+                    "capabilities":["job_priority", "worker_control", "scoped_tokens", "audit_log", "command_policy", "job_worker", "worker_metrics", "incremental_reconnect", "worker_updates"]
                 }))
             }),
         )

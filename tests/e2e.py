@@ -7,6 +7,7 @@ from pathlib import Path
 import platform
 import re
 import signal
+import shutil
 import sqlite3
 import urllib.request
 import socket
@@ -156,6 +157,29 @@ def main():
             os_name = "windows" if os.name == "nt" else "macos" if sys.platform == "darwin" else "linux"
             arch = "aarch64" if platform.machine() in ("arm64", "aarch64") else "x86_64"
             common = ["--os", os_name, "--arch", arch]
+
+            if os.name != "nt" and os.geteuid() != 0:
+                protected = base / "protected-bin"
+                protected.mkdir()
+                executable = protected / "ylcc"
+                shutil.copy2(binary, executable)
+                protected.chmod(0o555)
+                stream = (base / "update-denied.log").open("w+")
+                streams.append(stream)
+                denied_worker = subprocess.Popen([str(executable), *prefix[1:], "worker", "--id", "update-denied", "--data-dir", str(base / "update-denied")], stdout=stream, stderr=stream, start_new_session=True)
+                processes.append(denied_worker)
+                try:
+                    until(lambda: any(w["id"] == "update-denied" and w["online"] for w in cli("workers")[0]))
+                    denied_update = cli("workers", "update", "update-denied", "--version", "v0.0.0", "--timeout-secs", "15", ok=False)
+                    assert "cannot create update files" in denied_update.stdout, denied_update.stdout
+                    if sys.platform == "darwin":
+                        assert "Full Disk Access" in denied_update.stdout and str(executable) in denied_update.stdout
+                    denied_info = next(w for w in cli("workers")[0] if w["id"] == "update-denied")
+                    assert denied_info["online"] and not denied_info["paused"] and not denied_info.get("updating")
+                finally:
+                    stop(denied_worker)
+                    protected.chmod(0o755)
+                cli("workers", "delete", "update-denied")
 
             empty, _ = cli("run", "--no-input", *common, "--", *noop)
             assert empty["state"] == "succeeded" and not empty["spec"]["inputs"]

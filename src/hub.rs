@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeSet, HashMap},
+    io::BufReader,
     path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
@@ -2309,7 +2310,7 @@ async fn socket_loop(state: Shared, mut socket: WebSocket, principal: Principal)
                         message = tokio::task::spawn_blocking(move || -> Result<WorkerMessage> {
                             anyhow::ensure!(std::fs::metadata(&path)?.len() <= METADATA_BYTES, "metadata exceeds the 256 MiB decode budget");
                             anyhow::ensure!(crate::snapshot::hash_file(&path)? == hash, "metadata SHA-256 mismatch");
-                            let message = serde_json::from_reader(std::fs::File::open(path)?)?;
+                            let message = serde_json::from_reader(BufReader::new(std::fs::File::open(path)?))?;
                             anyhow::ensure!(matches!(message, WorkerMessage::Finished { .. } | WorkerMessage::Environment { .. } | WorkerMessage::UpdateFailed { .. }), "unsupported metadata message");
                             Ok(message)
                         }).await??;

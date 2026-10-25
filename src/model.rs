@@ -342,6 +342,8 @@ pub struct WorkerMetrics {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkerMessage {
     Hello {
+        #[serde(default)]
+        incremental: bool,
         worker_id: String,
         capabilities: Capabilities,
         max_jobs: usize,
@@ -350,6 +352,11 @@ pub enum WorkerMessage {
         #[serde(default)]
         version: String,
     },
+    /// Presence is reconciled before scheduling; results and logs follow independently.
+    Inventory { job_id: String, attempt_id: String, state: String },
+    Ready,
+    /// Large result/status metadata uses the streamed, SHA-256 verified blob transport.
+    Metadata { hash: String },
     Started {
         job_id: String,
         attempt_id: String,
@@ -376,6 +383,10 @@ pub enum WorkerMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HubMessage {
+    RunRef { job_id: String, attempt_id: String, hash: String },
+    Resume { job_id: String, attempt_id: String, after: u64, terminal: bool, discard: bool },
+    Ready,
+    Metadata { hash: String },
     Run {
         job: Box<Job>,
         environment: Option<Environment>,
@@ -625,3 +636,10 @@ mod tests {
         assert!(!worker.paused);
     }
 }
+
+// Transport bounds apply to control frames; manifests travel as streamed blobs.
+pub const WS_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+pub const WS_INLINE_BYTES: usize = 1024 * 1024;
+// A JobSpec and environment can each fill the 64 MiB HTTP JSON budget.
+// Keep their envelope bounded too; artifact bodies are streamed without this decode budget.
+pub const METADATA_BYTES: u64 = 256 * 1024 * 1024;

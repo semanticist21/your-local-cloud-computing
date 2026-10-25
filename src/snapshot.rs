@@ -334,6 +334,15 @@ fn wildcard(pattern: &str, name: &str) -> bool {
     rest.len() >= last.len() && rest.ends_with(last)
 }
 
+/// Serialize without allocating a second in-memory copy of a large manifest.
+pub fn json_blob(directory: &Path, value: &impl Serialize) -> Result<(tempfile::NamedTempFile, String)> {
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    serde_json::to_writer(file.as_file_mut(), value)?;
+    file.as_file_mut().sync_all()?;
+    let hash = hash_file(file.path())?;
+    Ok((file, hash))
+}
+
 pub fn hash_file(path: &Path) -> Result<String> {
     let mut f = File::open(path)?;
     let mut h = Sha256::new();

@@ -7,6 +7,8 @@ from pathlib import Path
 import platform
 import re
 import signal
+import sqlite3
+import urllib.request
 import socket
 import subprocess
 import sys
@@ -300,6 +302,61 @@ def main():
             until(lambda: any(e["action"] == "worker.rejected" and e["target"] == "impostor" for e in cli("audit")[0]))
             assert not any(w["id"] == "impostor" for w in cli("workers")[0])
             stop(impostor)
+            # Large metadata uses the same scoped worker token and streaming blob path as real jobs.
+            headers = {"Authorization": "Bearer " + token.read_text().strip(), "Content-Type": "application/json"}
+            def api(method, path, value=None):
+                body = None if value is None else json.dumps(value).encode()
+                request = urllib.request.Request(hub_url + path, data=body, headers=headers, method=method)
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    return json.load(response)
+            huge_spec = {"command": noop, "requirements": {"os": os_name, "arch": arch, "worker": "second-worker"}, "env": {"TOO_LARGE_FOR_OS_ENV": "x" * (17 * 1024 * 1024)}}
+            huge_run = api("POST", "/v1/jobs", huge_spec)
+            until(lambda: state(huge_run)["state"] == "failed")
+            huge_journal = base / "worker2" / "attempts" / huge_run["attempt_id"]
+            assert len(json.loads((huge_journal / "job.json").read_text())["env"]["TOO_LARGE_FOR_OS_ENV"]) == 17 * 1024 * 1024
+            assert json.loads((huge_journal / "journal.json").read_text()).get("delivery") is None
+            # Reconcile a >2 MiB successful file manifest and a >16 MiB failure without aggregate Hello.
+            large, _ = cli("run", "--no-input", *common, "--worker", "second-worker", "--output", "out", "--", *python("from pathlib import Path; Path('out').mkdir()"))
+            failure, _ = cli("run", "--no-input", *common, "--worker", "second-worker", "--", *noop)
+            empty_hash = hashlib.sha256(b"").hexdigest()
+            with urllib.request.urlopen(urllib.request.Request(hub_url + "/v1/blobs/" + empty_hash, data=b"", headers=headers, method="PUT")) as response:
+                assert response.status == 201
+            # Keep a deleted environment cache while the worker is offline.
+            stale = {"worker_id": "second-worker", "environment_id": "test-tools", "revision": "v1", "state": "ready", "error": None}
+            stop(second)
+            stale_dir = base / "worker2" / "environments" / "test-tools" / "v1"
+            stale_dir.mkdir(parents=True, exist_ok=True)
+            (stale_dir / "status.json").write_text(json.dumps(stale))
+            stop(worker)
+            cli("env", "delete", "test-tools")
+            stop(hub)
+            results = [{"path": f"out/{i:05d}", "hash": empty_hash, "size": 0, "mode": 420} for i in range(20000)]
+            assert len(json.dumps(results)) > 2 * 1024 * 1024
+            database = sqlite3.connect(base / "hub" / "hub.sqlite")
+            for job, report_state, output, error in [(large, "succeeded", results, None), (failure, "failed", [], "x" * (17 * 1024 * 1024))]:
+                journal_path = base / "worker2" / "attempts" / job["attempt_id"] / "journal.json"
+                journal = json.loads(journal_path.read_text())
+                journal["report"].update(state=report_state, results=output, error=error, exit_code=0 if report_state == "succeeded" else 1)
+                journal["seq"] = 9  # A failed append can leave the counter beyond readable logs.
+                journal_path.write_text(json.dumps(journal))
+                stored = json.loads(database.execute("SELECT data FROM jobs WHERE id=?", (job["id"],)).fetchone()[0])
+                stored.update(state="unknown", results=[], error=None, exit_code=None)
+                database.execute("UPDATE jobs SET data=? WHERE id=?", (json.dumps(stored), job["id"]))
+            database.commit()
+            database.close()
+            hub = start("hub", "--listen", f"127.0.0.1:{port}", "--data-dir", str(base / "hub"))
+            until(lambda: cli("workers")[0])
+            second = start("worker", "--id", "second-worker", "--data-dir", str(base / "worker2"), token_file=second_token)
+            until(lambda: state(large)["state"] == "succeeded", timeout=60)
+            recovered = state(large)
+            assert recovered["results"] == results
+            until(lambda: state(failure)["state"] == "failed", timeout=60)
+            assert len(state(failure)["error"]) == 17 * 1024 * 1024
+            next_job, _ = cli("run", "--no-input", *common, "--worker", "second-worker", "--", *noop)
+            assert next_job["state"] == "succeeded"
+            worker = start("worker", "--id", "test-worker", "--data-dir", str(base / "worker"), "--max-jobs", "2")
+            until(lambda: any(w["id"] == "test-worker" and w["online"] for w in cli("workers")[0]))
+
             tokens, _ = cli("tokens", "list")
             ids = {t["name"]: t["id"] for t in tokens}
             revoked, _ = cli("tokens", "revoke", ids["second"])
@@ -341,7 +398,7 @@ def main():
             refused_env = cli("run", "--no-input", *common, "--env", "FOO=1", "--", *noop, ok=False)
             assert "FOO is not allowed" in refused_env.stderr, refused_env.stderr
             stop(strict)
-            print("PASS: native compile, snapshots, dedup, isolation, cancellation, reconnect, persistent environments, YAML task, priority, pause/resume, live concurrency, scoped tokens, audit, command policy")
+            print("PASS: native compile, snapshots, dedup, isolation, cancellation, reconnect, persistent environments, YAML task, priority, pause/resume, live concurrency, scoped tokens, streamed Run/results, deleted-environment reconnect, audit, command policy")
         except BaseException:
             for stream in streams:
                 stream.flush()

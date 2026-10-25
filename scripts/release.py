@@ -11,6 +11,7 @@ import pathlib, re, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PINNED = ["README.md", "README.ko.md", "docs/install.md", "docs/ko/install.md",
+          "docs/services.md", "docs/ko/services.md",
           "scripts/install.sh", "scripts/install.ps1", "scripts/test-install.sh", "scripts/test-install.ps1"]
 IMAGE_PINNED = ["compose.yaml", "examples/quadlet/ylcc-worker.container", "docs/containers.md", "docs/ko/containers.md"]
 TAG = re.compile(r"\bv\d+\.\d+\.\d+\b")

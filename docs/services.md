@@ -61,3 +61,9 @@ Workers follow the usual CI/cluster retention rules, without configuration:
 - Deleting an environment from the catalogue removes its files from connected workers immediately; offline workers drop them by age.
 
 Collection runs hourly, after each attempt and at startup. Busy workers skip routine collection; under disk pressure, collection waits for active work to finish and runs before later attempts. An evicted environment is prepared again by the next job that needs it.
+
+## Reconnection and transport bounds
+
+Current workers send a small Hello, reconcile attempt identities/states, then recover logs from the Hub's contiguous stored cursor and send changed results separately. A single writer orders each attempt's logs before its completion report; command reception and heartbeats continue during backfill. Streamed assignments are journaled before download, survive reconnection/restart and are cancelled with their attempt. Old workers retain the legacy handshake until updated.
+
+JSON metadata above 1 MiB moves through the SHA-256 verified blob transport. The 1 MiB threshold chooses transport, not acceptance. One decoded metadata object has a 256 MiB memory-protection budget, with room for a job and environment each submitted through the existing 64 MiB HTTP JSON budget. It is an explicit operational bound, not a bound on how many output files a command can produce. An oversized completion becomes an explicit failed attempt; original results stay in its worker journal until normal retention expires. Artifact file bodies are streamed without this JSON budget. WebSocket message/frame bounds are both 64 MiB, individual log text remains limited to 1 MiB, and older workers cannot receive an inline Run above their 16 MiB frame bound: that operation fails with an update instruction instead of disconnecting the worker.

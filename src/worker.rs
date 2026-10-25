@@ -8,9 +8,9 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -22,7 +22,6 @@ use tokio::{
     sync::{RwLock, Semaphore, broadcast, watch},
 };
 use tokio_tungstenite::{
-    connect_async,
     tungstenite::{Message, client::IntoClientRequest},
 };
 
@@ -30,6 +29,8 @@ use tokio_tungstenite::{
 struct Journal {
     report: AttemptReport,
     seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery: Option<String>,
     #[serde(default)]
     pid: Option<u32>,
     #[serde(default)]
@@ -62,6 +63,8 @@ struct State {
     /// Fixed checkout directories currently used by an attempt.
     workspaces: Mutex<HashSet<String>>,
     events: broadcast::Sender<WorkerMessage>,
+    transient: Mutex<HashMap<String, WorkerMessage>>,
+    downloads: Mutex<HashSet<String>>,
     /// The operator's allowlist from `--policy`; `None` runs everything the Hub assigns.
     policy: Option<Policy>,
     /// Report host resource samples to Hubs that accept them (off with `--no-metrics`).
@@ -93,7 +96,11 @@ fn identifier(value: &str) -> Result<()> {
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
     let mut file = crate::platform::create_private_file(&tmp)?;
-    serde_json::to_writer(&mut file, value)?;
+    {
+        let mut writer = BufWriter::new(&mut file);
+        serde_json::to_writer(&mut writer, value)?;
+        writer.flush()?;
+    }
     file.sync_all()?;
     drop(file);
     crate::platform::replace_file(&tmp, path)?;
@@ -157,6 +164,15 @@ impl State {
             .join(&environment.revision))
     }
     fn emit(&self, message: WorkerMessage) {
+        let key = match &message {
+            WorkerMessage::UpdateFailed { .. } => Some("update".to_owned()),
+            WorkerMessage::Environment { status } if status.state == "evicted" => Some(format!("environment:{}/{}", status.environment_id, status.revision)),
+            _ => None,
+        };
+        if let WorkerMessage::Environment { status } = &message {
+            if status.state != "evicted" { self.transient.lock().unwrap().remove(&format!("environment:{}/{}", status.environment_id, status.revision)); }
+        }
+        if let Some(key) = key { self.transient.lock().unwrap().insert(key, message.clone()); }
         let _ = self.events.send(message);
     }
     fn environment_status(
@@ -197,25 +213,14 @@ impl State {
         self.emit(WorkerMessage::Environment { status: value });
         persisted
     }
-    fn hello(&self) -> WorkerMessage {
+    fn hello(&self, incremental: bool) -> WorkerMessage {
         WorkerMessage::Hello {
+            incremental,
             worker_id: self.id.clone(),
             capabilities: self.capabilities.clone(),
             max_jobs: self.max_jobs,
-            attempts: self
-                .attempts
-                .lock()
-                .unwrap()
-                .values()
-                .map(|a| a.report())
-                .collect(),
-            environments: self
-                .environments
-                .lock()
-                .unwrap()
-                .values()
-                .cloned()
-                .collect(),
+            attempts: if incremental { vec![] } else { self.attempts.lock().unwrap().values().map(|a| a.report()).collect() },
+            environments: if incremental { vec![] } else { self.environments.lock().unwrap().values().cloned().collect() },
             version: crate::VERSION.into(),
         }
     }
@@ -286,6 +291,8 @@ pub async fn run(
         caches: Mutex::new(HashSet::new()),
         workspaces: Mutex::new(HashSet::new()),
         events,
+        transient: Mutex::new(HashMap::new()),
+        downloads: Mutex::new(HashSet::new()),
         policy,
         metrics,
     });
@@ -340,7 +347,7 @@ async fn load_state(state: &Arc<State>) -> Result<()> {
         if !path.exists() {
             continue;
         }
-        let mut journal: Journal = serde_json::from_reader(File::open(&path)?)?;
+        let mut journal: Journal = serde_json::from_reader(BufReader::new(File::open(&path)?))?;
         identifier(&journal.report.attempt_id)?;
         ensure!(
             dir.file_name().and_then(|s| s.to_str()) == Some(&journal.report.attempt_id),
@@ -369,7 +376,7 @@ async fn load_state(state: &Arc<State>) -> Result<()> {
                 .open(&logs)?
                 .set_len(good_bytes)?;
         }
-        if !matches!(
+        if journal.delivery.is_none() && !matches!(
             journal.report.state.as_str(),
             "succeeded" | "failed" | "cancelled" | "unknown"
         ) {
@@ -398,7 +405,7 @@ async fn load_state(state: &Arc<State>) -> Result<()> {
             if !path.exists() {
                 continue;
             }
-            let mut status: EnvironmentStatus = serde_json::from_reader(File::open(&path)?)?;
+            let mut status: EnvironmentStatus = serde_json::from_reader(BufReader::new(File::open(&path)?))?;
             identifier(&status.environment_id)?;
             identifier(&status.revision)?;
             if status.state == "preparing" {
@@ -434,7 +441,7 @@ async fn load_state(state: &Arc<State>) -> Result<()> {
             .join(&status.revision);
         let result = async {
             let definition: Environment =
-                serde_json::from_reader(File::open(dir.join("definition.json"))?)?;
+                serde_json::from_reader(BufReader::new(File::open(dir.join("definition.json"))?))?;
             // Environments prepared before a policy existed stay usable only if it allows them.
             if let Some(policy) = &state.policy {
                 policy.check_environment(&definition).map_err(anyhow::Error::msg)?;
@@ -497,141 +504,346 @@ async fn connection(state: Arc<State>) -> Result<()> {
     request
         .headers_mut()
         .insert("Authorization", format!("Bearer {}", state.token).parse()?);
-    let mut events = state.events.subscribe();
-    let (socket, _) = connect_async(request).await?;
+    let events = state.events.subscribe();
+    let capabilities = hub_capabilities(&state).await;
+    let incremental = capabilities.iter().any(|c| c == "incremental_reconnect");
+    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(WS_MESSAGE_BYTES)).max_frame_size(Some(WS_MESSAGE_BYTES));
+    let (socket, _) = tokio_tungstenite::connect_async_with_config(request, Some(config), false).await?;
     let (mut sink, mut source) = socket.split();
-    sink.send(Message::Text(serde_json::to_string(&state.hello())?.into()))
-        .await?;
-    let attempts: Vec<_> = state.attempts.lock().unwrap().values().cloned().collect();
-    for attempt in attempts {
-        let logs = attempt.dir.join("logs.jsonl");
-        if logs.exists() {
-            let file = {
-                let _journal = attempt.journal.lock().unwrap();
-                let file = File::open(logs)?;
-                let size = file.metadata()?.len();
-                file.take(size)
+    sink.send(Message::Text(serde_json::to_string(&state.hello(incremental))?.into())).await?;
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(16);
+    let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel(8);
+    let (ready_tx, ready_rx) = watch::channel(!incremental);
+    let resumes = Arc::new(Mutex::new(HashMap::new()));
+    let cancelled = Arc::new(Mutex::new(HashSet::new()));
+    let producer = replay_and_follow(state.clone(), events, out_tx, incremental, resumes.clone(), ready_rx);
+    let writer = async {
+        let mut sampler = (state.metrics && capabilities.iter().any(|c| c == "worker_metrics")).then(|| Sampler { cpu: cpu_ticks() });
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+        heartbeat.tick().await;
+        loop {
+            let message = tokio::select! {
+                text = out_rx.recv() => { let Some(text) = text else { break }; Message::Text(text.into()) },
+                bytes = pong_rx.recv() => { let Some(bytes) = bytes else { break }; Message::Pong(bytes) },
+                _ = heartbeat.tick() => {
+                    let message = match sampler.as_mut() {
+                        Some(sampler) => WorkerMessage::Metrics { metrics: sampler.sample(&state.data) },
+                        None => WorkerMessage::Heartbeat,
+                    };
+                    Message::Text(serde_json::to_string(&message)?.into())
+                }
             };
-            for line in BufReader::new(file).lines() {
-                let line = line?;
-                // A write cut short (for example by a full disk) must not block every reconnect.
-                let Ok(entry) = serde_json::from_str::<LogEntry>(&line) else {
-                    eprintln!("skipped unreadable log line in {}", attempt.dir.display());
-                    continue;
-                };
-                sink.send(Message::Text(
-                    serde_json::to_string(&WorkerMessage::Log { entry })?.into(),
-                ))
-                .await?;
-            }
+            sink.send(message).await?;
         }
-        let report = attempt.report();
-        if matches!(
-            report.state.as_str(),
-            "succeeded" | "failed" | "cancelled" | "unknown"
-        ) {
-            sink.send(Message::Text(
-                serde_json::to_string(&WorkerMessage::Finished { report })?.into(),
-            ))
-            .await?;
-        }
-    }
-    let statuses: Vec<_> = state
-        .environments
-        .lock()
-        .unwrap()
-        .values()
-        .cloned()
-        .collect();
-    for status in statuses {
-        let logs = state
-            .data
-            .join("environments")
-            .join(status.environment_id)
-            .join(status.revision)
-            .join("logs.jsonl");
-        if !logs.exists() {
-            continue;
-        }
-        let file = File::open(logs)?;
-        let limit = file.metadata()?.len();
-        for line in BufReader::new(file.take(limit)).lines() {
-            let line = line?;
-            // A live preparation may be in the middle of its final append; its event is already subscribed.
-            if let Ok(entry) = serde_json::from_str::<LogEntry>(&line) {
-                sink.send(Message::Text(
-                    serde_json::to_string(&WorkerMessage::Log { entry })?.into(),
-                ))
-                .await?;
-            }
-        }
-    }
-    // Older Hubs reject unknown messages and drop the connection, so ask before sending samples.
-    let mut sampler = (state.metrics && hub_accepts_metrics(&state).await).then(|| Sampler { cpu: cpu_ticks() });
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
-    heartbeat.tick().await; // The first tick is immediate; the CPU baseline needs time to accumulate.
-    loop {
-        tokio::select! {
-            value = source.next() => match value {
-                Some(Ok(Message::Text(text))) => match serde_json::from_str::<HubMessage>(&text) {
-                    Err(error) => eprintln!("ignored unsupported hub message: {error}"),
-                    Ok(HubMessage::Run { job, environment }) => accept(state.clone(), *job, environment)?,
-                    Ok(HubMessage::Cancel { job_id, attempt_id }) => {
-                        let state = state.clone();
-                        tokio::spawn(async move { if let Err(error) = request_cancel(&state, &job_id, &attempt_id).await { eprintln!("cancel reconciliation: {error:#}"); } });
-                    }
-                    Ok(HubMessage::Prepare { environment }) => {
-                        let state = state.clone(); tokio::spawn(async move { if let Err(e) = prepare(&state, &environment, true).await { eprintln!("environment preparation: {e:#}"); } });
-                    }
-                    Ok(HubMessage::Evict { environment_id }) => {
-                        let state = state.clone();
-                        tokio::spawn(async move { if let Err(e) = evict_environment(&state, &environment_id).await { eprintln!("environment eviction: {e:#}"); } });
-                    }
-                    Ok(HubMessage::Update { version }) if state.policy.as_ref().is_some_and(|policy| !policy.self_update) => {
-                        eprintln!("self-update to {version} refused by worker policy");
-                        state.emit(WorkerMessage::UpdateFailed { error: "self-update is disabled by this worker's policy (self_update: false)".into() });
-                    }
-                    Ok(HubMessage::Update { version }) => {
-                        let state = state.clone();
-                        tokio::spawn(async move {
-                            if let Err(error) = self_update(&state, &version).await {
-                                eprintln!("self-update to {version}: {error:#}");
-                                state.emit(WorkerMessage::UpdateFailed { error: format!("{error:#}") });
+        Ok::<_, anyhow::Error>(())
+    };
+    let reader = async {
+        let mut downloads = futures_util::stream::FuturesUnordered::new();
+        loop {
+            tokio::select! {
+                result = downloads.next(), if !downloads.is_empty() => { result.unwrap()?; },
+                value = source.next() => match value {
+                    Some(Ok(Message::Text(text))) => match serde_json::from_str::<HubMessage>(&text) {
+                        Err(error) => eprintln!("ignored unsupported hub message: {error}"),
+                        Ok(HubMessage::Resume { job_id, attempt_id, after, terminal, discard }) => {
+                            if terminal || discard {
+                                let attempt = state.attempts.lock().unwrap().get(&attempt_id).cloned();
+                                if let Some(attempt) = attempt {
+                                    if attempt.journal.lock().unwrap().delivery.is_some() {
+                                        attempt.cancel.send_replace(true);
+                                        attempt.update(|journal| { journal.delivery = None; journal.report.state = "cancelled".into(); journal.report.error = Some("Hub no longer requests this undelivered assignment".into()); })?;
+                                    }
+                                }
                             }
-                        });
+                            resumes.lock().unwrap().insert((job_id, attempt_id), (after, terminal, discard));
+                        },
+                        Ok(HubMessage::Ready) => {
+                            // After restart, confirm ownership/cancellation with the Hub before resuming a delivery.
+                            let deliveries: Vec<_> = state.attempts.lock().unwrap().values().filter(|attempt| attempt.journal.lock().unwrap().delivery.is_some()).cloned().collect();
+                            for attempt in deliveries { resume_delivery(state.clone(), attempt); }
+                            ready_tx.send(true)?;
+                        },
+                        Ok(HubMessage::RunRef { job_id, attempt_id, hash }) => {
+                            ensure!(incremental, "metadata transport was not negotiated");
+                            accept_reference(state.clone(), job_id, attempt_id, hash)?;
+                        },
+                        Ok(HubMessage::Metadata { hash }) => {
+                            ensure!(incremental, "metadata transport was not negotiated");
+                            ensure!(downloads.len() < state.max_jobs + 1, "too many pending metadata deliveries");
+                            let state = state.clone();
+                            let cancelled = cancelled.clone();
+                            downloads.push(async move {
+                                // An update must not overtake an assignment still being downloaded.
+                                let _drain = state.drain.read().await;
+                                let path = ensure_metadata(&state, &hash).await?;
+                                let message = tokio::task::spawn_blocking(move || -> Result<HubMessage> {
+                                    let message = serde_json::from_reader(BufReader::new(File::open(path)?))?;
+                                    ensure!(matches!(message, HubMessage::Prepare { .. }), "unsupported metadata message");
+                                    Ok(message)
+                                }).await??;
+                                handle_hub_message(&state, message, &cancelled)
+                            });
+                        },
+                        Ok(message) => handle_hub_message(&state, message, &cancelled)?,
+                    },
+                    Some(Ok(Message::Ping(bytes))) => pong_tx.send(bytes).await?,
+                    Some(Ok(Message::Close(_))) | None => return Ok(()),
+                    Some(Err(error)) => return Err(error.into()),
+                    _ => {},
+                }
+            }
+        }
+    };
+    tokio::select! { result = producer => result, result = writer => result, result = reader => result }
+}
+
+fn handle_hub_message(state: &Arc<State>, message: HubMessage, cancelled: &Mutex<HashSet<String>>) -> Result<()> {
+    match message {
+        HubMessage::Run { job, environment } => {
+            if !cancelled.lock().unwrap().contains(&job.attempt_id) { accept(state.clone(), *job, environment)?; }
+        },
+        HubMessage::Cancel { job_id, attempt_id } => {
+            cancelled.lock().unwrap().insert(attempt_id.clone());
+            if cancel_delivery(state, &job_id, &attempt_id)? { return Ok(()); }
+            let state = state.clone();
+            tokio::spawn(async move { if let Err(error) = request_cancel(&state, &job_id, &attempt_id).await { eprintln!("cancel reconciliation: {error:#}"); } });
+        },
+        HubMessage::Prepare { environment } => {
+            let state = state.clone();
+            tokio::spawn(async move { if let Err(error) = prepare(&state, &environment, true).await { eprintln!("environment preparation: {error:#}"); } });
+        },
+        HubMessage::Evict { environment_id } => {
+            let state = state.clone();
+            tokio::spawn(async move { if let Err(error) = evict_environment(&state, &environment_id).await { eprintln!("environment eviction: {error:#}"); } });
+        },
+        HubMessage::Update { version } => {
+            state.transient.lock().unwrap().remove("update");
+            if state.policy.as_ref().is_some_and(|policy| !policy.self_update) {
+                state.emit(WorkerMessage::UpdateFailed { error: "self-update is disabled by this worker's policy (self_update: false)".into() });
+            } else {
+                let state = state.clone();
+                tokio::spawn(async move { if let Err(error) = self_update(&state, &version).await {
+                    eprintln!("self-update to {version}: {error:#}");
+                    state.emit(WorkerMessage::UpdateFailed { error: format!("{error:#}") });
+                } });
+            }
+        },
+        _ => bail!("unexpected hub control message"),
+    }
+    Ok(())
+}
+
+type ResumeMap = Arc<Mutex<HashMap<(String, String), (u64, bool, bool)>>>;
+
+fn oversized_metadata(state: &State, message: &WorkerMessage) -> Result<WorkerMessage> {
+    let reason = "metadata exceeds the 256 MiB decode budget; original results remain in the worker journal";
+    Ok(match message {
+        WorkerMessage::Finished { report } => {
+            if let Some(attempt) = state.attempts.lock().unwrap().get(&report.attempt_id).cloned() {
+                attempt.update(|journal| { journal.report.state = "failed".into(); journal.report.error = Some(reason.into()); })?;
+            }
+            WorkerMessage::Finished { report: AttemptReport { job_id: report.job_id.clone(), attempt_id: report.attempt_id.clone(), state: "failed".into(), exit_code: None, error: Some(reason.into()), results: vec![] } }
+        },
+        WorkerMessage::Environment { status } => {
+            let mut status = status.clone();
+            status.state = "failed".into(); status.error = Some("environment diagnostic exceeds the 256 MiB decode budget".into());
+            atomic_json(&state.data.join("environments").join(&status.environment_id).join(&status.revision).join("status.json"), &status)?;
+            state.environments.lock().unwrap().insert(env_key(&status.environment_id, &status.revision), status.clone());
+            WorkerMessage::Environment { status }
+        },
+        WorkerMessage::UpdateFailed { .. } => {
+            let message = WorkerMessage::UpdateFailed { error: "self-update diagnostic exceeds the 256 MiB decode budget; inspect the worker service log".into() };
+            state.transient.lock().unwrap().insert("update".into(), message.clone());
+            message
+        },
+        _ => bail!("oversized worker control message"),
+    })
+}
+
+async fn send_worker(state: &State, tx: &tokio::sync::mpsc::Sender<String>, message: &WorkerMessage, incremental: bool) -> Result<String> {
+    let (mut file, mut hash) = crate::snapshot::json_blob(&state.data.join("blobs"), message)?;
+    if file.as_file().metadata()?.len() > METADATA_BYTES {
+        (file, hash) = crate::snapshot::json_blob(&state.data.join("blobs"), &oversized_metadata(state, message)?)?;
+    }
+    let text = if incremental && file.as_file().metadata()?.len() > WS_INLINE_BYTES as u64 {
+        ensure!(matches!(message, WorkerMessage::Finished { .. } | WorkerMessage::Environment { .. } | WorkerMessage::UpdateFailed { .. }), "unsupported large worker message");
+        let response = state.client.head(format!("{}/v1/blobs/{hash}", state.hub)).bearer_auth(&state.token).send().await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND { upload_blob(state, &hash, file.path()).await?; }
+        else { response.error_for_status()?; }
+        serde_json::to_string(&WorkerMessage::Metadata { hash: hash.clone() })?
+    } else { fs::read_to_string(file.path())? };
+    tx.send(text).await?;
+    Ok(hash)
+}
+
+#[derive(Default)]
+struct LogTail { offset: u64, after: u64 }
+async fn replay_logs(path: &Path, tail: &mut LogTail, tx: &tokio::sync::mpsc::Sender<String>) -> Result<bool> {
+    let mut file = match File::open(path) { Ok(file) => file, Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true), Err(error) => return Err(error.into()) };
+    file.seek(SeekFrom::Start(tail.offset))?;
+    let mut reader = BufReader::new(file);
+    for _ in 0..128 {
+        let mut line = String::new();
+        let size = reader.read_line(&mut line)?;
+        // Leave an in-progress append for the next notification instead of consuming its prefix.
+        if size == 0 || !line.ends_with('\n') { return Ok(true); }
+        tail.offset += size as u64;
+        let Ok(entry) = serde_json::from_str::<LogEntry>(&line) else {
+            eprintln!("skipped unreadable log line in {}", path.display()); continue;
+        };
+        if entry.seq > tail.after {
+            let seq = entry.seq;
+            tx.send(serde_json::to_string(&WorkerMessage::Log { entry })?).await?;
+            tail.after = seq;
+        }
+    }
+    Ok(false)
+}
+
+async fn replay_and_follow(state: Arc<State>, mut events: broadcast::Receiver<WorkerMessage>, tx: tokio::sync::mpsc::Sender<String>, incremental: bool, resumes: ResumeMap, mut ready: watch::Receiver<bool>) -> Result<()> {
+    let attempts: Vec<_> = state.attempts.lock().unwrap().values().cloned().collect();
+    let statuses: Vec<_> = state.environments.lock().unwrap().values().cloned().collect();
+    let mut reports = HashMap::new();
+    if incremental {
+        for attempt in &attempts {
+            let message = {
+                let report = attempt.journal.lock().unwrap();
+                WorkerMessage::Inventory { job_id: report.report.job_id.clone(), attempt_id: report.report.attempt_id.clone(), state: report.report.state.clone() }
+            };
+            tx.send(serde_json::to_string(&message)?).await?;
+        }
+        for status in &statuses {
+            let hash = send_worker(&state, &tx, &WorkerMessage::Environment { status: status.clone() }, true).await?;
+            reports.insert(format!("environment:{}/{}", status.environment_id, status.revision), hash);
+            let message = WorkerMessage::Inventory { job_id: format!("environment:{}:{}", status.environment_id, status.revision), attempt_id: format!("environment:{}:{}:{}", state.id, status.environment_id, status.revision), state: String::new() };
+            tx.send(serde_json::to_string(&message)?).await?;
+        }
+        tx.send(serde_json::to_string(&WorkerMessage::Ready)?).await?;
+        while !*ready.borrow_and_update() { ready.changed().await?; }
+    }
+    let mut tails: HashMap<PathBuf, LogTail> = HashMap::new();
+    for attempt in &attempts {
+        let journal = attempt.journal.lock().unwrap();
+        if let Some(&(after, _, _)) = resumes.lock().unwrap().get(&(journal.report.job_id.clone(), journal.report.attempt_id.clone())) {
+            tails.insert(attempt.dir.join("logs.jsonl"), LogTail { offset: 0, after });
+        }
+    }
+    for status in statuses {
+        let key = (format!("environment:{}:{}", status.environment_id, status.revision), format!("environment:{}:{}:{}", state.id, status.environment_id, status.revision));
+        let after = resumes.lock().unwrap().get(&key).map_or(0, |r| r.0);
+        tails.insert(state.data.join("environments").join(status.environment_id).join(status.revision).join("logs.jsonl"), LogTail { offset: 0, after });
+    }
+    let transient: Vec<_> = state.transient.lock().unwrap().values().cloned().collect();
+    for message in transient { send_worker(&state, &tx, &message, incremental).await?; }
+    let mut pending = VecDeque::new();
+    enqueue_history(&state, &mut pending);
+    loop {
+        // A bounded backfill batch yields to live events, including results from newly assigned work.
+        for _ in 0..16 {
+            let event = if pending.is_empty() { events.recv().await } else { match events.try_recv() {
+                Ok(event) => Ok(event),
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Lagged(n)) => Err(broadcast::error::RecvError::Lagged(n)),
+                Err(broadcast::error::TryRecvError::Closed) => Err(broadcast::error::RecvError::Closed),
+            } };
+            match event {
+                Ok(WorkerMessage::Log { entry }) => {
+                    if let Some(environment) = entry.job_id.strip_prefix("environment:") {
+                        if let Some((id, revision)) = environment.split_once(':') {
+                            let status = state.environments.lock().unwrap().get(&env_key(id, revision)).cloned();
+                            if let Some(status) = status { enqueue(&mut pending, Replay::Environment(status), false); }
+                        }
+                    } else {
+                        let attempt = state.attempts.lock().unwrap().get(&entry.attempt_id).cloned();
+                        if let Some(attempt) = attempt { enqueue(&mut pending, Replay::Attempt(attempt), false); }
                     }
                 },
-                Some(Ok(Message::Ping(bytes))) => sink.send(Message::Pong(bytes)).await?,
-                Some(Ok(Message::Close(_))) | None => return Ok(()),
-                Some(Err(error)) => return Err(error.into()),
-                _ => {},
-            },
-            event = events.recv() => match event {
-                Ok(message) => sink.send(Message::Text(serde_json::to_string(&message)?.into())).await?,
-                Err(broadcast::error::RecvError::Lagged(_)) => bail!("event stream lagged; reconnect to replay durable logs"),
-                Err(_) => return Ok(()),
-            },
-            _ = heartbeat.tick() => {
-                let message = match sampler.as_mut() {
-                    Some(sampler) => WorkerMessage::Metrics { metrics: sampler.sample(&state.data) },
-                    None => WorkerMessage::Heartbeat,
-                };
-                sink.send(Message::Text(serde_json::to_string(&message)?.into())).await?
+                Ok(WorkerMessage::Finished { report }) => {
+                    let attempt = state.attempts.lock().unwrap().get(&report.attempt_id).cloned();
+                    if let Some(attempt) = attempt { enqueue(&mut pending, Replay::Attempt(attempt), true); }
+                    else { send_worker(&state, &tx, &WorkerMessage::Finished { report }, incremental).await?; }
+                },
+                Ok(WorkerMessage::Environment { status }) if status.state != "evicted" => enqueue(&mut pending, Replay::Environment(status), true),
+                Ok(message) => { send_worker(&state, &tx, &message, incremental).await?; },
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    enqueue_history(&state, &mut pending);
+                    let transient: Vec<_> = state.transient.lock().unwrap().values().cloned().collect();
+                    for message in transient { send_worker(&state, &tx, &message, incremental).await?; }
+                    break;
+                },
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
             }
+        }
+        if let Some(item) = pending.pop_front() {
+            let complete = match &item {
+                Replay::Attempt(attempt) => replay_attempt(&state, attempt, &tx, incremental, &resumes, &mut tails, &mut reports).await?,
+                Replay::Environment(status) => {
+                    let key = (format!("environment:{}:{}", status.environment_id, status.revision), format!("environment:{}:{}:{}", state.id, status.environment_id, status.revision));
+                    if resumes.lock().unwrap().get(&key).is_some_and(|r| r.2) { true } else {
+                        let message = WorkerMessage::Environment { status: status.clone() };
+                        let (file, hash) = crate::snapshot::json_blob(&state.data.join("blobs"), &message)?;
+                        drop(file);
+                        let key = format!("environment:{}/{}", status.environment_id, status.revision);
+                        if reports.get(&key) != Some(&hash) {
+                            send_worker(&state, &tx, &message, incremental).await?;
+                            reports.insert(key, hash);
+                        }
+                        let path = state.data.join("environments").join(&status.environment_id).join(&status.revision).join("logs.jsonl");
+                        replay_logs(&path, tails.entry(path.clone()).or_default(), &tx).await?
+                    }
+                },
+            };
+            if !complete { pending.push_back(item); }
+            tokio::task::yield_now().await;
         }
     }
 }
 
-async fn hub_accepts_metrics(state: &State) -> bool {
+enum Replay { Attempt(Arc<Attempt>), Environment(EnvironmentStatus) }
+impl Replay {
+    fn key(&self) -> String { match self {
+        Self::Attempt(attempt) => attempt.dir.to_string_lossy().into_owned(),
+        Self::Environment(status) => format!("environment:{}:{}", status.environment_id, status.revision),
+    } }
+}
+fn enqueue(pending: &mut VecDeque<Replay>, item: Replay, front: bool) {
+    let key = item.key();
+    if let Some(index) = pending.iter().position(|item| item.key() == key) {
+        if !front { return; }
+        pending.remove(index);
+    }
+    if front { pending.push_front(item); } else { pending.push_back(item); }
+}
+fn enqueue_history(state: &State, pending: &mut VecDeque<Replay>) {
+    for attempt in state.attempts.lock().unwrap().values() { enqueue(pending, Replay::Attempt(attempt.clone()), false); }
+    for status in state.environments.lock().unwrap().values() { enqueue(pending, Replay::Environment(status.clone()), false); }
+}
+
+async fn replay_attempt(state: &State, attempt: &Attempt, tx: &tokio::sync::mpsc::Sender<String>, incremental: bool, resumes: &ResumeMap, tails: &mut HashMap<PathBuf, LogTail>, reports: &mut HashMap<String, String>) -> Result<bool> {
+    let report = attempt.report();
+    let resume = resumes.lock().unwrap().get(&(report.job_id.clone(), report.attempt_id.clone())).copied();
+    if resume.is_some_and(|r| r.2) { return Ok(true); }
+    let path = attempt.dir.join("logs.jsonl");
+    if !replay_logs(&path, tails.entry(path.clone()).or_default(), tx).await? { return Ok(false); }
+    if !resume.is_some_and(|r| r.1) && matches!(report.state.as_str(), "succeeded" | "failed" | "cancelled" | "unknown") {
+        let message = WorkerMessage::Finished { report };
+        let (file, hash) = crate::snapshot::json_blob(&state.data.join("blobs"), &message)?;
+        drop(file);
+        if reports.get(&attempt.dir.to_string_lossy().to_string()) != Some(&hash) {
+            send_worker(state, tx, &message, incremental).await?;
+            reports.insert(attempt.dir.to_string_lossy().to_string(), hash);
+        }
+    }
+    Ok(true)
+}
+
+async fn hub_capabilities(state: &State) -> Vec<String> {
     let health = async {
         let response = state.client.get(format!("{}/health", state.hub)).send().await?;
         response.error_for_status()?.json::<serde_json::Value>().await
     };
-    health.await.is_ok_and(|health| {
-        health["capabilities"]
-            .as_array()
-            .is_some_and(|capabilities| capabilities.iter().any(|c| c == "worker_metrics"))
-    })
+    health.await.ok().and_then(|health| serde_json::from_value(health["capabilities"].clone()).ok()).unwrap_or_default()
 }
 
 /// CPU usage is the change in cumulative ticks between two samples.
@@ -743,6 +955,66 @@ fn load_average() -> Option<f64> {
     None // Windows has no load average.
 }
 
+fn accept_reference(state: Arc<State>, job_id: String, attempt_id: String, hash: String) -> Result<()> {
+    identifier(&job_id)?; identifier(&attempt_id)?; validate_hash(&hash)?;
+    let attempt = {
+        let mut attempts = state.attempts.lock().unwrap();
+        if let Some(attempt) = attempts.get(&attempt_id) {
+            ensure!(attempt.report().job_id == job_id, "attempt belongs to another job");
+            let journal = attempt.journal.lock().unwrap();
+            if let Some(expected) = &journal.delivery { ensure!(expected == &hash, "delivery changed for the same attempt"); }
+            drop(journal);
+            attempt.clone()
+        } else {
+            let dir = state.data.join("attempts").join(&attempt_id);
+            private_dir(&dir)?;
+            let journal = Journal { report: AttemptReport { job_id, attempt_id: attempt_id.clone(), state: "assigned".into(), exit_code: None, error: None, results: vec![] }, seq: 0, delivery: Some(hash), pid: None, container: None, runtime: None, windows_job: None };
+            atomic_json(&dir.join("journal.json"), &journal)?;
+            let (cancel, _) = watch::channel(false);
+            let attempt = Arc::new(Attempt { dir, journal: Mutex::new(journal), cancel });
+            attempts.insert(attempt_id, attempt.clone());
+            attempt
+        }
+    };
+    resume_delivery(state, attempt);
+    Ok(())
+}
+fn resume_delivery(state: Arc<State>, attempt: Arc<Attempt>) {
+    let journal = attempt.journal.lock().unwrap().clone();
+    let Some(hash) = journal.delivery else { state.emit(WorkerMessage::Finished { report: journal.report }); return; };
+    let id = journal.report.attempt_id;
+    if !state.downloads.lock().unwrap().insert(id.clone()) { return; }
+    let mut cancel = attempt.cancel.subscribe();
+    tokio::spawn(async move {
+        let accepted_cancel = cancel.clone();
+        let fetch = async {
+            let _drain = state.drain.read().await;
+            let path = ensure_metadata(&state, &hash).await?;
+            let message = tokio::task::spawn_blocking(move || -> Result<HubMessage> { Ok(serde_json::from_reader(BufReader::new(File::open(path)?))?) }).await??;
+            let HubMessage::Run { job, environment } = message else { bail!("delivery was not a Run") };
+            ensure!(job.id == journal.report.job_id && job.attempt_id == id, "delivery job/attempt identity mismatch");
+            cancelled(&accepted_cancel)?;
+            accept(state.clone(), *job, environment)?;
+            Ok::<_, anyhow::Error>(())
+        };
+        let result = tokio::select! { result = fetch => result, _ = cancel.changed() => Err(anyhow::anyhow!("job cancelled during metadata download")) };
+        if let Err(error) = result {
+            let report = attempt.update(|journal| {
+                journal.delivery = None;
+                journal.report.state = if *cancel.borrow() { "cancelled" } else { "failed" }.into();
+                journal.report.error = Some(format!("metadata delivery: {error:#}"));
+            });
+            match report { Ok(report) => state.emit(WorkerMessage::Finished { report }), Err(error) => eprintln!("cannot persist metadata delivery outcome: {error:#}") }
+        }
+        state.downloads.lock().unwrap().remove(&id);
+    });
+}
+async fn ensure_metadata(state: &State, hash: &str) -> Result<PathBuf> {
+    let path = ensure_blob_bounded(state, hash, None, Some(METADATA_BYTES)).await?;
+    ensure!(fs::metadata(&path)?.len() <= METADATA_BYTES, "metadata exceeds the 256 MiB decode budget");
+    Ok(path)
+}
+
 fn accept(state: Arc<State>, job: Job, environment: Option<Environment>) -> Result<()> {
     identifier(&job.id)?;
     identifier(&job.attempt_id)?;
@@ -751,20 +1023,17 @@ fn accept(state: Arc<State>, job: Job, environment: Option<Environment>) -> Resu
         state.environment_dir(environment)?;
     }
     let mut attempts = state.attempts.lock().unwrap();
-    if let Some(existing) = attempts.get(&job.attempt_id) {
-        ensure!(
-            existing.report().job_id == job.id,
-            "attempt belongs to another job"
-        );
+    let attempt = if let Some(existing) = attempts.get(&job.attempt_id) {
+        ensure!(existing.report().job_id == job.id, "attempt belongs to another job");
         let report = existing.report();
-        if matches!(
-            report.state.as_str(),
-            "succeeded" | "failed" | "cancelled" | "unknown"
-        ) {
-            state.emit(WorkerMessage::Finished { report });
+        if existing.journal.lock().unwrap().delivery.is_none() {
+            if matches!(report.state.as_str(), "succeeded" | "failed" | "cancelled" | "unknown") { state.emit(WorkerMessage::Finished { report }); }
+            return Ok(());
         }
-        return Ok(());
-    }
+        atomic_json(&existing.dir.join("job.json"), &job.spec)?;
+        existing.update(|journal| journal.delivery = None)?;
+        existing.clone()
+    } else {
     let dir = state.data.join("attempts").join(&job.attempt_id);
     private_dir(&dir)?;
     let report = AttemptReport {
@@ -782,16 +1051,20 @@ fn accept(state: Arc<State>, job: Job, environment: Option<Environment>) -> Resu
         container: None,
         runtime: None,
         windows_job: None,
+        delivery: None,
     };
     atomic_json(&dir.join("journal.json"), &journal)?;
     atomic_json(&dir.join("job.json"), &job.spec)?;
-    let (cancel, receiver) = watch::channel(false);
+    let (cancel, _) = watch::channel(false);
     let attempt = Arc::new(Attempt {
         dir,
         journal: Mutex::new(journal),
         cancel,
     });
-    attempts.insert(job.attempt_id.clone(), attempt.clone());
+        attempts.insert(job.attempt_id.clone(), attempt.clone());
+        attempt
+    };
+    let receiver = attempt.cancel.subscribe();
     drop(attempts);
     tokio::spawn(async move {
         let result = run_attempt(
@@ -1123,24 +1396,43 @@ async fn container_absent(runtime: &str, name: &str) -> Result<bool> {
         .split(|c: char| c.is_whitespace() || c == ',')
         .any(|value| value == name))
 }
+fn cancel_delivery(state: &State, job_id: &str, attempt_id: &str) -> Result<bool> {
+    // Serialize with accept(): an undelivered assignment has no process to fence.
+    let attempts = state.attempts.lock().unwrap();
+    let Some(attempt) = attempts.get(attempt_id) else { return Ok(false) };
+    ensure!(attempt.report().job_id == job_id, "cancel job identity mismatch");
+    if attempt.journal.lock().unwrap().delivery.is_none() { return Ok(false); }
+    attempt.cancel.send_replace(true); // Retain cancellation even before a download subscribes.
+    let report = attempt.update(|journal| {
+        journal.delivery = None;
+        journal.report.state = "cancelled".into();
+        journal.report.error = Some("cancelled before metadata delivery completed".into());
+    })?;
+    state.emit(WorkerMessage::Finished { report });
+    Ok(true)
+}
+
 async fn request_cancel(state: &Arc<State>, job_id: &str, attempt_id: &str) -> Result<()> {
-    let attempt = state.attempts.lock().unwrap().get(attempt_id).cloned();
-    let Some(attempt) = attempt else {
-        // `accept` journals every attempt before it runs and attempts are never pruned, so an
-        // unrecorded attempt never ran here. Confirm the cancel so the Hub releases its slot.
-        identifier(job_id)?;
-        identifier(attempt_id)?;
-        state.emit(WorkerMessage::Finished {
-            report: AttemptReport {
-                job_id: job_id.into(),
-                attempt_id: attempt_id.into(),
-                state: "cancelled".into(),
-                exit_code: None,
-                error: Some("cancelled; this worker never accepted the attempt".into()),
-                results: vec![],
-            },
-        });
-        return Ok(());
+    if cancel_delivery(state, job_id, attempt_id)? { return Ok(()); }
+    let attempt = {
+        let mut attempts = state.attempts.lock().unwrap();
+        if let Some(attempt) = attempts.get(attempt_id) { attempt.clone() } else {
+            identifier(job_id)?;
+            identifier(attempt_id)?;
+            let report = AttemptReport {
+                job_id: job_id.into(), attempt_id: attempt_id.into(), state: "cancelled".into(),
+                exit_code: None, error: Some("cancelled; this worker never accepted the attempt".into()), results: vec![],
+            };
+            // A cancel may overtake a streamed Run; persist the tombstone before acknowledging it.
+            let dir = state.data.join("attempts").join(attempt_id);
+            private_dir(&dir)?;
+            let journal = Journal { report: report.clone(), seq: 0, pid: None, container: None, runtime: None, windows_job: None, delivery: None };
+            atomic_json(&dir.join("journal.json"), &journal)?;
+            let (cancel, _) = watch::channel(false);
+            attempts.insert(attempt_id.into(), Arc::new(Attempt { dir, journal: Mutex::new(journal), cancel }));
+            state.emit(WorkerMessage::Finished { report });
+            return Ok(());
+        }
     };
     ensure!(
         attempt.report().job_id == job_id,
@@ -1422,7 +1714,7 @@ async fn run_attempt(
             // A ready environment ran the setup in its definition.json; that is what was checked.
             let definition = state.environment_dir(environment)?.join("definition.json");
             if definition.exists() {
-                let existing: Environment = serde_json::from_reader(File::open(&definition)?)?;
+                let existing: Environment = serde_json::from_reader(BufReader::new(File::open(&definition)?))?;
                 ensure!(
                     serde_json::to_value(&existing)? == serde_json::to_value(environment)?,
                     "prepared environment {} differs from the definition the Hub sent; delete the environment and prepare it again",
@@ -1884,9 +2176,13 @@ async fn verify_container_mount(
 }
 
 async fn ensure_blob(state: &State, hash: &str, size: Option<u64>) -> Result<PathBuf> {
+    ensure_blob_bounded(state, hash, size, None).await
+}
+async fn ensure_blob_bounded(state: &State, hash: &str, size: Option<u64>, limit: Option<u64>) -> Result<PathBuf> {
     validate_hash(hash)?;
     let path = state.data.join("blobs").join(hash);
     if path.exists() {
+        ensure!(limit.is_none_or(|limit| fs::metadata(&path).is_ok_and(|meta| meta.len() <= limit)), "metadata exceeds the 256 MiB decode budget");
         verify_file(&path, hash, size)?;
         return Ok(path);
     }
@@ -1897,11 +2193,13 @@ async fn ensure_blob(state: &State, hash: &str, size: Option<u64>) -> Result<Pat
         .send()
         .await?
         .error_for_status()?;
-    let temp = path.with_extension(format!("{}.part", uuid::Uuid::new_v4()));
+    ensure!(limit.is_none_or(|limit| response.content_length().is_none_or(|length| length <= limit)), "metadata exceeds the 256 MiB decode budget");
+    let temporary = tempfile::NamedTempFile::new_in(state.data.join("blobs"))?;
+    let temp = temporary.path().to_owned();
     let result = async {
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
-            .create_new(true)
+            .truncate(true)
             .open(&temp)
             .await?;
         let mut stream = response.bytes_stream();
@@ -1910,6 +2208,7 @@ async fn ensure_blob(state: &State, hash: &str, size: Option<u64>) -> Result<Pat
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             written += chunk.len() as u64;
+            ensure!(limit.is_none_or(|limit| written <= limit), "metadata exceeds the 256 MiB decode budget");
             ensure!(
                 size.is_none_or(|size| written <= size),
                 "blob exceeds declared size"
@@ -2251,9 +2550,9 @@ async fn verify_tools(
     Ok(())
 }
 fn resolved_image(state: &State, environment: &Environment) -> Result<String> {
-    serde_json::from_reader(File::open(
+    serde_json::from_reader(BufReader::new(File::open(
         state.environment_dir(environment)?.join("image.json"),
-    )?)
+    )?))
     .context("environment has no verified local image; prepare it first")
 }
 fn environment_logger(state: &State, environment: &Environment) -> Result<Arc<Attempt>> {
@@ -2295,6 +2594,7 @@ fn environment_logger(state: &State, environment: &Environment) -> Result<Arc<At
             container: None,
             runtime: None,
             windows_job: None,
+            delivery: None,
         }),
     }))
 }
@@ -2441,7 +2741,7 @@ async fn prepare(state: &Arc<State>, environment: &Environment, explicit: bool) 
         private_dir(&dir.join("bin"))?;
         let definition = dir.join("definition.json");
         if definition.exists() {
-            let existing: Environment = serde_json::from_reader(File::open(&definition)?)?;
+            let existing: Environment = serde_json::from_reader(BufReader::new(File::open(&definition)?))?;
             ensure!(
                 serde_json::to_value(existing)? == serde_json::to_value(environment)?,
                 "environment revision is immutable; choose a new revision"
@@ -3186,10 +3486,243 @@ mod tests {
             caches: Mutex::new(HashSet::new()),
             workspaces: Mutex::new(HashSet::new()),
             events,
+            transient: Mutex::new(HashMap::new()),
+        downloads: Mutex::new(HashSet::new()),
             policy: None,
         metrics: false,
         })
     }
+    #[tokio::test]
+    async fn log_tail_preserves_gaps_and_retries_an_incomplete_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs");
+        let entry = |seq| LogEntry { job_id: "job".into(), attempt_id: "attempt".into(), seq, stream: "stdout".into(), text: "x".into() };
+        fs::write(&path, format!("{}\ninvalid\n{}\n{{", serde_json::to_string(&entry(1)).unwrap(), serde_json::to_string(&entry(3)).unwrap())).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let mut tail = LogTail { offset: 0, after: 1 };
+        assert!(replay_logs(&path, &mut tail, &tx).await.unwrap());
+        let WorkerMessage::Log { entry: received } = serde_json::from_str(&rx.recv().await.unwrap()).unwrap() else { panic!() };
+        assert_eq!(received.seq, 3);
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(tail.offset)).unwrap();
+        writeln!(file, "{}", serde_json::to_string(&entry(4)).unwrap()).unwrap();
+        assert!(replay_logs(&path, &mut tail, &tx).await.unwrap());
+        let WorkerMessage::Log { entry: received } = serde_json::from_str(&rx.recv().await.unwrap()).unwrap() else { panic!() };
+        assert_eq!(received.seq, 4);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn backfill_yields_to_live_completion_even_when_notifications_lag() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_at(dir.path());
+        let old = attempt_at(dir.path(), "old");
+        state.attempts.lock().unwrap().insert("old".into(), old.clone());
+        for _ in 0..1000 { old.log(&state, "stdout", "history".into()).unwrap(); }
+        let events = state.events.subscribe();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let (_ready_tx, ready) = watch::channel(true);
+        let producer = tokio::spawn(replay_and_follow(state.clone(), events, tx, false, Arc::new(Mutex::new(HashMap::new())), ready));
+        rx.recv().await.unwrap(); // The bounded writer is now in the first backfill batch.
+        let fresh = attempt_at(dir.path(), "fresh");
+        let report = fresh.update(|journal| journal.report.state = "cancelled".into()).unwrap();
+        state.attempts.lock().unwrap().insert("fresh".into(), fresh);
+        state.emit(WorkerMessage::Finished { report });
+        for _ in 0..200 { old.log(&state, "stdout", "live".into()).unwrap(); }
+        let before = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut logs = 1;
+            loop {
+                let text = rx.recv().await.unwrap();
+                match serde_json::from_str::<WorkerMessage>(&text).unwrap() {
+                    WorkerMessage::Finished { report } if report.attempt_id == "fresh" => return logs,
+                    WorkerMessage::Log { .. } => logs += 1,
+                    _ => {},
+                }
+            }
+        }).await.unwrap();
+        producer.abort();
+        assert!(before < 1200, "the live completion must precede the full old history ({before})");
+        assert_eq!(old.report().state, "assigned");
+    }
+
+    #[test]
+    fn metadata_failure_retains_original_outputs_and_eviction_cache_tracks_revisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_at(dir.path());
+        let attempt = attempt_at(dir.path(), "done");
+        let report = attempt.update(|journal| {
+            journal.report.state = "succeeded".into();
+            journal.report.results.push(FileEntry { path: "out/a".into(), hash: "a".repeat(64), size: 0, mode: 0o600 });
+        }).unwrap();
+        state.attempts.lock().unwrap().insert("done".into(), attempt.clone());
+        let WorkerMessage::Finished { report } = oversized_metadata(&state, &WorkerMessage::Finished { report }).unwrap() else { panic!() };
+        assert_eq!(report.state, "failed"); assert!(report.results.is_empty());
+        assert_eq!(attempt.report().results.len(), 1);
+        assert_eq!(attempt.report().state, "failed");
+        for revision in ["v1", "v2"] { state.emit(WorkerMessage::Environment { status: EnvironmentStatus { worker_id: "test".into(), environment_id: "env".into(), revision: revision.into(), state: "evicted".into(), error: None } }); }
+        assert_eq!(state.transient.lock().unwrap().len(), 2);
+        state.emit(WorkerMessage::Environment { status: EnvironmentStatus { worker_id: "test".into(), environment_id: "env".into(), revision: "v1".into(), state: "ready".into(), error: None } });
+        assert_eq!(state.transient.lock().unwrap().len(), 1);
+        assert!(state.transient.lock().unwrap().contains_key("environment:env/v2"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_reader_runs_and_cancels_while_peer_stops_reading_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state_at(dir.path());
+        let old = attempt_at(dir.path(), "old");
+        let mut file = File::create(old.dir.join("logs.jsonl")).unwrap();
+        for seq in 1..=6000 {
+            let entry = LogEntry { job_id: "job".into(), attempt_id: "old".into(), seq, stream: "stdout".into(), text: "x".repeat(8192) };
+            serde_json::to_writer(&mut file, &entry).unwrap(); writeln!(file).unwrap();
+        }
+        drop(file);
+        state.attempts.lock().unwrap().insert("old".into(), old);
+        let discarded = attempt_at(dir.path(), "discarded");
+        discarded.update(|journal| { journal.delivery = Some("a".repeat(64)); }).unwrap();
+        state.attempts.lock().unwrap().insert("discarded".into(), discarded.clone());
+        let (commands, receiver) = tokio::sync::mpsc::channel::<HubMessage>(4);
+        let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
+        let connected = Arc::new(tokio::sync::Notify::new());
+        let app = {
+            let connected = connected.clone();
+            axum::Router::new().route("/health", axum::routing::get(|| async { axum::Json(serde_json::json!({"capabilities": ["incremental_reconnect"]})) }))
+                .route("/v1/worker/ws", axum::routing::get(move |ws: axum::extract::WebSocketUpgrade| {
+                    let receiver = receiver.clone(); let connected = connected.clone();
+                    async move { ws.on_upgrade(move |mut socket| async move {
+                        let axum::extract::ws::Message::Text(hello) = socket.recv().await.unwrap().unwrap() else { panic!() };
+                        assert!(matches!(serde_json::from_str::<WorkerMessage>(&hello).unwrap(), WorkerMessage::Hello { incremental: true, attempts, environments, .. } if attempts.is_empty() && environments.is_empty()));
+                        loop {
+                            let axum::extract::ws::Message::Text(text) = socket.recv().await.unwrap().unwrap() else { continue };
+                            match serde_json::from_str::<WorkerMessage>(&text).unwrap() {
+                                WorkerMessage::Inventory { job_id, attempt_id, .. } => {
+                                    let discard = attempt_id == "discarded";
+                                    socket.send(axum::extract::ws::Message::Text(serde_json::to_string(&HubMessage::Resume { job_id, attempt_id, after: 0, terminal: discard, discard }).unwrap().into())).await.unwrap();
+                                },
+                                WorkerMessage::Ready => {
+                                    socket.send(axum::extract::ws::Message::Text(serde_json::to_string(&HubMessage::Ready).unwrap().into())).await.unwrap();
+                                    break;
+                                },
+                                _ => {},
+                            }
+                        }
+                        connected.notify_one(); // Never drain the following history.
+                        while let Some(command) = receiver.lock().await.recv().await {
+                            if socket.send(axum::extract::ws::Message::Text(serde_json::to_string(&command).unwrap().into())).await.is_err() { break; }
+                        }
+                    }) }
+                }))
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Arc::get_mut(&mut state).unwrap().hub = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let socket = tokio::spawn(connection(state.clone()));
+        connected.notified().await;
+        let mut job = policy_job(&["sh", "-c", "sleep 30"], None);
+        job.id = "live".into(); job.attempt_id = "live".into();
+        commands.send(HubMessage::Run { job: Box::new(job), environment: None }).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state.attempts.lock().unwrap().get("live").is_some_and(|a| a.report().state == "running") { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("Run must be read while replay is backpressured");
+        commands.send(HubMessage::Cancel { job_id: "live".into(), attempt_id: "live".into() }).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.attempts.lock().unwrap()["live"].report().state != "cancelled" { tokio::task::yield_now().await; }
+        }).await.expect("Cancel must be read while replay is backpressured");
+        assert_eq!(discarded.report().state, "cancelled");
+        assert!(discarded.journal.lock().unwrap().delivery.is_none());
+        assert!(!discarded.dir.join("job.json").exists(), "a discarded delivery must never be fetched or accepted");
+        assert!(!socket.is_finished());
+        socket.abort(); server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streamed_delivery_cancels_partial_download_and_resumes_after_restart_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("executions");
+        let job = policy_job(&["sh", "-c", "printf once >> \"$1\"", "sh", marker.to_str().unwrap()], None);
+        let bytes = Arc::new(serde_json::to_vec(&HubMessage::Run { job: Box::new(job), environment: None }).unwrap());
+        let hash = hex::encode(Sha256::digest(bytes.as_slice()));
+        let gate = Arc::new(Semaphore::new(0));
+        let requests = Arc::new(tokio::sync::Notify::new());
+        let app = {
+            let gate = gate.clone(); let requests = requests.clone();
+            axum::Router::new().route("/v1/blobs/{hash}", axum::routing::get(move || {
+                let bytes = bytes.clone(); let gate = gate.clone(); let requests = requests.clone();
+                async move {
+                    requests.notify_one();
+                    let stream = futures_util::stream::unfold(0, move |stage| {
+                        let bytes = bytes.clone(); let gate = gate.clone();
+                        async move { match stage {
+                            0 => Some((Ok::<_, std::io::Error>(bytes[..64].to_vec()), 1)),
+                            1 => { gate.acquire().await.unwrap().forget(); Some((Ok(bytes[64..].to_vec()), 2)) },
+                            _ => None,
+                        } }
+                    });
+                    axum::body::Body::from_stream(stream)
+                }
+            }))
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut state = state_at(dir.path()); Arc::get_mut(&mut state).unwrap().hub = url.clone();
+        accept_reference(state.clone(), "job".into(), "attempt".into(), hash.clone()).unwrap();
+        requests.notified().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fs::read_dir(dir.path().join("blobs")).unwrap().count() == 0 { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        request_cancel(&state, "job", "attempt").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !state.downloads.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        assert_eq!(state.attempts.lock().unwrap()["attempt"].report().state, "cancelled");
+        assert_eq!(fs::read_dir(dir.path().join("blobs")).unwrap().count(), 0, "cancel must remove partial downloads");
+        assert!(!marker.exists());
+        // Model a process exit after durable receipt but before download: only its journal survives.
+        state.attempts.lock().unwrap()["attempt"].update(|journal| { journal.report.state = "assigned".into(); journal.delivery = Some(hash.clone()); }).unwrap();
+        let mut restarted = state_at(dir.path()); Arc::get_mut(&mut restarted).unwrap().hub = url;
+        load_state(&restarted).await.unwrap();
+        let attempt = restarted.attempts.lock().unwrap()["attempt"].clone();
+        assert_eq!(attempt.report().state, "assigned");
+        resume_delivery(restarted.clone(), attempt.clone());
+        requests.notified().await;
+        gate.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while attempt.report().state != "succeeded" { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        assert!(attempt.journal.lock().unwrap().delivery.is_none());
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "once");
+        accept_reference(restarted.clone(), "job".into(), "attempt".into(), hash.clone()).unwrap();
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "once");
+        while !restarted.downloads.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
+        attempt.update(|journal| { journal.report.state = "assigned".into(); journal.delivery = Some(hash); }).unwrap();
+        handle_hub_message(&restarted, HubMessage::Cancel { job_id: "job".into(), attempt_id: "attempt".into() }, &Mutex::new(HashSet::new())).unwrap();
+        assert!(*attempt.cancel.borrow(), "Cancel must be fixed before a following Ready can resume");
+        assert_eq!(attempt.report().state, "cancelled");
+        resume_delivery(restarted.clone(), attempt.clone());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !restarted.downloads.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        assert_eq!(attempt.report().state, "cancelled");
+        assert!(attempt.journal.lock().unwrap().delivery.is_none());
+        assert_eq!(fs::read_to_string(marker).unwrap(), "once");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cached_metadata_is_rejected_before_decoding_when_over_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_at(dir.path());
+        let hash = "a".repeat(64);
+        File::create(state.data.join("blobs").join(&hash)).unwrap().set_len(METADATA_BYTES + 1).unwrap();
+        assert!(ensure_metadata(&state, &hash).await.unwrap_err().to_string().contains("256 MiB"));
+    }
+
     #[test]
     fn podman_relabels_owned_mounts_without_disabling_selinux() {
         let temp = tempfile::tempdir().unwrap();
@@ -3240,6 +3773,7 @@ mod tests {
             container: None,
             runtime: None,
             windows_job: None,
+            delivery: None,
         };
         atomic_json(&dir.join("journal.json"), &journal).unwrap();
         Arc::new(Attempt {
@@ -3946,7 +4480,7 @@ mod tests {
             WorkerMessage::Finished { report }
                 if report.state == "cancelled" && report.job_id == "job" && report.attempt_id == "lost-attempt"
         ));
-        assert!(state.attempts.lock().unwrap().is_empty());
+        assert_eq!(state.attempts.lock().unwrap()["lost-attempt"].report().state, "cancelled");
     }
     #[cfg(unix)]
     #[tokio::test]
@@ -4227,7 +4761,7 @@ mod tests {
                 if status.state == "failed"
                     && status.error.as_deref().is_some_and(|error| error.contains("could not persist environment failure"))
         ));
-        let WorkerMessage::Hello { environments, .. } = state.hello() else {
+        let WorkerMessage::Hello { environments, .. } = state.hello(false) else {
             panic!("expected worker hello");
         };
         assert_eq!(environments.len(), 1);

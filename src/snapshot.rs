@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs::{self, File},
-    io::{Read, Write},
+    io::{BufWriter, Read, Write},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -332,6 +332,19 @@ fn wildcard(pattern: &str, name: &str) -> bool {
         }
     }
     rest.len() >= last.len() && rest.ends_with(last)
+}
+
+/// Serialize without allocating a second in-memory copy of a large manifest.
+pub fn json_blob(directory: &Path, value: &impl Serialize) -> Result<(tempfile::NamedTempFile, String)> {
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    {
+        let mut writer = BufWriter::new(file.as_file_mut());
+        serde_json::to_writer(&mut writer, value)?;
+        writer.flush()?;
+    }
+    file.as_file_mut().sync_all()?;
+    let hash = hash_file(file.path())?;
+    Ok((file, hash))
 }
 
 pub fn hash_file(path: &Path) -> Result<String> {

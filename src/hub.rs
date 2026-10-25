@@ -21,9 +21,10 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeSet, HashMap},
+    io::BufReader,
     path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::{io::AsyncWriteExt, sync::mpsc};
 use tokio_util::io::ReaderStream;
@@ -76,6 +77,8 @@ struct Session {
     tx: mpsc::UnboundedSender<HubMessage>,
     /// The scoped token the worker authenticated with, so revoking it closes the session.
     token: Option<String>,
+    reconciling: bool,
+    missing: BTreeSet<(String, String)>,
 }
 /// Audit rows kept; older events are pruned so a busy pool cannot fill the disk.
 const AUDIT_RETENTION: i64 = 10_000;
@@ -165,6 +168,7 @@ impl Store {
         let db = Connection::open(data.join("hub.sqlite"))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
             CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, data TEXT NOT NULL, environment TEXT, cancel_requested INTEGER NOT NULL DEFAULT 0);
+            CREATE INDEX IF NOT EXISTS jobs_state_worker ON jobs(json_extract(data,'$.state'),json_extract(data,'$.worker_id'));
             CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS worker_settings (id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS environments (id TEXT PRIMARY KEY, data TEXT NOT NULL);
@@ -271,6 +275,72 @@ impl Store {
             }
             _ => self.rows("SELECT data FROM jobs ORDER BY rowid"),
         }
+    }
+    fn job_summaries(&self, query: &JobListQuery) -> Result<JobList> {
+        let limit = query.limit.unwrap_or(50);
+        let offset = query.offset.unwrap_or(0);
+        let state = query.state.as_deref().unwrap_or("");
+        let worker = query.worker.as_deref().unwrap_or("");
+        let needle = query.q.as_deref().unwrap_or("").trim();
+        let filtered = !state.is_empty() || !worker.is_empty() || !needle.is_empty();
+        let mut predicates = Vec::new();
+        let mut values: Vec<rusqlite::types::Value> = Vec::new();
+        if state == "active" {
+            predicates.push("json_extract(data,'$.state') IN ('assigned','running')");
+        } else if !state.is_empty() {
+            predicates.push("json_extract(data,'$.state')=?");
+            values.push(state.to_owned().into());
+        }
+        if !worker.is_empty() {
+            predicates.push("json_extract(data,'$.worker_id')=?");
+            values.push(worker.to_owned().into());
+        }
+        if !needle.is_empty() {
+            predicates.push("instr(lower(id || ' ' || json_extract(data,'$.state') || ' ' || COALESCE(json_extract(data,'$.worker_id'),'') || ' ' || COALESCE(environment,'') || ' ' || COALESCE(json_extract(data,'$.submitted_by'),'') || ' ' || json_extract(data,'$.spec.command')),lower(?))>0");
+            values.push(needle.to_owned().into());
+        }
+        let predicate = if filtered { predicates.join(" AND ") } else { "1".into() };
+        let total = if filtered {
+            self.db.query_row(&format!("SELECT COUNT(*) FROM jobs WHERE {predicate}"), rusqlite::params_from_iter(values.iter()), |row| row.get(0))?
+        } else {
+            self.db.query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))?
+        };
+        let mut statement = self.db.prepare(&format!("SELECT json_object(
+            'id',id,'state',json_extract(data,'$.state'),
+            'command',COALESCE(substr((SELECT group_concat(value,' ') FROM json_each(jobs.data,'$.spec.command')),1,241),''),
+            'environment',json_extract(data,'$.spec.environment'),
+            'worker_id',json_extract(data,'$.worker_id'),
+            'created_at',json_extract(data,'$.created_at'),'updated_at',json_extract(data,'$.updated_at'),
+            'submitted_by',json_extract(data,'$.submitted_by'))
+            FROM jobs WHERE {predicate} ORDER BY rowid DESC LIMIT ? OFFSET ?"))?;
+        values.extend([rusqlite::types::Value::Integer(limit as i64), rusqlite::types::Value::Integer(offset as i64)]);
+        let rows = statement.query_map(rusqlite::params_from_iter(values.iter()), |row| row.get::<_, String>(0))?;
+        let mut jobs = Vec::new();
+        for row in rows {
+            let mut job: JobSummary = serde_json::from_str(&row?)?;
+            if job.command.chars().count() > 240 {
+                job.command = job.command.chars().take(240).chain(['…']).collect();
+            }
+            jobs.push(job);
+        }
+        let stats = if !filtered && offset == 0 {
+            let mut stats = JobStats::default();
+            let mut statement = self.db.prepare("SELECT json_extract(data,'$.state'),json_extract(data,'$.worker_id'),COUNT(*) FROM jobs GROUP BY 1,2")?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let state: String = row.get(0)?;
+                let worker: Option<String> = row.get(1)?;
+                let count: usize = row.get(2)?;
+                *stats.states.entry(state.clone()).or_default() += count;
+                if let Some(worker) = worker {
+                    let counts = stats.workers.entry(worker).or_default();
+                    counts.total += count;
+                    if matches!(state.as_str(), "assigned" | "running") { counts.active += count; }
+                }
+            }
+            Some(stats)
+        } else { None };
+        Ok(JobList { jobs, total, stats })
     }
     fn environments(&self) -> Result<Vec<Environment>> {
         self.rows("SELECT data FROM environments ORDER BY id")
@@ -810,7 +880,7 @@ impl Store {
             .iter()
             .filter(|worker| worker.online && !worker.paused)
         {
-            let Some(tx) = self.sessions.get(&worker.id).map(|s| s.tx.clone()) else {
+            let Some(tx) = self.sessions.get(&worker.id).filter(|s| !s.reconciling).map(|s| s.tx.clone()) else {
                 continue;
             };
             let mut occupied = jobs
@@ -1072,6 +1142,7 @@ impl Store {
         version: String,
         tx: mpsc::UnboundedSender<HubMessage>,
         principal: &Principal,
+        incremental: bool,
     ) -> Result<Uuid> {
         identifier(&id)?;
         match principal.role {
@@ -1107,12 +1178,19 @@ impl Store {
         };
         settings.capacity = max_jobs;
         self.save_worker_settings(&id, &settings)?;
+        let missing = if incremental {
+            self.jobs(None, None)?.into_iter()
+                .filter(|job| job.worker_id.as_deref() == Some(&id) && active(&job.state))
+                .map(|job| (job.id, job.attempt_id)).collect()
+        } else { BTreeSet::new() };
         self.sessions.insert(
             id.clone(),
             Session {
                 id: session,
                 tx,
                 token: principal.token_id.clone(),
+                reconciling: incremental,
+                missing,
             },
         );
         self.save_worker(&WorkerInfo {
@@ -1136,7 +1214,7 @@ impl Store {
         }
         for mut job in self.jobs(None, None)? {
             if job.worker_id.as_deref() == Some(&id) && active(&job.state) {
-                if !reported.contains(&(job.id.clone(), job.attempt_id.clone())) {
+                if !incremental && !reported.contains(&(job.id.clone(), job.attempt_id.clone())) {
                     job.state = "unknown".into();
                     job.updated_at = now();
                     job.error = Some(
@@ -1153,23 +1231,25 @@ impl Store {
                 }
             }
         }
-        for status in environments {
+        for status in environments { self.reconcile_status(&id, status)?; }
+        self.schedule()?;
+        Ok(session)
+    }
+    fn reconcile_status(&mut self, worker: &str, status: EnvironmentStatus) -> Result<()> {
             if let Some(environment) =
                 self.environment_revision(&status.environment_id, &status.revision)?
                 && self
-                    .status(&id, &environment)?
+                    .status(worker, &environment)?
                     .is_some_and(|current| current.state == "pending")
                 && matches!(status.state.as_str(), "ready" | "failed")
             {
                 // A reconnect may replay the previous result after a new explicit prepare was queued.
-                continue;
+                return Ok(());
             }
-            if let Err(error) = self.receive_status(&id, status) {
+            if let Err(error) = self.receive_status(worker, status) {
                 eprintln!("ignored environment reconciliation status: {error:#}");
             }
-        }
-        self.schedule()?;
-        Ok(session)
+        Ok(())
     }
     fn receive(&mut self, worker: &str, session: Uuid, message: WorkerMessage) -> Result<()> {
         if self.sessions.get(worker).is_none_or(|s| s.id != session) {
@@ -1182,9 +1262,56 @@ impl Store {
             self.save_worker(&info)?;
         }
         // Logs never change scheduling; skipping `schedule` keeps reconnect log replay linear.
-        let reschedule = !matches!(message, WorkerMessage::Log { .. });
+        let reschedule = !matches!(message, WorkerMessage::Log { .. } | WorkerMessage::Inventory { .. });
         match message {
             WorkerMessage::Hello { .. } => bail!("hello already received"),
+            WorkerMessage::Metadata { .. } => bail!("nested metadata is not allowed"),
+            WorkerMessage::Inventory { job_id, attempt_id, state: reported_state } => {
+                if matches!(reported_state.as_str(), "assigned" | "running" | "cancelling" | "unknown")
+                    && self.assigned(worker, &job_id, &attempt_id).is_ok() {
+                    self.report(worker, AttemptReport { job_id: job_id.clone(), attempt_id: attempt_id.clone(), state: reported_state, exit_code: None, error: None, results: vec![] })?;
+                }
+                let (done, discard) = if let Some(environment) = job_id.strip_prefix("environment:") {
+                    let (id, revision) = environment.split_once(':').context("invalid environment log ID")?;
+                    identifier(id)?;
+                    identifier(revision)?;
+                    anyhow::ensure!(attempt_id == format!("environment:{worker}:{id}:{revision}"), "environment log ownership mismatch");
+                    (false, self.environment_revision(id, revision)?.is_none())
+                } else {
+                    match self.job(&job_id)? {
+                        Some(job) if job.worker_id.as_deref() == Some(worker) && job.attempt_id == attempt_id => (terminal(&job.state), false),
+                        _ => (true, true), // Locally retained history may outlive an explicit Hub deletion/retry.
+                    }
+                };
+                let session = self.sessions.get_mut(worker).unwrap();
+                anyhow::ensure!(session.reconciling, "inventory already completed");
+                session.missing.remove(&(job_id.clone(), attempt_id.clone()));
+                // Only a contiguous prefix is safe when upgrading from legacy out-of-order replay.
+                let mut after = 0u64;
+                let mut statement = self.db.prepare("SELECT seq FROM logs WHERE job=?1 AND attempt=?2 ORDER BY seq")?;
+                for seq in statement.query_map(params![job_id, attempt_id], |r| r.get::<_, u64>(0))? {
+                    let seq = seq?;
+                    if seq != after + 1 { break; }
+                    after = seq;
+                }
+                session.tx.send(HubMessage::Resume { job_id, attempt_id, after, terminal: done, discard })?;
+            }
+            WorkerMessage::Ready => {
+                let session = self.sessions.get_mut(worker).unwrap();
+                anyhow::ensure!(session.reconciling, "inventory already completed");
+                session.reconciling = false;
+                let missing = std::mem::take(&mut session.missing);
+                session.tx.send(HubMessage::Ready)?;
+                for (id, attempt) in missing {
+                    let mut job = self.assigned(worker, &id, &attempt)?;
+                    if active(&job.state) {
+                        job.state = "unknown".into();
+                        job.error = Some("worker did not report this attempt; cancel explicitly before retrying".into());
+                        job.updated_at = now();
+                        self.save_job(&job)?;
+                    }
+                }
+            }
             WorkerMessage::Started { job_id, attempt_id } => {
                 let mut job = self.assigned(worker, &job_id, &attempt_id)?;
                 if active(&job.state) {
@@ -1254,7 +1381,10 @@ impl Store {
                 }
             }
             WorkerMessage::Finished { report } => self.report(worker, report)?,
-            WorkerMessage::Environment { status } => self.receive_status(worker, status)?,
+            WorkerMessage::Environment { status } => {
+                if self.sessions[worker].reconciling { self.reconcile_status(worker, status)?; }
+                else { self.receive_status(worker, status)?; }
+            },
             WorkerMessage::Heartbeat => {}
             WorkerMessage::Metrics { metrics: m } => {
                 let at = now() as i64;
@@ -1445,6 +1575,7 @@ fn router(state: Shared) -> Router {
         .route("/v1/workers/{id}/metrics", get(worker_metrics))
         .route("/v1/blobs/missing", post(missing_blobs))
         .route("/v1/jobs", post(submit).get(jobs))
+        .route("/v1/jobs/summary", get(job_summaries))
         .route("/v1/jobs/{id}", get(job))
         .route("/v1/jobs/{id}/logs", get(logs))
         .route("/v1/jobs/{id}/cancel", post(cancel))
@@ -1474,7 +1605,7 @@ fn router(state: Shared) -> Router {
                 Json(serde_json::json!({
                     "status":"ok",
                     "version":crate::VERSION,
-                    "capabilities":["job_priority", "worker_control", "scoped_tokens", "audit_log", "command_policy", "job_worker", "worker_metrics"]
+                    "capabilities":["job_priority", "worker_control", "scoped_tokens", "audit_log", "command_policy", "job_worker", "worker_metrics", "incremental_reconnect"]
                 }))
             }),
         )
@@ -1739,6 +1870,45 @@ async fn set_priority(
     }
     store.record(&principal, "job.priority", &id, Some(request.priority.to_string()));
     Ok(Json(job))
+}
+#[derive(Serialize, Deserialize)]
+struct JobSummary {
+    id: String,
+    state: String,
+    command: String,
+    environment: Option<String>,
+    worker_id: Option<String>,
+    created_at: u64,
+    updated_at: u64,
+    submitted_by: Option<String>,
+}
+#[derive(Default, Serialize)]
+struct WorkerJobCounts { total: usize, active: usize }
+#[derive(Default, Serialize)]
+struct JobStats {
+    states: HashMap<String, usize>,
+    workers: HashMap<String, WorkerJobCounts>,
+}
+#[derive(Serialize)]
+struct JobList {
+    jobs: Vec<JobSummary>,
+    total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stats: Option<JobStats>,
+}
+#[derive(Deserialize, Default)]
+struct JobListQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    state: Option<String>,
+    worker: Option<String>,
+    q: Option<String>,
+}
+async fn job_summaries(State(state): State<Shared>, Query(query): Query<JobListQuery>) -> ApiResult<Json<JobList>> {
+    if !(1..=50).contains(&query.limit.unwrap_or(50)) || query.offset.unwrap_or(0) > i64::MAX as usize {
+        return Err(invalid("limit must be between 1 and 50; offset must fit a signed 64-bit integer"));
+    }
+    Ok(Json(lock(&state)?.job_summaries(&query)?))
 }
 #[derive(Deserialize, Default)]
 struct JobsQuery {
@@ -2091,8 +2261,8 @@ async fn worker_socket(
     Extension(principal): Extension<Principal>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    // Reconnect snapshots aggregate retained results; allow the bounded WebSocket default.
-    ws.max_message_size(64 * 1024 * 1024)
+    // Legacy snapshots stay compatible; modern peers stream large metadata separately.
+    ws.max_message_size(WS_MESSAGE_BYTES).max_frame_size(WS_MESSAGE_BYTES)
         .on_upgrade(move |socket| socket_loop(state, socket, principal))
 }
 async fn socket_loop(state: Shared, mut socket: WebSocket, principal: Principal) {
@@ -2100,16 +2270,17 @@ async fn socket_loop(state: Shared, mut socket: WebSocket, principal: Principal)
     let Ok(Some(Ok(Message::Text(text)))) = hello else {
         return;
     };
-    let (worker_id, capabilities, max_jobs, attempts, environments, version) =
+    let (worker_id, capabilities, max_jobs, attempts, environments, version, incremental) =
         match serde_json::from_str(&text) {
             Ok(WorkerMessage::Hello {
+                incremental,
                 worker_id,
                 capabilities,
                 max_jobs,
                 attempts,
                 environments,
                 version,
-            }) => (worker_id, capabilities, max_jobs, attempts, environments, version),
+            }) => (worker_id, capabilities, max_jobs, attempts, environments, version, incremental),
             Ok(_) => {
                 eprintln!("worker connection rejected: first message was not hello");
                 return;
@@ -2136,6 +2307,7 @@ async fn socket_loop(state: Shared, mut socket: WebSocket, principal: Principal)
             version.clone(),
             tx,
             &principal,
+            incremental,
         ) {
             Ok(session) => {
                 if store.connect_seen.get(&worker_id) != Some(&signature) {
@@ -2167,42 +2339,102 @@ async fn socket_loop(state: Shared, mut socket: WebSocket, principal: Principal)
         };
         session
     };
+    let blobs = match state.lock() { Ok(store) => store.blobs.clone(), Err(_) => return };
     let (mut sink, mut stream) = socket.split();
-    let mut ticker = tokio::time::interval(Duration::from_secs(15));
-    let mut last_message = Instant::now();
-    loop {
-        tokio::select! {
-            outgoing = rx.recv() => {
-                let Some(outgoing) = outgoing else { break };
-                let Ok(text) = serde_json::to_string(&outgoing) else { break };
-                if sink.send(Message::Text(text.into())).await.is_err() { break; }
-            }
-            incoming = stream.next() => {
-                match incoming {
-                    Some(Ok(Message::Text(text))) => {
-                        if text.len() > 2 * 1024 * 1024 {
-                            eprintln!("worker message rejected: live event exceeds 2 MiB");
-                            break;
+    let (pong_tx, mut pong_rx) = mpsc::channel(8);
+    let writer = async {
+        let mut ticker = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            let message = tokio::select! {
+                outgoing = rx.recv() => {
+                    let Some(outgoing) = outgoing else { break };
+                    let (file, hash) = crate::snapshot::json_blob(&blobs, &outgoing)?;
+                    let size = file.as_file().metadata()?.len();
+                    if size > METADATA_BYTES {
+                        let mut store = state.lock().map_err(|_| anyhow::anyhow!("hub store unavailable"))?;
+                        let reason = "metadata exceeds the 256 MiB decode budget";
+                        match &outgoing {
+                            HubMessage::Run { job, .. } => {
+                                let mut current = store.assigned(&worker_id, &job.id, &job.attempt_id)?;
+                                if active(&current.state) { current.state = "failed".into(); current.error = Some(reason.into()); current.updated_at = now(); store.save_job(&current)?; }
+                            },
+                            HubMessage::Prepare { environment } => store.save_status(&EnvironmentStatus { worker_id: worker_id.clone(), environment_id: environment.id.clone(), revision: environment.revision.clone(), state: "failed".into(), error: Some(reason.into()) })?,
+                            _ => bail!("oversized hub control message"),
                         }
-                        last_message = Instant::now();
-                        let result = match serde_json::from_str::<WorkerMessage>(&text) {
-                            Ok(message) => match state.lock() { Ok(mut store) => store.receive(&worker_id, session, message), Err(_) => break },
-                            Err(error) => Err(error.into()),
-                        };
-                        if let Err(error) = result { eprintln!("worker message rejected: {error:#}"); break; }
+                        store.schedule()?;
+                        continue;
                     }
-                    Some(Ok(Message::Ping(bytes))) => { last_message = Instant::now(); if sink.send(Message::Pong(bytes)).await.is_err() { break; } }
-                    Some(Ok(Message::Pong(_))) => last_message = Instant::now(),
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                    _ => break,
-                }
-            }
-            _ = ticker.tick() => {
-                if last_message.elapsed() > Duration::from_secs(90) { break; }
-                if sink.send(Message::Ping(Vec::new().into())).await.is_err() { break; }
+                    let text = if incremental && size > WS_INLINE_BYTES as u64 {
+                        anyhow::ensure!(matches!(outgoing, HubMessage::Run { .. } | HubMessage::Prepare { .. }), "unsupported large hub message");
+                        match file.persist_noclobber(blobs.join(&hash)) {
+                            Ok(_) => {},
+                            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {},
+                            Err(error) => return Err(error.into()),
+                        }
+                        let reference = match outgoing {
+                            HubMessage::Run { job, .. } => HubMessage::RunRef { job_id: job.id, attempt_id: job.attempt_id, hash },
+                            _ => HubMessage::Metadata { hash },
+                        };
+                        serde_json::to_string(&reference)?
+                    } else {
+                        if !incremental && size > 16 * 1024 * 1024 {
+                            let mut store = state.lock().map_err(|_| anyhow::anyhow!("hub store unavailable"))?;
+                            let reason = "worker predates streamed metadata; update the worker to run this manifest";
+                            match outgoing {
+                                HubMessage::Run { job, .. } => {
+                                    let mut current = store.assigned(&worker_id, &job.id, &job.attempt_id)?;
+                                    if active(&current.state) {
+                                        current.state = "failed".into(); current.error = Some(reason.into()); current.updated_at = now(); store.save_job(&current)?;
+                                    }
+                                },
+                                HubMessage::Prepare { environment } => store.save_status(&EnvironmentStatus { worker_id: worker_id.clone(), environment_id: environment.id, revision: environment.revision, state: "failed".into(), error: Some(reason.into()) })?,
+                                _ => bail!("oversized legacy control message"),
+                            }
+                            store.schedule()?;
+                            continue;
+                        }
+                        std::fs::read_to_string(file.path())?
+                    };
+                    Message::Text(text.into())
+                },
+                pong = pong_rx.recv() => { let Some(bytes) = pong else { break }; Message::Pong(bytes) },
+                _ = ticker.tick() => Message::Ping(Vec::new().into()),
+            };
+            sink.send(message).await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    let reader = async {
+        loop {
+            let incoming = tokio::time::timeout(Duration::from_secs(90), stream.next()).await?;
+            match incoming {
+                Some(Ok(Message::Text(text))) => {
+                    let mut message: WorkerMessage = serde_json::from_str(&text)?;
+                    if let WorkerMessage::Metadata { hash } = message {
+                        anyhow::ensure!(incremental, "metadata transport was not negotiated");
+                        validate_hash(&hash)?;
+                        let path = blobs.join(&hash);
+                        message = tokio::task::spawn_blocking(move || -> Result<WorkerMessage> {
+                            anyhow::ensure!(std::fs::metadata(&path)?.len() <= METADATA_BYTES, "metadata exceeds the 256 MiB decode budget");
+                            anyhow::ensure!(crate::snapshot::hash_file(&path)? == hash, "metadata SHA-256 mismatch");
+                            let message = serde_json::from_reader(BufReader::new(std::fs::File::open(path)?))?;
+                            anyhow::ensure!(matches!(message, WorkerMessage::Finished { .. } | WorkerMessage::Environment { .. } | WorkerMessage::UpdateFailed { .. }), "unsupported metadata message");
+                            Ok(message)
+                        }).await??;
+                    }
+                    state.lock().map_err(|_| anyhow::anyhow!("hub store unavailable"))?.receive(&worker_id, session, message)?;
+                },
+                Some(Ok(Message::Ping(bytes))) => pong_tx.send(bytes).await?,
+                Some(Ok(Message::Pong(_))) => {},
+                Some(Ok(Message::Close(_))) | None => break,
+                Some(Err(error)) => return Err(error.into()),
+                _ => bail!("unsupported websocket frame"),
             }
         }
-    }
+        Ok::<_, anyhow::Error>(())
+    };
+    let result = tokio::select! { result = writer => result, result = reader => result };
+    if let Err(error) = result { eprintln!("worker connection: {error:#}"); }
     if let Ok(mut store) = state.lock()
         && let Err(error) = store.disconnect(&worker_id, session)
     {
@@ -2237,7 +2469,7 @@ mod tests {
     fn worker(store: &mut Store, id: &str) -> (Uuid, mpsc::UnboundedReceiver<HubMessage>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let session = store
-            .connect(id.into(), caps(), 1, vec![], vec![], String::new(), tx, &pool_principal())
+            .connect(id.into(), caps(), 1, vec![], vec![], String::new(), tx, &pool_principal(), false)
             .unwrap();
         (session, rx)
     }
@@ -2256,6 +2488,70 @@ mod tests {
             )
             .unwrap();
         store.schedule().unwrap();
+    }
+
+    #[test]
+    fn job_summaries_page_filter_and_exclude_detail_payloads() {
+        let (_dir, mut store) = test_store();
+        let (_session, _rx) = worker(&mut store, "one");
+        store.control_worker("one", WorkerControl { paused: Some(true), ..Default::default() }).unwrap();
+        let mut ids = Vec::new();
+        for index in 0..123 {
+            let mut job = store.add_job(spec(), Some("requester".into())).unwrap();
+            job.state = if index % 2 == 0 { "running" } else { "succeeded" }.into();
+            job.worker_id = Some("one".into());
+            job.spec.command = vec!["echo".into(), format!("needle-{index} {}", "가".repeat(500))];
+            store.save_job(&job).unwrap();
+            ids.push(job.id);
+        }
+        let mut full = store.job(&ids[122]).unwrap().unwrap();
+        full.spec.env.insert("PRIVATE".into(), "detail-only".repeat(100_000));
+        full.results = vec![FileEntry { path: "answer".into(), hash: "0".repeat(64), size: 3, mode: 420 }];
+        store.save_job(&full).unwrap();
+        let first = store.job_summaries(&JobListQuery::default()).unwrap();
+        assert_eq!(first.total, 123);
+        assert_eq!(first.jobs.len(), 50);
+        assert_eq!(first.jobs[0].id, ids[122]);
+        assert!(first.jobs[0].command.ends_with('…'));
+        assert_eq!(first.jobs[0].command.chars().count(), 241);
+        let stats = first.stats.as_ref().unwrap();
+        assert_eq!(stats.states["running"], 62);
+        assert_eq!(stats.workers["one"].total, 123);
+        assert_eq!(stats.workers["one"].active, 62);
+        let encoded = serde_json::to_string(&first).unwrap();
+        assert!(!encoded.contains("detail-only"));
+        assert!(!encoded.contains("results"));
+        assert!(!encoded.contains("spec"));
+        assert!(encoded.len() < 60_000);
+        let second = store.job_summaries(&JobListQuery { offset: Some(50), ..Default::default() }).unwrap();
+        let third = store.job_summaries(&JobListQuery { offset: Some(100), ..Default::default() }).unwrap();
+        assert_eq!(second.jobs.len(), 50);
+        assert_eq!(third.jobs.len(), 23);
+        assert!(second.stats.is_none());
+        let combined: BTreeSet<_> = first.jobs.iter().chain(&second.jobs).chain(&third.jobs).map(|j| &j.id).collect();
+        assert_eq!(combined.len(), 123);
+        let filtered = store.job_summaries(&JobListQuery { state: Some("active".into()), worker: Some("one".into()), q: Some("needle-12".into()), ..Default::default() }).unwrap();
+        assert_eq!(filtered.total, 3); // 12, 120, 122
+        assert_eq!(filtered.jobs.len(), 3);
+        assert!(store.job_summaries(&JobListQuery { q: Some("does-not-exist".into()), ..Default::default() }).unwrap().jobs.is_empty());
+        assert_eq!(store.job(&ids[122]).unwrap().unwrap().spec.env["PRIVATE"], full.spec.env["PRIVATE"]);
+        let plan: String = store.db.query_row("EXPLAIN QUERY PLAN SELECT json_extract(data,'$.state'),json_extract(data,'$.worker_id'),COUNT(*) FROM jobs GROUP BY 1,2", [], |row| row.get(3)).unwrap();
+        assert!(plan.contains("jobs_state_worker"), "{plan}");
+    }
+
+    #[tokio::test]
+    async fn job_summaries_require_auth_and_bound_page_size() {
+        use tower::ServiceExt;
+        let (_dir, store) = test_store();
+        let app = router(Arc::new(Mutex::new(store)));
+        let response = app.clone().oneshot(axum::http::Request::builder().uri("/v1/jobs/summary").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        for limit in [0, 51] {
+            let response = app.clone().oneshot(axum::http::Request::builder().uri(format!("/v1/jobs/summary?limit={limit}")).header(header::AUTHORIZATION, "Bearer test-token-long-enough").body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        let response = app.oneshot(axum::http::Request::builder().uri("/v1/jobs/summary?limit=50").header(header::AUTHORIZATION, "Bearer test-token-long-enough").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[cfg(dashboard_assets)]
@@ -2544,7 +2840,7 @@ mod tests {
         let (dir, mut store) = test_store();
         let (tx, _rx) = mpsc::unbounded_channel();
         store
-            .connect("one".into(), caps(), 4, vec![], vec![], String::new(), tx, &pool_principal())
+            .connect("one".into(), caps(), 4, vec![], vec![], String::new(), tx, &pool_principal(), false)
             .unwrap();
         let info = store
             .control_worker(
@@ -2565,7 +2861,7 @@ mod tests {
         for (advertised, expected) in [(4, 3), (2, 2), (4, 3)] {
             let (tx, _rx) = mpsc::unbounded_channel();
             store
-                .connect("one".into(), caps(), advertised, vec![], vec![], String::new(), tx, &pool_principal())
+                .connect("one".into(), caps(), advertised, vec![], vec![], String::new(), tx, &pool_principal(), false)
                 .unwrap();
             let info = store.workers().unwrap().remove(0);
             assert!(info.paused);
@@ -2613,7 +2909,7 @@ mod tests {
         let (_dir, mut store) = test_store();
         let (tx, mut rx) = mpsc::unbounded_channel();
         store
-            .connect("one".into(), caps(), 2, vec![], vec![], String::new(), tx, &pool_principal())
+            .connect("one".into(), caps(), 2, vec![], vec![], String::new(), tx, &pool_principal(), false)
             .unwrap();
         let first = store.add_job(spec(), None).unwrap();
         let second = store.add_job(spec(), None).unwrap();
@@ -2765,7 +3061,7 @@ mod tests {
                 vec![],
                 String::new(),
                 tx, &pool_principal()
-            )
+            , false)
             .unwrap_err();
         assert!(error.to_string().contains("unsupported worker OS"));
         assert!(store.workers().unwrap().is_empty());
@@ -2784,7 +3080,7 @@ mod tests {
                 vec![],
                 String::new(),
                 tx, &pool_principal()
-            )
+            , false)
             .unwrap();
         let job = store
             .add_job(JobSpec {
@@ -3084,13 +3380,38 @@ mod tests {
         assert_eq!(store.job(&queued.id).unwrap().unwrap().state, "cancelled");
     }
 
+    #[test]
+    fn incremental_inventory_restores_state_and_cursor_before_scheduling() {
+        let (_dir, mut store) = test_store();
+        let (old, _rx) = worker(&mut store, "one");
+        let first = store.add_job(spec(), None).unwrap();
+        let absent = store.add_job(spec(), None).unwrap();
+        store.disconnect("one", old).unwrap();
+        for seq in [1, 3, 5] {
+            let entry = LogEntry { job_id: first.id.clone(), attempt_id: first.attempt_id.clone(), seq, stream: "stdout".into(), text: "old".into() };
+            store.db.execute("INSERT INTO logs(job,attempt,seq,data) VALUES(?1,?2,?3,?4)", params![entry.job_id, entry.attempt_id, seq as i64, encode(&entry).unwrap()]).unwrap();
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let session = store.connect("one".into(), caps(), 2, vec![], vec![], "new".into(), tx, &pool_principal(), true).unwrap();
+        assert_eq!(store.job(&first.id).unwrap().unwrap().state, "unknown");
+        assert_eq!(store.job(&absent.id).unwrap().unwrap().state, "queued");
+        store.receive("one", session, WorkerMessage::Inventory { job_id: first.id.clone(), attempt_id: first.attempt_id.clone(), state: "running".into() }).unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), HubMessage::Resume { after: 1, terminal: false, discard: false, .. }));
+        assert_eq!(store.job(&first.id).unwrap().unwrap().state, "running");
+        assert!(rx.try_recv().is_err());
+        store.receive("one", session, WorkerMessage::Ready).unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), HubMessage::Ready));
+        assert!(matches!(rx.try_recv().unwrap(), HubMessage::Run { job, .. } if job.id == absent.id));
+        assert!(store.receive("one", old, WorkerMessage::Ready).is_err());
+    }
+
     #[tokio::test]
-    async fn large_reconnect_snapshots_preserve_outcomes_without_enlarging_live_events() {
+    async fn legacy_reconnect_and_large_live_messages_preserve_outcomes() {
         use tokio_tungstenite::tungstenite::{Message as ClientMessage, client::IntoClientRequest};
 
         let (_dir, mut store) = test_store();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let session = store.connect("one".into(), caps(), 4, vec![], vec![], "old".into(), tx, &pool_principal()).unwrap();
+        let session = store.connect("one".into(), caps(), 4, vec![], vec![], "old".into(), tx, &pool_principal(), false).unwrap();
         let reports: Vec<_> = (0..4).map(|_| {
             let job = store.add_job(spec(), None).unwrap();
             AttemptReport {
@@ -3110,7 +3431,7 @@ mod tests {
         let server_state = state.clone();
         let server = tokio::spawn(async move { axum::serve(listener, router(server_state)).await.unwrap() });
         let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
-        let hello = encode(&WorkerMessage::Hello {
+        let hello = encode(&WorkerMessage::Hello { incremental: false,
             worker_id: "one".into(), capabilities: caps(), max_jobs: 4,
             attempts: reports.clone(), environments: vec![], version: "new".into(),
         }).unwrap();
@@ -3130,11 +3451,11 @@ mod tests {
         let oversized = encode(&WorkerMessage::UpdateFailed { error: "x".repeat(3 * 1024 * 1024) }).unwrap();
         socket.send(ClientMessage::Text(oversized.into())).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while state.lock().unwrap().workers().unwrap()[0].online {
+            while state.lock().unwrap().workers().unwrap()[0].update_error.is_none() {
                 tokio::task::yield_now().await;
             }
-        }).await.expect("oversized live events must still be rejected");
-        assert!(state.lock().unwrap().workers().unwrap()[0].update_error.is_none());
+        }).await.expect("valid live metadata must not be rejected by the removed 2 MiB guard");
+        assert!(state.lock().unwrap().workers().unwrap()[0].online);
         server.abort();
     }
 
@@ -3273,18 +3594,18 @@ mod tests {
         let principal = store.resolve(&created.secret).unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         let error = store
-            .connect("other".into(), caps(), 1, vec![], vec![], String::new(), tx, &principal)
+            .connect("other".into(), caps(), 1, vec![], vec![], String::new(), tx, &principal, false)
             .unwrap_err();
         assert!(error.to_string().contains("bound to worker builder"));
         let (tx, _rx) = mpsc::unbounded_channel();
         store
-            .connect("builder".into(), caps(), 1, vec![], vec![], String::new(), tx, &principal)
+            .connect("builder".into(), caps(), 1, vec![], vec![], String::new(), tx, &principal, false)
             .unwrap();
         let laptop = store.create_token(requester(), &pool_principal()).unwrap();
         let laptop = store.resolve(&laptop.secret).unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
         assert!(store
-            .connect("x".into(), caps(), 1, vec![], vec![], String::new(), tx, &laptop)
+            .connect("x".into(), caps(), 1, vec![], vec![], String::new(), tx, &laptop, false)
             .is_err());
     }
 
@@ -3295,7 +3616,7 @@ mod tests {
         let principal = store.resolve(&created.secret).unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         store
-            .connect("builder".into(), caps(), 1, vec![], vec![], String::new(), tx, &principal)
+            .connect("builder".into(), caps(), 1, vec![], vec![], String::new(), tx, &principal, false)
             .unwrap();
         let job = store.add_job(spec(), None).unwrap();
         assert!(matches!(rx.try_recv(), Ok(HubMessage::Run { .. })));
@@ -3306,7 +3627,7 @@ mod tests {
         // A socket authenticated before the revoke cannot complete its hello afterwards.
         let (tx, _rx) = mpsc::unbounded_channel();
         let error = store
-            .connect("builder".into(), caps(), 1, vec![], vec![], String::new(), tx, &principal)
+            .connect("builder".into(), caps(), 1, vec![], vec![], String::new(), tx, &principal, false)
             .unwrap_err();
         assert!(error.to_string().contains("revoked"));
     }
@@ -3429,7 +3750,7 @@ mod tests {
         restricted.policy = Some(crate::policy::Policy::parse("version: 1\ncommands: [[\"true\"]]\nenvironments: []\n").unwrap());
         let (tx, mut strict_rx) = mpsc::unbounded_channel();
         store
-            .connect("strict".into(), restricted, 1, vec![], vec![], String::new(), tx, &pool_principal())
+            .connect("strict".into(), restricted, 1, vec![], vec![], String::new(), tx, &pool_principal(), false)
             .unwrap();
         let denied = JobSpec { command: vec!["sh".into(), "-c".into(), "x".into()], ..spec() };
         let error = store.add_job(denied.clone(), None).unwrap_err();

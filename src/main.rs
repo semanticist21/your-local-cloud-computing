@@ -463,42 +463,13 @@ fn home() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
-fn valid_release_version(version: &str) -> bool {
-    if !version.starts_with('v') || version.len() > 64 || version.len() < 2 {
-        return false;
-    }
-    version.chars().skip(1).all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-}
-
-async fn resolve_latest_release_version() -> Result<String> {
-    let api_url = std::env::var("YLCC_UPDATE_API_URL")
-        .unwrap_or_else(|_| "https://api.github.com/repos/semanticist21/your-local-cloud-computing/releases/latest".to_string());
-    let client = reqwest::Client::new();
-    let response = client
-        .get(&api_url)
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", format!("ylcc/{}", ylcc::VERSION))
-        .send()
-        .await
-        .context("failed to query GitHub releases")?;
-    if !response.status().is_success() {
-        bail!("GitHub releases request failed with {}", response.status())
-    }
-    let body: serde_json::Value = response.json().await.context("invalid GitHub release response")?;
-    let tag = body["tag_name"]
-        .as_str()
-        .context("GitHub did not return tag_name")?
-        .to_string();
-    Ok(tag)
-}
-
 async fn update_workers(client: &Client, ids: Vec<String>, all: bool, version: Option<String>, timeout_secs: u64) -> Result<()> {
     if ids.is_empty() && !all {
         bail!("name worker IDs or pass --all")
     }
     let version = match version {
         Some(version) => version,
-        None => resolve_latest_release_version().await?,
+        None => ylcc::client::resolve_latest_release_version().await?,
     };
     if !valid_release_version(&version) {
         bail!("invalid release version; expected a tag such as v0.4.6")
@@ -587,7 +558,7 @@ async fn update_release(
     token: &Path,
 ) -> Result<()> {
             let version = if latest {
-                resolve_latest_release_version().await?
+                ylcc::client::resolve_latest_release_version().await?
             } else {
                 version.unwrap_or_else(|| format!("v{}", env!("CARGO_PKG_VERSION")))
             };

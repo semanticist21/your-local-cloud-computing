@@ -55,6 +55,7 @@ import {
   formatRelative,
   formatTime,
   jobLogsQuery,
+  latestReleaseQuery,
   jobQuery,
   jobListQuery,
   jobsHistoryQuery,
@@ -341,7 +342,7 @@ function Shell() {
             </EmptyState>
           ) : <LoadingState />}
           <footer className="page-footer">
-            <span><ShieldCheck size={14} /> Read-only dashboard</span>
+            <span><ShieldCheck size={14} /> Compute pool dashboard</span>
             <span>Auto-refreshes every 5 seconds</span>
           </footer>
         </div>
@@ -386,7 +387,7 @@ function OverviewPage() {
   const queuedCount = jobList.stats?.states.queued ?? 0
   const failedCount = jobList.stats?.states.failed ?? 0
   const jobsByWorker = countActiveJobs(jobList.stats)
-  const schedulable = onlineWorkers.filter((worker) => !worker.paused)
+  const schedulable = onlineWorkers.filter((worker) => !worker.paused && !worker.updating)
   const totalCapacity = schedulable.reduce((sum, worker) => sum + worker.max_jobs, 0)
   const availableSlots = schedulable.reduce((sum, worker) => sum + Math.max(worker.max_jobs - (jobsByWorker.get(worker.id) ?? 0), 0), 0)
   const readyStatuses = environmentStatuses.filter((status) => status.state === 'ready').length
@@ -403,7 +404,7 @@ function OverviewPage() {
           <Metric icon={<Activity />} label="Active jobs" value={String(activeCount)} note={queuedCount ? `${queuedCount} waiting in queue` : 'Queue is clear'} tone="orange" />
         </Link>
         <div className="metric-item">
-          <Metric icon={<Cpu />} label="Available slots" value={String(availableSlots)} note={`${totalCapacity} on unpaused workers`} tone="green" />
+          <Metric icon={<Cpu />} label="Available slots" value={String(availableSlots)} note={`${totalCapacity} ready to accept jobs`} tone="green" />
         </div>
         <Link className="metric-item metric-link" to="/environments">
           <Metric icon={<Boxes />} label="Ready environments" value={String(readyStatuses)} note={`${environmentStatuses.length} worker installs reported`} tone="slate" />
@@ -490,6 +491,7 @@ function WorkerPage() {
           <Detail label="Containerized">{caps.containerized ? 'Yes' : 'No'}</Detail>
           <Detail label="CPU features">{caps.cpu_features?.length ? `${caps.cpu_features.length} reported` : 'None reported'}</Detail>
           <Detail label="Command policy">{caps.policy ? <PolicyBadge policy={caps.policy} /> : <span className="muted-text">None (runs any job)</span>}</Detail>
+          <Detail label="YLCC version"><WorkerUpdate worker={worker} /></Detail>
         </dl>
       </section>
 
@@ -548,7 +550,7 @@ function WorkersTable({ workers, jobsByWorker }: { workers: WorkerInfo[]; jobsBy
   const navigate = useNavigate()
   return (
     <div className="table-scroll"><table className="data-table workers-table">
-      <thead><tr><th>Worker</th><th>State</th><th>Platform</th><th>Resources</th><th>Jobs</th><th>Last seen</th></tr></thead>
+      <thead><tr><th>Worker</th><th>State</th><th>Platform</th><th>Resources</th><th>Jobs</th><th>Version / update</th><th>Last seen</th></tr></thead>
       <tbody>{workers.map((worker) => (
         <tr key={worker.id} className="clickable-row" onClick={() => navigate({ to: '/workers/$workerId', params: { workerId: worker.id } })}>
           <td><div className="worker-name"><span className={`worker-avatar worker-avatar-${worker.capabilities.os}`}>{osGlyph(worker.capabilities.os)}</span><Link className="table-link" to="/workers/$workerId" params={{ workerId: worker.id }}>{worker.id}</Link></div></td>
@@ -556,10 +558,55 @@ function WorkersTable({ workers, jobsByWorker }: { workers: WorkerInfo[]; jobsBy
           <td><span className="platform-name">{worker.capabilities.os}</span><span className="platform-arch">{worker.capabilities.arch}</span></td>
           <td><div className="resource-line"><Cpu size={13} /> {worker.capabilities.cpus} CPU <span className="resource-divider">·</span> {formatMemory(worker.capabilities.memory_bytes)}</div></td>
           <td><span className="capacity-value">{jobsByWorker.get(worker.id) ?? 0}<span> / {worker.max_jobs}</span></span></td>
+          <td onClick={(event) => event.stopPropagation()}><WorkerUpdate worker={worker} /></td>
           <td className="time-cell"><RelativeTime timestamp={worker.last_seen} /></td>
         </tr>
       ))}</tbody>
     </table></div>
+  )
+}
+
+function WorkerUpdate({ worker }: { worker: WorkerInfo }) {
+  const queryClient = useQueryClient()
+  const whoami = useQuery(whoamiQuery)
+  const admin = whoami.data?.role === 'admin'
+  const release = useQuery({ ...latestReleaseQuery, enabled: admin })
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<unknown>(null)
+  useDisconnectOnAuthError(error)
+  const target = release.data?.version
+  const current = worker.version?.split('+')[0]
+  const available = target && (!current || current.localeCompare(target.slice(1), undefined, { numeric: true }) < 0)
+  const reason = worker.capabilities.containerized ? 'Recreate the container with the new release image.'
+    : worker.capabilities.policy?.self_update === false ? 'Self-update is disabled by worker policy.'
+    : !worker.online ? 'Connect this worker to update it.'
+    : !worker.version ? 'Upgrade this older worker locally first.' : ''
+  const update = async () => {
+    if (!target || submitting) return
+    setSubmitting(true)
+    setError(null)
+    try {
+      await post(`/v1/workers/${encodeURIComponent(worker.id)}/update`, { version: target })
+      await queryClient.invalidateQueries({ queryKey: ['snapshot'] })
+    } catch (failure) { setError(failure) }
+    finally { setSubmitting(false) }
+  }
+  return (
+    <div className="worker-update">
+      <code>{worker.version || 'Unknown'}</code>
+      {worker.updating ? (
+        <span className="worker-update-note" role="status"><RefreshCw size={12} className="spin" />{worker.online ? 'Updating' : 'Awaiting reconnection'} to {worker.updating}</span>
+      ) : admin && (
+        <>
+          {available && <Button size="sm" variant="outline" disabled={submitting || Boolean(reason)} title={reason || 'Running jobs finish before the worker restarts. You can close this page.'} onClick={() => void update()}>{submitting ? 'Starting…' : `Update to ${target}`}</Button>}
+          {reason && <span className="worker-update-note">{reason}</span>}
+          {!reason && !available && target && <span className="worker-update-note">Up to date</span>}
+          {release.isError && <span className="form-error" role="alert">{errorMessage(release.error)} <button className="text-action" onClick={() => void release.refetch()}>Retry release check</button></span>}
+          {release.isPending && <span className="worker-update-note">Checking release…</span>}
+        </>
+      )}
+      {(error || worker.update_error) && <span className="form-error" role="alert">{error ? errorMessage(error) : worker.update_error}</span>}
+    </div>
   )
 }
 
@@ -1044,6 +1091,7 @@ function RelativeTime({ timestamp }: { timestamp: number }) {
 }
 
 function WorkerState({ worker }: { worker: WorkerInfo }) {
+  if (worker.updating) return <Badge variant="warning"><span className="badge-dot" />Updating</Badge>
   if (!worker.online) return <Badge variant="muted"><span className="badge-dot" />Offline</Badge>
   if (worker.paused) return <Badge variant="warning"><span className="badge-dot" />Paused</Badge>
   return <Badge variant="success"><span className="badge-dot" />Online</Badge>

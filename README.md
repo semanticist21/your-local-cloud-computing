@@ -77,7 +77,7 @@ ylcc init
 ylcc hub --listen 127.0.0.1:7443 --data-dir "$HOME/.local/share/ylcc/hub"
 ```
 
-The Hub serves its read-only dashboard at the same address. Open `http://127.0.0.1:7443/` on the Hub machine, or use the private HTTPS address from another device, then enter the pool token or a requester token in the browser. The dashboard shows workers, jobs and environment readiness and refreshes every five seconds. Its token is kept only in that browser tab. Admins also see the audit log and issued tokens.
+The Hub serves its dashboard at the same address. Open `http://127.0.0.1:7443/` on the Hub machine, or use the private HTTPS address from another device, then enter the pool token or a requester token in the browser. The dashboard shows workers, jobs and environment readiness and refreshes every five seconds. Its token is kept only in that browser tab. Admins also see the audit log and issued tokens.
 
 Do not send the pool token over plain HTTP on an untrusted network. For direct LAN access, bind the Hub to a reachable private interface and apply the host firewall's normal restrictions.
 

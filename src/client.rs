@@ -15,6 +15,22 @@ use std::{
 };
 use tokio_util::io::ReaderStream;
 
+pub async fn resolve_latest_release_version() -> Result<String> {
+    let url = std::env::var("YLCC_UPDATE_API_URL")
+        .unwrap_or_else(|_| "https://api.github.com/repos/semanticist21/your-local-cloud-computing/releases/latest".into());
+    let response = HttpClient::new()
+        .get(url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", format!("ylcc/{}", crate::VERSION))
+        .timeout(Duration::from_secs(20))
+        .send().await.context("failed to query GitHub releases")?
+        .error_for_status().context("GitHub releases request failed")?;
+    let body: serde_json::Value = response.json().await.context("invalid GitHub release response")?;
+    let version = body["tag_name"].as_str().context("GitHub did not return tag_name")?;
+    anyhow::ensure!(valid_release_version(version), "GitHub returned an invalid release tag");
+    Ok(version.into())
+}
+
 pub fn read_token(path: &Path) -> Result<String> {
     let mut token = String::new();
     platform::read_private_file(path)?.read_to_string(&mut token)?;

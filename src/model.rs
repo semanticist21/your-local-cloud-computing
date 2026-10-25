@@ -262,7 +262,15 @@ pub struct WorkerInfo {
     #[serde(default)]
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updating: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_error: Option<String>,
+}
+
+pub fn valid_release_version(version: &str) -> bool {
+    version.len() <= 64
+        && version.strip_prefix('v').is_some_and(|v| !v.is_empty()
+            && v.bytes().all(|c| c.is_ascii_alphanumeric() || b".-".contains(&c)))
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

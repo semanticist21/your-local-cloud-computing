@@ -43,6 +43,8 @@ Remove the user service with `ylcc service uninstall --role worker` (or `hub`). 
 
 ## Updating workers
 
+Admins can also use **Update to v…** in the dashboard worker list or detail page. The Hub holds new assignments until the worker reconnects on the requested version, even if the browser is closed or the Hub restarts. Running jobs finish first; the operator’s existing pause setting is preserved. The dashboard shows update failures and skips container, offline and policy-restricted workers.
+
 ```bash
 ylcc workers update --all                      # newest published release, one worker at a time
 ylcc workers update mac-build --version v0.4.6

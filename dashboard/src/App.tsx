@@ -601,7 +601,7 @@ function WorkerUpdate({ worker }: { worker: WorkerInfo }) {
   const target = release.data?.version
   const current = worker.version?.split('+')[0]
   const available = target && (!current || current.localeCompare(target.slice(1), undefined, { numeric: true }) < 0)
-  const reason = worker.capabilities.containerized ? 'Recreate the container with the new release image.'
+  const reason = !available ? '' : worker.capabilities.containerized ? 'This worker runs from a container image, so the dashboard cannot replace its binary. After jobs finish, pull the new release image and recreate the container with its existing data volume.'
     : worker.capabilities.policy?.self_update === false ? 'Self-update is disabled by worker policy.'
     : !worker.online ? 'Connect this worker to update it.'
     : !worker.version ? 'Upgrade this older worker locally first.' : ''
@@ -624,7 +624,7 @@ function WorkerUpdate({ worker }: { worker: WorkerInfo }) {
         <>
           {available && <Button size="sm" variant="outline" disabled={submitting || Boolean(reason)} title={reason || 'Running jobs finish before the worker restarts. You can close this page.'} onClick={() => void update()}>{submitting ? 'Starting…' : `Update to ${target}`}</Button>}
           {reason && <span className="worker-update-note">{reason}</span>}
-          {!reason && !available && target && <span className="worker-update-note">Up to date</span>}
+          {!available && target && <span className="worker-update-note">Up to date</span>}
           {release.isError && <span className="form-error" role="alert">{errorMessage(release.error)} <button className="text-action" onClick={() => void release.refetch()}>Retry release check</button></span>}
           {release.isPending && <span className="worker-update-note">Checking release…</span>}
         </>

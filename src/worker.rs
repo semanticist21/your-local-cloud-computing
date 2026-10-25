@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -96,7 +96,11 @@ fn identifier(value: &str) -> Result<()> {
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
     let mut file = crate::platform::create_private_file(&tmp)?;
-    serde_json::to_writer(&mut file, value)?;
+    {
+        let mut writer = BufWriter::new(&mut file);
+        serde_json::to_writer(&mut writer, value)?;
+        writer.flush()?;
+    }
     file.sync_all()?;
     drop(file);
     crate::platform::replace_file(&tmp, path)?;
@@ -343,7 +347,7 @@ async fn load_state(state: &Arc<State>) -> Result<()> {
         if !path.exists() {
             continue;
         }
-        let mut journal: Journal = serde_json::from_reader(File::open(&path)?)?;
+        let mut journal: Journal = serde_json::from_reader(BufReader::new(File::open(&path)?))?;
         identifier(&journal.report.attempt_id)?;
         ensure!(
             dir.file_name().and_then(|s| s.to_str()) == Some(&journal.report.attempt_id),
@@ -401,7 +405,7 @@ async fn load_state(state: &Arc<State>) -> Result<()> {
             if !path.exists() {
                 continue;
             }
-            let mut status: EnvironmentStatus = serde_json::from_reader(File::open(&path)?)?;
+            let mut status: EnvironmentStatus = serde_json::from_reader(BufReader::new(File::open(&path)?))?;
             identifier(&status.environment_id)?;
             identifier(&status.revision)?;
             if status.state == "preparing" {
@@ -437,7 +441,7 @@ async fn load_state(state: &Arc<State>) -> Result<()> {
             .join(&status.revision);
         let result = async {
             let definition: Environment =
-                serde_json::from_reader(File::open(dir.join("definition.json"))?)?;
+                serde_json::from_reader(BufReader::new(File::open(dir.join("definition.json"))?))?;
             // Environments prepared before a policy existed stay usable only if it allows them.
             if let Some(policy) = &state.policy {
                 policy.check_environment(&definition).map_err(anyhow::Error::msg)?;
@@ -574,7 +578,7 @@ async fn connection(state: Arc<State>) -> Result<()> {
                                 let _drain = state.drain.read().await;
                                 let path = ensure_metadata(&state, &hash).await?;
                                 let message = tokio::task::spawn_blocking(move || -> Result<HubMessage> {
-                                    let message = serde_json::from_reader(File::open(path)?)?;
+                                    let message = serde_json::from_reader(BufReader::new(File::open(path)?))?;
                                     ensure!(matches!(message, HubMessage::Prepare { .. }), "unsupported metadata message");
                                     Ok(message)
                                 }).await??;
@@ -986,7 +990,7 @@ fn resume_delivery(state: Arc<State>, attempt: Arc<Attempt>) {
         let fetch = async {
             let _drain = state.drain.read().await;
             let path = ensure_metadata(&state, &hash).await?;
-            let message = tokio::task::spawn_blocking(move || -> Result<HubMessage> { Ok(serde_json::from_reader(File::open(path)?)?) }).await??;
+            let message = tokio::task::spawn_blocking(move || -> Result<HubMessage> { Ok(serde_json::from_reader(BufReader::new(File::open(path)?))?) }).await??;
             let HubMessage::Run { job, environment } = message else { bail!("delivery was not a Run") };
             ensure!(job.id == journal.report.job_id && job.attempt_id == id, "delivery job/attempt identity mismatch");
             cancelled(&accepted_cancel)?;
@@ -1710,7 +1714,7 @@ async fn run_attempt(
             // A ready environment ran the setup in its definition.json; that is what was checked.
             let definition = state.environment_dir(environment)?.join("definition.json");
             if definition.exists() {
-                let existing: Environment = serde_json::from_reader(File::open(&definition)?)?;
+                let existing: Environment = serde_json::from_reader(BufReader::new(File::open(&definition)?))?;
                 ensure!(
                     serde_json::to_value(&existing)? == serde_json::to_value(environment)?,
                     "prepared environment {} differs from the definition the Hub sent; delete the environment and prepare it again",
@@ -2546,9 +2550,9 @@ async fn verify_tools(
     Ok(())
 }
 fn resolved_image(state: &State, environment: &Environment) -> Result<String> {
-    serde_json::from_reader(File::open(
+    serde_json::from_reader(BufReader::new(File::open(
         state.environment_dir(environment)?.join("image.json"),
-    )?)
+    )?))
     .context("environment has no verified local image; prepare it first")
 }
 fn environment_logger(state: &State, environment: &Environment) -> Result<Arc<Attempt>> {
@@ -2737,7 +2741,7 @@ async fn prepare(state: &Arc<State>, environment: &Environment, explicit: bool) 
         private_dir(&dir.join("bin"))?;
         let definition = dir.join("definition.json");
         if definition.exists() {
-            let existing: Environment = serde_json::from_reader(File::open(&definition)?)?;
+            let existing: Environment = serde_json::from_reader(BufReader::new(File::open(&definition)?))?;
             ensure!(
                 serde_json::to_value(existing)? == serde_json::to_value(environment)?,
                 "environment revision is immutable; choose a new revision"

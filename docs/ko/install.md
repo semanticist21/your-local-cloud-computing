@@ -4,7 +4,7 @@
 
 [README](../../README.ko.md#cli-설치)에 나온 방법으로 바이너리를 설치하세요.
 
-설치 위치를 바꾸려면 `--prefix /your/prefix`를 쓰세요. [릴리스 아카이브](https://github.com/semanticist21/your-local-cloud-computing/releases)를 직접 내려받아 확인해도 됩니다. macOS 빌드는 서명되지 않은 명령줄 프로그램이며, 공증(notarize)된 앱 번들이 아닙니다. Linux 릴리스 바이너리는 네이티브 워커가 GPU 드라이버 라이브러리를 불러올 수 있도록 glibc 2.35 이상이 필요합니다. Alpine 같은 musl 기반 시스템에서는 컨테이너 이미지를 쓰거나 해당 시스템용으로 소스에서 빌드하세요. GPU 감지에는 추가로 동적 라이브러리 로딩이 필요합니다. 워크로드 바이너리는 각자의 플랫폼/ABI 요구 조건을 그대로 따릅니다.
+설치 위치를 바꾸려면 `--prefix /your/prefix`를 쓰세요. [릴리스 아카이브](https://github.com/semanticist21/your-local-cloud-computing/releases)를 직접 내려받아 확인해도 됩니다. macOS 릴리스는 Developer ID Application으로 서명하고 공증하며, 코드 식별자 `com.kobbokkom.ylcc`를 유지합니다. 업데이트 때 실행 경로와 개발자 서명 주체를 유지해야 기존 개인정보 보호 권한이 이어질 수 있습니다. 서명되지 않은 버전에서 처음 전환할 때는 승인이 필요할 수 있습니다. 배포 형식은 기존 tar 아카이브이며, 단독 실행 파일에는 공증 티켓을 첨부할 수 없어 Apple이 온라인으로 티켓을 제공합니다. Linux 릴리스 바이너리는 네이티브 워커가 GPU 드라이버 라이브러리를 불러올 수 있도록 glibc 2.35 이상이 필요합니다. Alpine 같은 musl 기반 시스템에서는 컨테이너 이미지를 쓰거나 해당 시스템용으로 소스에서 빌드하세요. GPU 감지에는 추가로 동적 라이브러리 로딩이 필요합니다. 워크로드 바이너리는 각자의 플랫폼/ABI 요구 조건을 그대로 따릅니다.
 
 ## 예제와 에이전트 지원 파일 내려받기
 

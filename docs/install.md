@@ -4,7 +4,7 @@ English | [한국어](ko/install.md)
 
 Install the binary as shown in the [README](../README.md#install-the-cli).
 
-Use `--prefix /your/prefix` to change the install location. You can also download and check the [release archives](https://github.com/semanticist21/your-local-cloud-computing/releases) yourself. macOS builds are unsigned command-line programs; they are not notarized application bundles. Linux release binaries require glibc 2.35 or newer so native workers can load GPU driver libraries. On musl-based systems such as Alpine, use the container image or build from source for your system; GPU probing additionally requires dynamic library loading. Workload binaries keep their own platform/ABI requirements.
+Use `--prefix /your/prefix` to change the install location. You can also download and check the [release archives](https://github.com/semanticist21/your-local-cloud-computing/releases) yourself. macOS releases are Developer ID Application signed and notarized, with the stable code identifier `com.kobbokkom.ylcc`. Keep the same executable path and developer identity when updating so privacy grants can carry over; the first transition from an unsigned release can require approval. The standalone CLI remains in the existing tar archive; Apple provides its notarization ticket online because standalone binaries cannot have a ticket stapled to them. Linux release binaries require glibc 2.35 or newer so native workers can load GPU driver libraries. On musl-based systems such as Alpine, use the container image or build from source for your system; GPU probing additionally requires dynamic library loading. Workload binaries keep their own platform/ABI requirements.
 
 ## Download examples and agent support files
 

@@ -80,6 +80,17 @@ jobs:
           cp 'target/${{ matrix.target }}/release/ylcc' dist/ylcc
           cp LICENSE dist/LICENSE
           python3 scripts/generate-notices.py --output dist/THIRD_PARTY_NOTICES.txt
+      - name: Sign and notarize macOS release
+        if: matrix.os == 'macos'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: python3 scripts/sign-macos.py dist/ylcc
+      - name: Package the tested release binary
+        run: |
           dist/ylcc --version
           tar -czf 'ylcc-${{ matrix.os }}-${{ matrix.arch }}.tar.gz' -C dist ylcc LICENSE THIRD_PARTY_NOTICES.txt
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

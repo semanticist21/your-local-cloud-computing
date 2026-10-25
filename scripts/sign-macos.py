@@ -61,6 +61,10 @@ def sign(binary):
             security("import", str(certificate), "-P", os.environ["APPLE_CERTIFICATE_PASSWORD"],
                      "-k", keychain, "-T", "/usr/bin/codesign")
             security("set-key-partition-list", "-S", "apple-tool:,apple:,codesign:", "-s", "-k", password, keychain)
+            # --keychain limits certificate lookup; the private key also needs the user search list.
+            search = shlex.split(run("security", "list-keychains", "-d", "user").stdout)
+            security("list-keychains", "-d", "user", "-s", keychain,
+                     *[path for path in search if Path(path).resolve() != Path(keychain).resolve()])
             identities = run("security", "find-identity", "-v", "-p", "codesigning", keychain).stdout
             identities = re.findall(r'([A-F0-9]{40}) "Developer ID Application: [^"\n]+"', identities)
             if len(identities) != 1:

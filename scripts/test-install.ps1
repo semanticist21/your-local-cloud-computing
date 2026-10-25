@@ -79,23 +79,23 @@ function New-Fixture([string]$Variant = 'valid') {
 # This intercepts downloads, keeping the actual installer and its ZIP/hash handling under test.
 function Invoke-WebRequest {
     param([switch]$UseBasicParsing, [string]$Uri, [string]$OutFile)
-    $base = 'https://github.com/semanticist21/your-local-cloud-computing/releases/download/v0.5.3/'
+    $base = 'https://github.com/semanticist21/your-local-cloud-computing/releases/download/v0.5.4/'
     Assert ($Uri.StartsWith($base)) "Unexpected release URL: $Uri"
     [IO.File]::Copy((Join-Path $release $Uri.Substring($base.Length)), $OutFile, $true)
 }
 function Assert-Rejected([string]$Variant) {
     $failed = $false
-    try { & $Installer -Version v0.5.3 -Prefix $prefix } catch { $failed = $true }
+    try { & $Installer -Version v0.5.4 -Prefix $prefix } catch { $failed = $true }
     Assert $failed "Unsafe fixture accepted: $Variant"
     Assert ([IO.File]::ReadAllText((Join-Path $prefix 'bin\ylcc.exe')) -eq 'fixture:ylcc.exe') "Existing executable changed: $Variant"
     Assert (-not (Test-Path -LiteralPath (Join-Path $taskTemp 'escaped'))) 'Archive traversal escaped the staging directory.'
 }
 try {
     New-Fixture
-    & $Installer -Version v0.5.3 -Prefix $prefix
+    & $Installer -Version v0.5.4 -Prefix $prefix
     Assert ([IO.File]::ReadAllText((Join-Path $prefix 'bin\ylcc.exe')) -eq 'fixture:ylcc.exe') 'Executable did not install.'
     Assert ([IO.File]::ReadAllText((Join-Path $prefix 'share\licenses\ylcc\LICENSE')) -eq 'fixture:LICENSE') 'License did not install.'
-    & $Installer -Version v0.5.3 -Prefix $prefix
+    & $Installer -Version v0.5.4 -Prefix $prefix
     [IO.File]::AppendAllText((Join-Path $release $archive), 'corruption')
     Assert-Rejected 'checksum mismatch'
     foreach ($variant in @('extra', 'duplicate', 'traversal', 'case', 'symlink', 'directory')) {

@@ -167,6 +167,7 @@ impl Store {
         let db = Connection::open(data.join("hub.sqlite"))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
             CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, data TEXT NOT NULL, environment TEXT, cancel_requested INTEGER NOT NULL DEFAULT 0);
+            CREATE INDEX IF NOT EXISTS jobs_state_worker ON jobs(json_extract(data,'$.state'),json_extract(data,'$.worker_id'));
             CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS worker_settings (id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS environments (id TEXT PRIMARY KEY, data TEXT NOT NULL);
@@ -273,6 +274,72 @@ impl Store {
             }
             _ => self.rows("SELECT data FROM jobs ORDER BY rowid"),
         }
+    }
+    fn job_summaries(&self, query: &JobListQuery) -> Result<JobList> {
+        let limit = query.limit.unwrap_or(50);
+        let offset = query.offset.unwrap_or(0);
+        let state = query.state.as_deref().unwrap_or("");
+        let worker = query.worker.as_deref().unwrap_or("");
+        let needle = query.q.as_deref().unwrap_or("").trim();
+        let filtered = !state.is_empty() || !worker.is_empty() || !needle.is_empty();
+        let mut predicates = Vec::new();
+        let mut values: Vec<rusqlite::types::Value> = Vec::new();
+        if state == "active" {
+            predicates.push("json_extract(data,'$.state') IN ('assigned','running')");
+        } else if !state.is_empty() {
+            predicates.push("json_extract(data,'$.state')=?");
+            values.push(state.to_owned().into());
+        }
+        if !worker.is_empty() {
+            predicates.push("json_extract(data,'$.worker_id')=?");
+            values.push(worker.to_owned().into());
+        }
+        if !needle.is_empty() {
+            predicates.push("instr(lower(id || ' ' || json_extract(data,'$.state') || ' ' || COALESCE(json_extract(data,'$.worker_id'),'') || ' ' || COALESCE(environment,'') || ' ' || COALESCE(json_extract(data,'$.submitted_by'),'') || ' ' || json_extract(data,'$.spec.command')),lower(?))>0");
+            values.push(needle.to_owned().into());
+        }
+        let predicate = if filtered { predicates.join(" AND ") } else { "1".into() };
+        let total = if filtered {
+            self.db.query_row(&format!("SELECT COUNT(*) FROM jobs WHERE {predicate}"), rusqlite::params_from_iter(values.iter()), |row| row.get(0))?
+        } else {
+            self.db.query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))?
+        };
+        let mut statement = self.db.prepare(&format!("SELECT json_object(
+            'id',id,'state',json_extract(data,'$.state'),
+            'command',COALESCE(substr((SELECT group_concat(value,' ') FROM json_each(jobs.data,'$.spec.command')),1,241),''),
+            'environment',json_extract(data,'$.spec.environment'),
+            'worker_id',json_extract(data,'$.worker_id'),
+            'created_at',json_extract(data,'$.created_at'),'updated_at',json_extract(data,'$.updated_at'),
+            'submitted_by',json_extract(data,'$.submitted_by'))
+            FROM jobs WHERE {predicate} ORDER BY rowid DESC LIMIT ? OFFSET ?"))?;
+        values.extend([rusqlite::types::Value::Integer(limit as i64), rusqlite::types::Value::Integer(offset as i64)]);
+        let rows = statement.query_map(rusqlite::params_from_iter(values.iter()), |row| row.get::<_, String>(0))?;
+        let mut jobs = Vec::new();
+        for row in rows {
+            let mut job: JobSummary = serde_json::from_str(&row?)?;
+            if job.command.chars().count() > 240 {
+                job.command = job.command.chars().take(240).chain(['…']).collect();
+            }
+            jobs.push(job);
+        }
+        let stats = if !filtered && offset == 0 {
+            let mut stats = JobStats::default();
+            let mut statement = self.db.prepare("SELECT json_extract(data,'$.state'),json_extract(data,'$.worker_id'),COUNT(*) FROM jobs GROUP BY 1,2")?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let state: String = row.get(0)?;
+                let worker: Option<String> = row.get(1)?;
+                let count: usize = row.get(2)?;
+                *stats.states.entry(state.clone()).or_default() += count;
+                if let Some(worker) = worker {
+                    let counts = stats.workers.entry(worker).or_default();
+                    counts.total += count;
+                    if matches!(state.as_str(), "assigned" | "running") { counts.active += count; }
+                }
+            }
+            Some(stats)
+        } else { None };
+        Ok(JobList { jobs, total, stats })
     }
     fn environments(&self) -> Result<Vec<Environment>> {
         self.rows("SELECT data FROM environments ORDER BY id")
@@ -1507,6 +1574,7 @@ fn router(state: Shared) -> Router {
         .route("/v1/workers/{id}/metrics", get(worker_metrics))
         .route("/v1/blobs/missing", post(missing_blobs))
         .route("/v1/jobs", post(submit).get(jobs))
+        .route("/v1/jobs/summary", get(job_summaries))
         .route("/v1/jobs/{id}", get(job))
         .route("/v1/jobs/{id}/logs", get(logs))
         .route("/v1/jobs/{id}/cancel", post(cancel))
@@ -1801,6 +1869,45 @@ async fn set_priority(
     }
     store.record(&principal, "job.priority", &id, Some(request.priority.to_string()));
     Ok(Json(job))
+}
+#[derive(Serialize, Deserialize)]
+struct JobSummary {
+    id: String,
+    state: String,
+    command: String,
+    environment: Option<String>,
+    worker_id: Option<String>,
+    created_at: u64,
+    updated_at: u64,
+    submitted_by: Option<String>,
+}
+#[derive(Default, Serialize)]
+struct WorkerJobCounts { total: usize, active: usize }
+#[derive(Default, Serialize)]
+struct JobStats {
+    states: HashMap<String, usize>,
+    workers: HashMap<String, WorkerJobCounts>,
+}
+#[derive(Serialize)]
+struct JobList {
+    jobs: Vec<JobSummary>,
+    total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stats: Option<JobStats>,
+}
+#[derive(Deserialize, Default)]
+struct JobListQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    state: Option<String>,
+    worker: Option<String>,
+    q: Option<String>,
+}
+async fn job_summaries(State(state): State<Shared>, Query(query): Query<JobListQuery>) -> ApiResult<Json<JobList>> {
+    if !(1..=50).contains(&query.limit.unwrap_or(50)) || query.offset.unwrap_or(0) > i64::MAX as usize {
+        return Err(invalid("limit must be between 1 and 50; offset must fit a signed 64-bit integer"));
+    }
+    Ok(Json(lock(&state)?.job_summaries(&query)?))
 }
 #[derive(Deserialize, Default)]
 struct JobsQuery {
@@ -2380,6 +2487,70 @@ mod tests {
             )
             .unwrap();
         store.schedule().unwrap();
+    }
+
+    #[test]
+    fn job_summaries_page_filter_and_exclude_detail_payloads() {
+        let (_dir, mut store) = test_store();
+        let (_session, _rx) = worker(&mut store, "one");
+        store.control_worker("one", WorkerControl { paused: Some(true), ..Default::default() }).unwrap();
+        let mut ids = Vec::new();
+        for index in 0..123 {
+            let mut job = store.add_job(spec(), Some("requester".into())).unwrap();
+            job.state = if index % 2 == 0 { "running" } else { "succeeded" }.into();
+            job.worker_id = Some("one".into());
+            job.spec.command = vec!["echo".into(), format!("needle-{index} {}", "가".repeat(500))];
+            store.save_job(&job).unwrap();
+            ids.push(job.id);
+        }
+        let mut full = store.job(&ids[122]).unwrap().unwrap();
+        full.spec.env.insert("PRIVATE".into(), "detail-only".repeat(100_000));
+        full.results = vec![FileEntry { path: "answer".into(), hash: "0".repeat(64), size: 3, mode: 420 }];
+        store.save_job(&full).unwrap();
+        let first = store.job_summaries(&JobListQuery::default()).unwrap();
+        assert_eq!(first.total, 123);
+        assert_eq!(first.jobs.len(), 50);
+        assert_eq!(first.jobs[0].id, ids[122]);
+        assert!(first.jobs[0].command.ends_with('…'));
+        assert_eq!(first.jobs[0].command.chars().count(), 241);
+        let stats = first.stats.as_ref().unwrap();
+        assert_eq!(stats.states["running"], 62);
+        assert_eq!(stats.workers["one"].total, 123);
+        assert_eq!(stats.workers["one"].active, 62);
+        let encoded = serde_json::to_string(&first).unwrap();
+        assert!(!encoded.contains("detail-only"));
+        assert!(!encoded.contains("results"));
+        assert!(!encoded.contains("spec"));
+        assert!(encoded.len() < 60_000);
+        let second = store.job_summaries(&JobListQuery { offset: Some(50), ..Default::default() }).unwrap();
+        let third = store.job_summaries(&JobListQuery { offset: Some(100), ..Default::default() }).unwrap();
+        assert_eq!(second.jobs.len(), 50);
+        assert_eq!(third.jobs.len(), 23);
+        assert!(second.stats.is_none());
+        let combined: BTreeSet<_> = first.jobs.iter().chain(&second.jobs).chain(&third.jobs).map(|j| &j.id).collect();
+        assert_eq!(combined.len(), 123);
+        let filtered = store.job_summaries(&JobListQuery { state: Some("active".into()), worker: Some("one".into()), q: Some("needle-12".into()), ..Default::default() }).unwrap();
+        assert_eq!(filtered.total, 3); // 12, 120, 122
+        assert_eq!(filtered.jobs.len(), 3);
+        assert!(store.job_summaries(&JobListQuery { q: Some("does-not-exist".into()), ..Default::default() }).unwrap().jobs.is_empty());
+        assert_eq!(store.job(&ids[122]).unwrap().unwrap().spec.env["PRIVATE"], full.spec.env["PRIVATE"]);
+        let plan: String = store.db.query_row("EXPLAIN QUERY PLAN SELECT json_extract(data,'$.state'),json_extract(data,'$.worker_id'),COUNT(*) FROM jobs GROUP BY 1,2", [], |row| row.get(3)).unwrap();
+        assert!(plan.contains("jobs_state_worker"), "{plan}");
+    }
+
+    #[tokio::test]
+    async fn job_summaries_require_auth_and_bound_page_size() {
+        use tower::ServiceExt;
+        let (_dir, store) = test_store();
+        let app = router(Arc::new(Mutex::new(store)));
+        let response = app.clone().oneshot(axum::http::Request::builder().uri("/v1/jobs/summary").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        for limit in [0, 51] {
+            let response = app.clone().oneshot(axum::http::Request::builder().uri(format!("/v1/jobs/summary?limit={limit}")).header(header::AUTHORIZATION, "Bearer test-token-long-enough").body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        let response = app.oneshot(axum::http::Request::builder().uri("/v1/jobs/summary?limit=50").header(header::AUTHORIZATION, "Bearer test-token-long-enough").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[cfg(dashboard_assets)]

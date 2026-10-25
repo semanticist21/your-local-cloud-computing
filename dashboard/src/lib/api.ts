@@ -62,6 +62,14 @@ export type Job = {
   submitted_by?: string | null
 }
 
+export type JobSummary = Pick<Job, 'id' | 'state' | 'worker_id' | 'created_at' | 'updated_at' | 'submitted_by'> & {
+  command: string
+  environment?: string | null
+}
+export type JobSearch = { q?: string; state?: string; worker?: string }
+export type JobStats = { states: Record<string, number>; workers: Record<string, { total: number; active: number }> }
+export type JobList = { jobs: JobSummary[]; total: number; stats?: JobStats }
+
 export type LogEntry = { job_id: string; attempt_id: string; seq: number; stream: string; text: string }
 
 export type Environment = {
@@ -106,7 +114,7 @@ export type AuditEvent = {
 
 export type Snapshot = {
   workers: WorkerInfo[]
-  jobs: Job[]
+  jobList: JobList
   environments: Environment[]
   environmentStatuses: EnvironmentStatus[]
 }
@@ -181,14 +189,29 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const dashboardPasswordStatus = () => get<{ set: boolean }>('/v1/dashboard-password')
-export const jobPageSize = 200
-export const jobsHistoryQuery = infiniteQueryOptions({
-  queryKey: ['jobs-history'],
-  queryFn: ({ pageParam }) => get<Job[]>(`/v1/jobs?limit=${jobPageSize}&offset=${pageParam}`),
-  initialPageParam: jobPageSize,
+export const jobPageSize = 50
+
+function fetchJobList(search: JobSearch = {}, offset = 0) {
+  const params = new URLSearchParams({ limit: String(jobPageSize), offset: String(offset) })
+  for (const [key, value] of Object.entries(search)) if (value) params.set(key, value)
+  return get<JobList>(`/v1/jobs/summary?${params}`)
+}
+
+export const jobsHistoryQuery = (search: JobSearch = {}) => infiniteQueryOptions({
+  queryKey: ['jobs-history', search],
+  queryFn: ({ pageParam }) => fetchJobList(search, pageParam),
+  initialPageParam: 0,
   getNextPageParam: (lastPage, _pages, lastOffset) =>
-    lastPage.length === jobPageSize ? lastOffset + jobPageSize : undefined,
-  enabled: false,
+    lastOffset + jobPageSize < lastPage.total && lastPage.jobs.length
+      ? lastOffset + jobPageSize : undefined,
+  refetchOnMount: false,
+  refetchOnWindowFocus: false,
+})
+
+export const jobListQuery = (search: JobSearch) => queryOptions({
+  queryKey: ['jobs-list', search],
+  queryFn: () => fetchJobList(search),
+  refetchInterval: pollMs,
 })
 
 export async function post<T = void>(path: string, body?: unknown): Promise<T> {
@@ -212,13 +235,13 @@ export const pollMs = 5000
 export const snapshotQuery = queryOptions({
   queryKey: ['snapshot'],
   queryFn: async (): Promise<Snapshot> => {
-    const [workers, jobs, environments, environmentStatuses] = await Promise.all([
+    const [workers, jobList, environments, environmentStatuses] = await Promise.all([
       get<WorkerInfo[]>('/v1/workers'),
-      get<Job[]>(`/v1/jobs?limit=${jobPageSize}`),
+      fetchJobList(),
       get<Environment[]>('/v1/environments'),
       get<EnvironmentStatus[]>('/v1/environments/status'),
     ])
-    return { workers, jobs, environments, environmentStatuses }
+    return { workers, jobList, environments, environmentStatuses }
   },
   refetchInterval: pollMs,
   placeholderData: keepPreviousData,

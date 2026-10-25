@@ -231,6 +231,7 @@ select.field { padding-right: 26px; }
 .loading-state-compact { min-height: 96px; flex-direction: row; gap: 10px; }
 .loading-state-compact p { margin: 0; }
 .jobs-pagination { min-height: 96px; display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 12px; text-align: center; color: var(--muted-foreground); font-size: 12px; }
+.jobs-pagination .loading-state p { color: var(--muted-foreground); }
 
 @media (max-width: 1100px) {
   .app-shell { grid-template-columns: 210px minmax(0, 1fr); }

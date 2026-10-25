@@ -1,5 +1,5 @@
-import { lazy, Suspense, useCallback, useEffect, useState, type FormEvent, type ReactNode } from 'react'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { lazy, Suspense, useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import { useInfiniteQuery, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Link,
   Outlet,
@@ -54,7 +54,9 @@ import {
   formatRelative,
   formatTime,
   jobLogsQuery,
-  jobsPage,
+  jobQuery,
+  jobPageSize,
+  jobsHistoryQuery,
   readToken,
   snapshotQuery,
   storeToken,
@@ -71,7 +73,6 @@ import {
 const activeJobStates = new Set(['assigned', 'running'])
 const terminalJobStates = new Set(['succeeded', 'failed', 'cancelled'])
 const jobStates = ['queued', 'assigned', 'running', 'cancelling', 'succeeded', 'failed', 'cancelled']
-const jobListLimit = 200
 
 // ---------- Routes ----------
 
@@ -589,35 +590,14 @@ function PolicySection({ policy }: { policy: WorkerPolicy }) {
 function JobsPage() {
   const snapshot = useSnapshot()
   const workers = snapshot.workers
-  const [loadedJobs, setLoadedJobs] = useState(snapshot.jobs)
-  const [offset, setOffset] = useState(0)
-  const [hasMore, setHasMore] = useState(snapshot.jobs.length >= 200)
-  const moreQuery = useQuery({
-    queryKey: ['jobs-page', offset],
-    queryFn: () => jobsPage(200, offset),
-    enabled: offset > 0,
-  })
-  useEffect(() => {
-    if (!moreQuery.data) return
-    setLoadedJobs((previous) => {
-      const known = new Set(previous.map((job) => job.id))
-      return [...previous, ...moreQuery.data.filter((job) => !known.has(job.id))]
-    })
-    setHasMore(moreQuery.data.length >= 200)
-  }, [moreQuery.data])
-
-  useEffect(() => {
-    const onScroll = () => {
-      if (!hasMore || moreQuery.isFetching) return
-      if (window.innerHeight + window.scrollY >= document.body.offsetHeight - 240) {
-        setOffset((value) => value + 200)
-      }
-    }
-    window.addEventListener('scroll', onScroll, { passive: true })
-    return () => window.removeEventListener('scroll', onScroll)
-  }, [hasMore, moreQuery.isFetching])
-
-  const jobs = loadedJobs
+  const loadMoreRef = useRef<HTMLDivElement>(null)
+  const moreQuery = useInfiniteQuery(jobsHistoryQuery)
+  const hasMore = moreQuery.data ? moreQuery.hasNextPage : snapshot.jobs.length >= jobPageSize
+  const { fetchNextPage, isFetching, isError, dataUpdatedAt } = moreQuery
+  const jobs = [...new Map([
+    ...(moreQuery.data?.pages.flat() ?? []),
+    ...snapshot.jobs,
+  ].map((job) => [job.id, job])).values()]
   const search = jobsRoute.useSearch()
   const navigate = useNavigate({ from: '/jobs' })
   const setSearch = useCallback(
@@ -650,6 +630,16 @@ function JobsPage() {
   const filtering = Boolean(search.q || search.state || search.worker)
   const workerIds = [...new Set([...workers.map((worker) => worker.id), ...(search.worker ? [search.worker] : [])])].sort()
 
+  useEffect(() => {
+    const target = loadMoreRef.current
+    if (!target || !hasMore || isFetching || isError) return
+    const observer = new IntersectionObserver(([entry]) => {
+      if (entry.isIntersecting) void fetchNextPage({ cancelRefetch: false })
+    }, { rootMargin: '240px' })
+    observer.observe(target)
+    return () => observer.disconnect()
+  }, [hasMore, isFetching, isError, fetchNextPage, dataUpdatedAt, filtered.length])
+
   return (
     <>
       <PageHeading title="Jobs" description="Recent execution state across the pool." />
@@ -680,14 +670,21 @@ function JobsPage() {
         </div>
         <SectionHeading
           title="Job history"
-          detail={filtered.length > jobListLimit ? `Showing newest ${jobListLimit} of ${filtered.length} matches` : `${filtered.length} of ${jobs.length} jobs`}
+          detail={`${filtered.length} of ${jobs.length} jobs`}
         />
-        {filtered.length ? <JobsTable jobs={filtered.slice(0, jobListLimit)} /> : jobs.length ? (
+        {filtered.length ? <JobsTable jobs={filtered} /> : jobs.length ? (
           <EmptyState icon={<Terminal />} title="No matching jobs" detail="Try a different search or clear the filters." />
         ) : (
           <EmptyState icon={<Terminal />} title="No jobs yet" detail="Submitted jobs and their latest states will appear here." />
         )}
-        {hasMore && moreQuery.isFetching && <div className="filter-row">Loading more…</div>}
+        {hasMore && <div ref={loadMoreRef} className="jobs-pagination">
+          {isFetching ? <LoadingState compact label="Loading more jobs…" /> : <>
+            {isError && <span role="alert">Could not load more jobs: {errorMessage(moreQuery.error)}</span>}
+            <Button variant="outline" onClick={() => void fetchNextPage({ cancelRefetch: false })}>
+              {isError ? 'Try again' : 'Load more jobs'}
+            </Button>
+          </>}
+        </div>}
       </section>
     </>
   )
@@ -696,7 +693,9 @@ function JobsPage() {
 function JobPage() {
   const { jobId } = jobRoute.useParams()
   const { jobs } = useSnapshot()
-  const job = jobs.find((candidate) => candidate.id === jobId)
+  const recentJob = jobs.find((candidate) => candidate.id === jobId)
+  const details = useQuery({ ...jobQuery(jobId), enabled: !recentJob })
+  const job = recentJob ?? details.data
   const finished = Boolean(job && terminalJobStates.has(job.state))
   const logs = useQuery({ ...jobLogsQuery(jobId, !finished), enabled: Boolean(job) })
   const queryClient = useQueryClient()
@@ -706,11 +705,14 @@ function JobPage() {
   }, [finished, jobId, queryClient])
   const now = useNow()
   const back = <Link className="back-link" to="/jobs"><ArrowLeft size={14} /> Jobs</Link>
+  if (!job && details.isPending) return <><PageHeading title="Job details" back={back} /><LoadingState compact /></>
   if (!job) {
     return (
       <>
-        <PageHeading title="Job not found" back={back} />
-        <EmptyState icon={<Terminal />} title={`No job with ID ${jobId}`} detail="It may have been pruned from the Hub history." />
+        <PageHeading title="Could not load job" back={back} />
+        <EmptyState icon={<Terminal />} title={jobId} detail={errorMessage(details.error)}>
+          <Button variant="outline" onClick={() => void details.refetch()}>Try again</Button>
+        </EmptyState>
       </>
     )
   }
@@ -1050,11 +1052,11 @@ function EmptyState({ icon, title, detail, children }: { icon: ReactNode; title:
   return <div className="empty-state"><span className="empty-icon">{icon}</span><div><strong>{title}</strong><p>{detail}</p></div>{children && <div className="empty-action">{children}</div>}</div>
 }
 
-function LoadingState({ compact }: { compact?: boolean }) {
+function LoadingState({ compact, label = 'Loading…' }: { compact?: boolean; label?: string }) {
   return (
     <div className={compact ? 'loading-state loading-state-compact' : 'loading-state'} role="status">
-      <span className="loading-indicator" />
-      {compact ? <p>Loading…</p> : <><strong>Connecting to Hub</strong><p><Clock3 size={12} /> Reading workers, jobs, and environments</p></>}
+      <span className="loading-indicator" aria-hidden="true" />
+      {compact ? <p>{label}</p> : <><strong>Connecting to Hub</strong><p><Clock3 size={12} /> Reading workers, jobs, and environments</p></>}
     </div>
   )
 }

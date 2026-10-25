@@ -20,7 +20,7 @@ jobs:
       - name: Rust stable
         run: rustup update stable --no-self-update && rustup default stable
       - name: Build dashboard assets
-        run: npm ci --prefix dashboard && npm run build --prefix dashboard
+        run: npm ci --prefix dashboard && npm test --prefix dashboard && npm run build --prefix dashboard
       - run: python3 scripts/release.py --check
       - run: cargo test --locked
       - run: cargo build --locked
@@ -39,7 +39,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustup default stable
       - name: Build dashboard assets
-        run: npm ci --prefix dashboard; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; npm run build --prefix dashboard; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        run: npm ci --prefix dashboard; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; npm test --prefix dashboard; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; npm run build --prefix dashboard; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - run: cargo test --locked
       - run: cargo build --locked
       - run: python tests/e2e.py target/debug/ylcc.exe

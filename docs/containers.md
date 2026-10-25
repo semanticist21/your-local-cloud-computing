@@ -30,7 +30,7 @@ docker --context "$YLCC_DOCKER_CONTEXT" run -d --init --name ylcc-worker --resta
   --user "$YLCC_UID:$YLCC_GID" \
   --mount "type=bind,src=$YLCC_DATA_DIR/worker,dst=/data" \
   --mount "type=bind,src=$YLCC_TOKEN_FILE,dst=/run/secrets/token,readonly" \
-  ghcr.io/semanticist21/your-local-cloud-computing:0.5.10 \
+  ghcr.io/semanticist21/your-local-cloud-computing:0.5.11 \
   --hub https://HUB.example.ts.net:10000 --token-file /run/secrets/token \
   worker --id container-worker --data-dir /data --max-jobs 1
 ```
@@ -45,7 +45,7 @@ Native workers can use an already configured Docker or Podman runtime; verify it
 mkdir -p "$YLCC_SUPPORT_DIR/dist"
 # Extract the verified Linux release archive for the runtime CPU; arm64 example:
 tar -xzf /path/to/ylcc-linux-aarch64.tar.gz -C "$YLCC_SUPPORT_DIR/dist"
-docker --context "$YLCC_DOCKER_CONTEXT" build --target runtime-client -t ylcc-runtime-client:0.5.10 \
+docker --context "$YLCC_DOCKER_CONTEXT" build --target runtime-client -t ylcc-runtime-client:0.5.11 \
   -f "$YLCC_SUPPORT_DIR/Dockerfile" "$YLCC_SUPPORT_DIR"
 ```
 
@@ -62,7 +62,7 @@ docker --context "$YLCC_DOCKER_CONTEXT" run -d --init --name ylcc-runtime-worker
   --mount "type=bind,src=$YLCC_RUNTIME_SOCKET,dst=/var/run/docker.sock" \
   --mount "type=bind,src=$YLCC_RUNTIME_DATA,dst=$YLCC_RUNTIME_DATA" \
   --mount "type=bind,src=$YLCC_TOKEN_FILE,dst=/run/secrets/token,readonly" \
-  ylcc-runtime-client:0.5.10 \
+  ylcc-runtime-client:0.5.11 \
   --hub https://HUB.example.ts.net:10000 --token-file /run/secrets/token \
   worker --id runtime-worker --data-dir "$YLCC_RUNTIME_DATA" --max-jobs 1
 ```

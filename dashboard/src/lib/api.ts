@@ -37,6 +37,25 @@ export type WorkerInfo = {
   update_error?: string | null
 }
 
+export function workerUpdateProgress(worker: Pick<WorkerInfo, 'updating' | 'online'>, activeJobs: number) {
+  if (!worker.updating) return null
+  if (!worker.online) return {
+    phase: 'reconnecting' as const,
+    label: 'Awaiting reconnection',
+    detail: `Waiting for this worker to reconnect and complete ${worker.updating}.`,
+  }
+  if (activeJobs > 0) return {
+    phase: 'draining' as const,
+    label: 'Waiting for jobs',
+    detail: `Waiting for ${activeJobs} active ${activeJobs === 1 ? 'job' : 'jobs'} to finish. Then ${worker.updating} installs automatically.`,
+  }
+  return {
+    phase: 'updating' as const,
+    label: 'Updating',
+    detail: `Updating to ${worker.updating}. The worker will restart and reconnect.`,
+  }
+}
+
 export type FileEntry = { path: string; hash: string; size: number; mode: number }
 
 export type JobSpec = {

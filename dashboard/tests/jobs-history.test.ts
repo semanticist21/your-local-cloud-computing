@@ -7,7 +7,19 @@ Object.defineProperties(globalThis, {
   window: { value: { setInterval: () => 0 }, configurable: true },
   sessionStorage: { value: { getItem: () => 'fixture' }, configurable: true },
 })
-const { jobsHistoryQuery, jobListQuery, jobQuery, snapshotQuery, latestReleaseQuery, post } = await import('../src/lib/api.ts')
+const { jobsHistoryQuery, jobListQuery, jobQuery, snapshotQuery, latestReleaseQuery, post, workerUpdateProgress } = await import('../src/lib/api.ts')
+
+test('worker updates distinguish job draining, installation and reconnection', () => {
+  const worker = { updating: 'v0.5.10', online: true }
+  assert.deepEqual(workerUpdateProgress(worker, 1), {
+    phase: 'draining', label: 'Waiting for jobs',
+    detail: 'Waiting for 1 active job to finish. Then v0.5.10 installs automatically.',
+  })
+  assert.match(workerUpdateProgress(worker, 2)!.detail, /2 active jobs/)
+  assert.equal(workerUpdateProgress(worker, 0)!.phase, 'updating')
+  assert.equal(workerUpdateProgress({ ...worker, online: false }, 1)!.phase, 'reconnecting')
+  assert.equal(workerUpdateProgress({ online: true, updating: null }, 1), null)
+})
 
 test('release checks are cached and update refusals show the server reason', async (t) => {
   const paths: string[] = []

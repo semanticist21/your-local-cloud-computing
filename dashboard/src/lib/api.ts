@@ -1,4 +1,4 @@
-import { keepPreviousData, queryOptions } from '@tanstack/react-query'
+import { infiniteQueryOptions, keepPreviousData, queryOptions } from '@tanstack/react-query'
 import { useSyncExternalStore } from 'react'
 
 export type Capabilities = {
@@ -181,7 +181,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const dashboardPasswordStatus = () => get<{ set: boolean }>('/v1/dashboard-password')
-export const jobsPage = (limit: number, offset: number) => get<Job[]>(`/v1/jobs?limit=${limit}&offset=${offset}`)
+export const jobPageSize = 200
+export const jobsHistoryQuery = infiniteQueryOptions({
+  queryKey: ['jobs-history'],
+  queryFn: ({ pageParam }) => get<Job[]>(`/v1/jobs?limit=${jobPageSize}&offset=${pageParam}`),
+  initialPageParam: jobPageSize,
+  getNextPageParam: (lastPage, _pages, lastOffset) =>
+    lastPage.length === jobPageSize ? lastOffset + jobPageSize : undefined,
+  enabled: false,
+})
 
 export async function post<T = void>(path: string, body?: unknown): Promise<T> {
   return request<T>(path, {
@@ -206,7 +214,7 @@ export const snapshotQuery = queryOptions({
   queryFn: async (): Promise<Snapshot> => {
     const [workers, jobs, environments, environmentStatuses] = await Promise.all([
       get<WorkerInfo[]>('/v1/workers'),
-      get<Job[]>('/v1/jobs?limit=200'),
+      get<Job[]>(`/v1/jobs?limit=${jobPageSize}`),
       get<Environment[]>('/v1/environments'),
       get<EnvironmentStatus[]>('/v1/environments/status'),
     ])
@@ -238,6 +246,13 @@ export const tokensQuery = queryOptions({
   refetchInterval: (query) => (query.state.error instanceof ForbiddenError ? false : pollMs),
   placeholderData: keepPreviousData,
 })
+
+export const jobQuery = (jobId: string) =>
+  queryOptions({
+    queryKey: ['job', jobId],
+    queryFn: () => get<Job>(`/v1/jobs/${encodeURIComponent(jobId)}`),
+    refetchInterval: pollMs,
+  })
 
 export const jobLogsQuery = (jobId: string, active: boolean) =>
   queryOptions({

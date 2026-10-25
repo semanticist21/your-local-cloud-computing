@@ -2933,11 +2933,13 @@ enum Reclaimable {
     Environment(Option<EnvironmentStatus>),
 }
 
-/// Skips busy workers so background collection never queues ahead of new attempts.
+/// Skips busy workers unless disk pressure requires draining before later admissions.
 /// Expired entries always go; under disk pressure or the cache cap, oldest first.
 fn collect_garbage(state: &State, now: SystemTime, cache_limit: u64, usage: &dyn Fn(&State) -> Result<f64>) -> Result<()> {
-    let Ok(_drain) = state.drain.try_write() else {
-        return Ok(());
+    let _drain = match state.drain.try_write() {
+        Ok(drain) => drain,
+        Err(_) if usage(state)? > DISK_HIGH => state.drain.blocking_write(),
+        Err(_) => return Ok(()),
     };
     let attempts: Vec<_> = state.attempts.lock().unwrap().iter().map(|(id, attempt)| (id.clone(), attempt.clone())).collect();
     let age = |time: Option<SystemTime>| time.and_then(|time| now.duration_since(time).ok()).unwrap_or_default();
@@ -2990,10 +2992,10 @@ fn collect_garbage(state: &State, now: SystemTime, cache_limit: u64, usage: &dyn
     let mut pressure = usage(state)? > DISK_HIGH;
     for (used, path, kind) in candidates {
         let unused = age(used);
-        if unused <= MINIMUM_AGE {
-            break;
-        }
         let over_cache_cap = matches!(&kind, Reclaimable::Cache(_)) && cache_bytes > cache_limit;
+        if unused <= MINIMUM_AGE && !over_cache_cap {
+            continue;
+        }
         if !pressure && !over_cache_cap && unused <= UNUSED_RETENTION {
             continue;
         }
@@ -3302,7 +3304,7 @@ mod tests {
         assert_eq!(status.state, "evicted");
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn busy_collection_skips_without_blocking_later_admissions() {
+    async fn busy_collection_only_drains_under_disk_pressure() {
         let temp = tempfile::tempdir().unwrap();
         let state = state_at(temp.path());
         let now = SystemTime::now();
@@ -3330,9 +3332,8 @@ mod tests {
         let active = state.drain.read().await;
         let collector = {
             let state = state.clone();
-            let old = old.clone();
             tokio::task::spawn_blocking(move || {
-                collect_garbage(&state, now, MAX_CACHE_BYTES, &|_| Ok(if old.exists() { 0.9 } else { 0.79 }))
+                collect_garbage(&state, now, MAX_CACHE_BYTES, &|_| Ok(0.5))
             })
         };
         let collected = tokio::time::timeout(Duration::from_secs(5), collector).await;
@@ -3340,11 +3341,25 @@ mod tests {
         assert!(old.exists() && fresh.join("dependency").exists() && workspace.join("in-use").exists());
         assert!(assigned.dir.join("job.json").exists() && assigned.dir.join("journal.json").exists());
 
-        drop(active);
         collected.expect("collection must skip a busy worker").unwrap().unwrap();
         let later = later_admission.expect("collection must leave free slots usable");
         drop(later);
-        collect_garbage(&state, now, MAX_CACHE_BYTES, &|_| Ok(if old.exists() { 0.9 } else { 0.79 })).unwrap();
+        let collector = {
+            let state = state.clone();
+            let old = old.clone();
+            tokio::task::spawn_blocking(move || {
+                collect_garbage(&state, now, MAX_CACHE_BYTES, &|_| Ok(if old.exists() { 0.9 } else { 0.79 }))
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.drain.try_read().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("disk pressure must queue collection ahead of later admissions");
+        assert!(old.exists() && workspace.join("in-use").exists(), "active work must finish before collection");
+        drop(active);
+        let _later = tokio::time::timeout(Duration::from_secs(5), state.drain.read()).await.unwrap();
+        collector.await.unwrap().unwrap();
         assert!(!old.exists() && !cache_marker(&old).exists() && !workspace.exists());
         assert!(fresh.join("dependency").exists() && cache_marker(&fresh).exists(), "a fresh cache marker protects even old dependency files");
         assert_eq!(assigned.report().state, "assigned");
@@ -3352,7 +3367,7 @@ mod tests {
         assert!(assigned.dir.join("journal.json").exists(), "queued work remains runnable after collection");
     }
     #[test]
-    fn cache_cap_uses_whole_lru_caches_and_spares_recent_markers() {
+    fn cache_cap_evicts_whole_lru_caches_even_when_recent() {
         let temp = tempfile::tempdir().unwrap();
         let state = state_at(temp.path());
         let now = SystemTime::now();
@@ -3369,6 +3384,8 @@ mod tests {
         }
         let blob = state.data.join("blobs/keep");
         File::create(&blob).unwrap().set_modified(now - Duration::from_secs(3 * 3600)).unwrap();
+        let recent_blob = state.data.join("blobs/recent");
+        File::create(&recent_blob).unwrap().set_modified(now - Duration::from_secs(1)).unwrap();
         let low_disk_usage = |_: &State| Ok(0.5);
         collect_garbage(&state, now, cache_limit, &low_disk_usage).unwrap();
         assert!(!old.exists() && !cache_marker(&old).exists());
@@ -3378,7 +3395,8 @@ mod tests {
 
         File::options().write(true).open(fresh.join("dependency")).unwrap().set_len(cache_limit + 1).unwrap();
         collect_garbage(&state, now, cache_limit, &low_disk_usage).unwrap();
-        assert!(fresh.join("dependency").exists(), "minimum age protects even an over-budget recent cache");
+        assert!(!fresh.exists() && !cache_marker(&fresh).exists(), "the cache cap triggers eviction even within the minimum age");
+        assert!(recent_blob.exists(), "a recent non-cache must neither stop cache eviction nor be evicted by the cache cap");
     }
     #[test]
     #[cfg(unix)]

@@ -184,7 +184,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       const body = (await response.json().catch(() => null)) as { error?: string } | null
       throw new ForbiddenError(body?.error ?? 'This action requires an admin token.')
     }
-    const message = await response.text()
+    let message = await response.text()
+    try {
+      const body = JSON.parse(message) as { error?: unknown }
+      if (typeof body.error === 'string') message = body.error
+    } catch { /* Non-JSON responses retain their original diagnostic. */ }
     throw new Error(message || `Hub returned ${response.status}`)
   }
   if (response.status === 204) return undefined as unknown as T
@@ -239,6 +243,7 @@ export const latestReleaseQuery = queryOptions({
   queryKey: ['latest-release'],
   queryFn: () => get<{ version: string }>('/v1/releases/latest'),
   staleTime: 300_000,
+  refetchInterval: 300_000,
   retry: 1,
 })
 

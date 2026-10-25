@@ -7,7 +7,26 @@ Object.defineProperties(globalThis, {
   window: { value: { setInterval: () => 0 }, configurable: true },
   sessionStorage: { value: { getItem: () => 'fixture' }, configurable: true },
 })
-const { jobsHistoryQuery, jobListQuery, jobQuery, snapshotQuery } = await import('../src/lib/api.ts')
+const { jobsHistoryQuery, jobListQuery, jobQuery, snapshotQuery, latestReleaseQuery, post } = await import('../src/lib/api.ts')
+
+test('release checks are cached and update refusals show the server reason', async (t) => {
+  const paths: string[] = []
+  t.mock.method(globalThis, 'fetch', async (path: string, init?: RequestInit) => {
+    paths.push(path)
+    assert.equal(new Headers(init?.headers).get('Authorization'), 'Bearer fixture')
+    if (path === '/v1/releases/latest') return Response.json({ version: 'v0.5.7' })
+    assert.equal(init?.method, 'POST')
+    assert.deepEqual(JSON.parse(init?.body as string), { version: 'v0.5.7' })
+    return Response.json({ error: 'worker is offline' }, { status: 409 })
+  })
+  const client = new QueryClient({ defaultOptions: { queries: { gcTime: Infinity } } })
+  try {
+    assert.deepEqual(await client.fetchQuery(latestReleaseQuery), { version: 'v0.5.7' })
+    await client.fetchQuery(latestReleaseQuery)
+    assert.equal(paths.length, 1)
+    await assert.rejects(post('/v1/workers/one/update', { version: 'v0.5.7' }), { message: 'worker is offline' })
+  } finally { client.clear() }
+})
 
 test('history pages stay sequential through duplicate triggers, errors and retry', async (t) => {
   const offsets: number[] = []

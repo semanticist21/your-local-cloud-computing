@@ -519,7 +519,12 @@ async fn update_worker(client: &Client, worker: &WorkerInfo, version: &str, time
     ylcc::client::segment(&worker.id)?;
     let control = |paused| WorkerControl { paused: Some(paused), max_jobs: None };
     let path = format!("/v1/workers/{}", worker.id);
-    if !worker.paused {
+    let health: serde_json::Value = client.get("/health").await?;
+    let managed = health["capabilities"].as_array()
+        .is_some_and(|caps| caps.iter().any(|cap| cap == "worker_updates"));
+    // New Hubs hold assignments durably; a disconnected CLI must not leave a manual pause.
+    let pause_here = !managed && !worker.paused;
+    if pause_here {
         client.post::<_, WorkerInfo>(&format!("{path}/control"), &control(true)).await?;
     }
     let result = async {
@@ -543,7 +548,7 @@ async fn update_worker(client: &Client, worker: &WorkerInfo, version: &str, time
         }
     }
     .await;
-    if !worker.paused {
+    if pause_here {
         client.post::<_, WorkerInfo>(&format!("{path}/control"), &control(false)).await?;
     }
     result
@@ -1806,6 +1811,44 @@ mod tests {
         platform::protect_file(token.as_file()).unwrap();
         writeln!(token, "{}", "a".repeat(64)).unwrap();
         token.into_temp_path()
+    }
+
+    #[tokio::test]
+    async fn managed_updates_do_not_write_manual_pause_settings() {
+        for (managed, paused) in [(false, false), (true, false), (true, true)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let hub = format!("http://{}", listener.local_addr().unwrap());
+            let worker = WorkerInfo {
+                id: "one".into(), capabilities: Capabilities::default(), max_jobs: 1,
+                paused, online: true, last_seen: 0, version: "0.5.8".into(), updating: None, update_error: None,
+            };
+            let updated = WorkerInfo { version: "0.5.9".into(), ..worker.clone() };
+            let controls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = controls.clone();
+            let control_response = updated.clone();
+            let update_response = updated.clone();
+            let app = axum::Router::new()
+                .route("/health", axum::routing::get(move || async move {
+                    axum::Json(serde_json::json!({"capabilities": if managed { vec!["worker_updates"] } else { vec![] }}))
+                }))
+                .route("/v1/workers/one/control", axum::routing::post(move |axum::Json(control): axum::Json<WorkerControl>| {
+                    let recorded = recorded.clone();
+                    let response = control_response.clone();
+                    async move { recorded.lock().unwrap().push(control.paused.unwrap()); axum::Json(response) }
+                }))
+                .route("/v1/workers/one/update", axum::routing::post(move || {
+                    let response = update_response.clone(); async move { axum::Json(response) }
+                }))
+                .route("/v1/workers", axum::routing::get(move || {
+                    let response = updated.clone(); async move { axum::Json(vec![response]) }
+                }));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let token = test_token();
+            let client = Client::new(&hub, &token).unwrap();
+            update_worker(&client, &worker, "v0.5.9", std::time::Duration::from_secs(10)).await.unwrap();
+            server.abort();
+            assert_eq!(*controls.lock().unwrap(), if managed { vec![] } else { vec![true, false] });
+        }
     }
 
     #[test]

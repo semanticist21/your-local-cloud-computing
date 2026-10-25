@@ -3361,8 +3361,13 @@ async fn self_update(state: &Arc<State>, version: &str) -> Result<()> {
     ensure!(!state.capabilities.containerized, "container workers update by recreating the container from the new image");
     let exe = crate::platform::command_path(&std::env::current_exe()?.canonicalize()?);
     let dir = exe.parent().context("worker binary has no directory")?;
-    let staging = tempfile::Builder::new().prefix(".ylcc-update-").tempdir_in(dir).with_context(|| {
-        format!("the worker account cannot write {}; install the worker binary in a directory it owns", dir.display())
+    let staging = tempfile::Builder::new().prefix(".ylcc-update-").tempdir_in(dir).map_err(|error| {
+        let help = if cfg!(target_os = "macos") && error.kind() == std::io::ErrorKind::PermissionDenied {
+            format!("Check the worker account's write permissions. If those are correct, macOS may be denying external-disk access: on the worker's Mac, re-add {} to Full Disk Access in System Settings, enable it, restart the worker service, and retry", exe.display())
+        } else {
+            "Check the worker service account's write permissions and available disk space".into()
+        };
+        anyhow::Error::new(error).context(format!("cannot create update files in {}. {help}", dir.display()))
     })?;
     let (os, arch) = (&state.capabilities.os, &state.capabilities.arch);
     let (archive, binary) = if os == "windows" { (format!("ylcc-{os}-{arch}.zip"), "ylcc.exe") } else { (format!("ylcc-{os}-{arch}.tar.gz"), "ylcc") };

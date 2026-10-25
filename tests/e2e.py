@@ -309,11 +309,15 @@ def main():
                 request = urllib.request.Request(hub_url + path, data=body, headers=headers, method=method)
                 with urllib.request.urlopen(request, timeout=60) as response:
                     return json.load(response)
-            huge_spec = {"command": noop, "requirements": {"os": os_name, "arch": arch, "worker": "second-worker"}, "env": {"TOO_LARGE_FOR_OS_ENV": "x" * (17 * 1024 * 1024)}}
+            huge_spec = {"command": python("raise SystemExit(23)"), "requirements": {"os": os_name, "arch": arch, "worker": "second-worker"}, "env": {"LARGE_METADATA": "x" * (17 * 1024 * 1024)}}
             huge_run = api("POST", "/v1/jobs", huge_spec)
-            until(lambda: state(huge_run)["state"] == "failed")
+            def huge_outcome():
+                current = state(huge_run)
+                return current if current["state"] in {"succeeded", "failed", "cancelled", "unknown"} else None
+            outcome = until(huge_outcome)
+            assert outcome["state"] == "failed", {"state": outcome["state"], "error": (outcome.get("error") or "")[:500]}
             huge_journal = base / "worker2" / "attempts" / huge_run["attempt_id"]
-            assert len(json.loads((huge_journal / "job.json").read_text())["env"]["TOO_LARGE_FOR_OS_ENV"]) == 17 * 1024 * 1024
+            assert len(json.loads((huge_journal / "job.json").read_text())["env"]["LARGE_METADATA"]) == 17 * 1024 * 1024
             assert json.loads((huge_journal / "journal.json").read_text()).get("delivery") is None
             # Reconcile a >2 MiB successful file manifest and a >16 MiB failure without aggregate Hello.
             large, _ = cli("run", "--no-input", *common, "--worker", "second-worker", "--output", "out", "--", *python("from pathlib import Path; Path('out').mkdir()"))

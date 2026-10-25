@@ -56,8 +56,8 @@ Download a versioned binary for Linux/macOS on x86_64/arm64. The installer verif
 
 ```bash
 task_tmp="$(mktemp -d)"
-curl -fL https://raw.githubusercontent.com/semanticist21/your-local-cloud-computing/v0.5.8/scripts/install.sh -o "$task_tmp/install.sh"
-bash "$task_tmp/install.sh" --version v0.5.8
+curl -fL https://raw.githubusercontent.com/semanticist21/your-local-cloud-computing/v0.5.9/scripts/install.sh -o "$task_tmp/install.sh"
+bash "$task_tmp/install.sh" --version v0.5.9
 rm "$task_tmp/install.sh"
 rmdir "$task_tmp"
 export PATH="$HOME/.local/bin:$PATH"

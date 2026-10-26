@@ -64,7 +64,7 @@ Workers follow the usual CI/cluster retention rules, without configuration:
 - When the data filesystem is over 85% full, the least recently used of those go first until it is under 80%, as the kubelet does for images. Entries used within the last hour are spared unless task caches exceed their own cap, so a disk filled by something else does not make every job rebuild.
 - Deleting an environment from the catalogue removes its files from connected workers immediately; offline workers drop them by age.
 
-Collection runs hourly, after each attempt and at startup. Busy workers skip routine collection; under disk pressure, collection waits for active work to finish and runs before later attempts. An evicted environment is prepared again by the next job that needs it.
+Collection runs hourly, after each attempt and at startup. Under disk pressure, a busy worker reclaims finished attempt files and unleased caches while admitting new jobs. It defers workspace, blob and environment cleanup until idle. GC logs separate lock wait, cleanup time and filesystem space reclaimed. An evicted environment is prepared again by the next job that needs it.
 
 ## Reconnection and transport bounds
 

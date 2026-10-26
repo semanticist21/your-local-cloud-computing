@@ -80,11 +80,12 @@ export type Job = {
   updated_at: number
   exit_code?: number | null
   error?: string | null
+  wait_reason?: string | null
   results?: FileEntry[]
   submitted_by?: string | null
 }
 
-export type JobSummary = Pick<Job, 'id' | 'state' | 'worker_id' | 'created_at' | 'updated_at' | 'submitted_by'> & {
+export type JobSummary = Pick<Job, 'id' | 'state' | 'worker_id' | 'created_at' | 'updated_at' | 'submitted_by' | 'wait_reason'> & {
   command: string
   environment?: string | null
 }

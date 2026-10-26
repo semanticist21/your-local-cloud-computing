@@ -75,9 +75,9 @@ import {
   type WorkerPolicy,
 } from './lib/api'
 
-const activeJobStates = new Set(['assigned', 'running'])
+const activeJobStates = new Set(['assigned', 'waiting', 'running'])
 const terminalJobStates = new Set(['succeeded', 'failed', 'cancelled'])
-const jobStates = ['queued', 'assigned', 'running', 'cancelling', 'succeeded', 'failed', 'cancelled']
+const jobStates = ['queued', 'waiting', 'running', 'cancelling', 'succeeded', 'failed', 'cancelled']
 
 // ---------- Routes ----------
 
@@ -384,7 +384,7 @@ function OverviewPage() {
   const { workers, jobList, environmentStatuses } = useSnapshot()
   const jobs = jobList.jobs
   const onlineWorkers = workers.filter((worker) => worker.online)
-  const activeCount = (jobList.stats?.states.assigned ?? 0) + (jobList.stats?.states.running ?? 0)
+  const activeCount = (jobList.stats?.states.assigned ?? 0) + (jobList.stats?.states.waiting ?? 0) + (jobList.stats?.states.running ?? 0)
   const queuedCount = jobList.stats?.states.queued ?? 0
   const failedCount = jobList.stats?.states.failed ?? 0
   const jobsByWorker = countActiveJobs(jobList.stats)
@@ -742,7 +742,7 @@ function JobsPage() {
           />
           <select className="field" aria-label="Filter by state" value={search.state ?? ''} onChange={(event) => setSearch({ state: event.target.value || undefined })}>
             <option value="">All states</option>
-            <option value="active">Active (assigned + running)</option>
+            <option value="active">Active (waiting + running)</option>
             {jobStates.map((state) => <option key={state} value={state}>{state}</option>)}
           </select>
           <select className="field" aria-label="Filter by worker" value={search.worker ?? ''} onChange={(event) => setSearch({ worker: event.target.value || undefined })}>
@@ -811,6 +811,7 @@ function JobPage() {
   return (
     <>
       <PageHeading title={<code className="heading-code">{job.id}</code>} back={back} description={<StatusBadge state={job.state} />} />
+      {job.state === 'waiting' && job.wait_reason && <p role="status" className="muted-text">{job.wait_reason}</p>}
       {job.error && (
         <div className="error-notice" role="alert"><CircleAlert size={16} /><span>{job.error}</span></div>
       )}
@@ -879,7 +880,7 @@ function JobsTable({ jobs }: { jobs: JobSummary[] }) {
       <tbody>{jobs.map((job) => (
         <tr key={job.id} className="clickable-row" onClick={() => navigate({ to: '/jobs/$jobId', params: { jobId: job.id } })}>
           <td><Link className="table-link" to="/jobs/$jobId" params={{ jobId: job.id }}><code className="job-id">{job.id.slice(0, 8)}</code></Link></td>
-          <td><StatusBadge state={job.state} /></td>
+          <td><StatusBadge state={job.state} />{job.state === 'waiting' && job.wait_reason && <span className="muted-text"> {job.wait_reason}</span>}</td>
           <td><code className="command-cell" title={job.command}>{job.command || '—'}</code></td>
           <td>{job.worker_id
             ? <Link className="table-link" to="/workers/$workerId" params={{ workerId: job.worker_id }} onClick={(event) => event.stopPropagation()}>{job.worker_id}</Link>
@@ -1131,7 +1132,7 @@ function StatusBadge({ state }: { state: string }) {
   const variant = ['succeeded', 'ready', 'complete'].includes(state) ? 'success'
     : ['running', 'assigned', 'preparing'].includes(state) ? 'default'
       : ['failed', 'unknown'].includes(state) ? 'danger'
-        : ['queued', 'pending', 'cancelling'].includes(state) ? 'warning' : 'muted'
+        : ['queued', 'waiting', 'pending', 'cancelling'].includes(state) ? 'warning' : 'muted'
   return <Badge variant={variant}><span className={variant === 'default' ? 'badge-dot badge-dot-live' : 'badge-dot'} />{state}</Badge>
 }
 

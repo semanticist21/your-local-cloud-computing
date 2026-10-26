@@ -575,7 +575,7 @@ async fn update_release(
                     let active: Vec<String> = match client.get::<Vec<Job>>("/v1/jobs").await {
                         Ok(jobs) => jobs
                             .into_iter()
-                            .filter(|job| matches!(job.state.as_str(), "queued" | "assigned" | "running"))
+                            .filter(|job| matches!(job.state.as_str(), "queued" | "assigned" | "waiting" | "running"))
                             .map(|job| job.id)
                             .collect(),
                         Err(error) => {
@@ -1431,6 +1431,7 @@ async fn execute() -> Result<()> {
                     "total_jobs": jobs.len(),
                     "queued": jobs.iter().filter(|j| j.state == "queued").count(),
                     "assigned": jobs.iter().filter(|j| j.state == "assigned").count(),
+                    "waiting": jobs.iter().filter(|j| j.state == "waiting").count(),
                     "running": jobs.iter().filter(|j| j.state == "running").count(),
                     "succeeded": jobs.iter().filter(|j| j.state == "succeeded").count(),
                     "failed": jobs.iter().filter(|j| j.state == "failed").count(),
@@ -1527,7 +1528,7 @@ async fn execute() -> Result<()> {
             }
             let active_job_ids: std::collections::BTreeSet<String> = all_jobs
                 .iter()
-                .filter(|job| matches!(job.state.as_str(), "queued" | "assigned" | "running"))
+                .filter(|job| matches!(job.state.as_str(), "queued" | "assigned" | "waiting" | "running"))
                 .map(|job| job.id.clone())
                 .collect();
             let mut skipped_active = Vec::new();

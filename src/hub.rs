@@ -138,7 +138,7 @@ fn terminal(state: &str) -> bool {
 /// Worker resource samples older than this are deleted as new ones arrive.
 const METRICS_RETENTION: u64 = 7 * 24 * 60 * 60;
 fn active(state: &str) -> bool {
-    matches!(state, "assigned" | "running" | "cancelling" | "unknown")
+    matches!(state, "assigned" | "waiting" | "running" | "cancelling" | "unknown")
 }
 fn encode<T: Serialize>(value: &T) -> Result<String> {
     Ok(serde_json::to_string(value)?)
@@ -289,7 +289,7 @@ impl Store {
         let mut predicates = Vec::new();
         let mut values: Vec<rusqlite::types::Value> = Vec::new();
         if state == "active" {
-            predicates.push("json_extract(data,'$.state') IN ('assigned','running')");
+            predicates.push("json_extract(data,'$.state') IN ('assigned','waiting','running')");
         } else if !state.is_empty() {
             predicates.push("json_extract(data,'$.state')=?");
             values.push(state.to_owned().into());
@@ -314,7 +314,8 @@ impl Store {
             'environment',json_extract(data,'$.spec.environment'),
             'worker_id',json_extract(data,'$.worker_id'),
             'created_at',json_extract(data,'$.created_at'),'updated_at',json_extract(data,'$.updated_at'),
-            'submitted_by',json_extract(data,'$.submitted_by'))
+            'submitted_by',json_extract(data,'$.submitted_by'),
+            'wait_reason',json_extract(data,'$.wait_reason'))
             FROM jobs WHERE {predicate} ORDER BY rowid DESC LIMIT ? OFFSET ?"))?;
         values.extend([rusqlite::types::Value::Integer(limit as i64), rusqlite::types::Value::Integer(offset as i64)]);
         let rows = statement.query_map(rusqlite::params_from_iter(values.iter()), |row| row.get::<_, String>(0))?;
@@ -338,7 +339,7 @@ impl Store {
                 if let Some(worker) = worker {
                     let counts = stats.workers.entry(worker).or_default();
                     counts.total += count;
-                    if matches!(state.as_str(), "assigned" | "running") { counts.active += count; }
+                    if matches!(state.as_str(), "assigned" | "waiting" | "running") { counts.active += count; }
                 }
             }
             Some(stats)
@@ -417,7 +418,7 @@ impl Store {
     /// Deleting a missing id succeeds so retries are idempotent; jobs that still use it block deletion.
     fn delete_environment(&mut self, id: &str) -> Result<(), ApiError> {
         if self.jobs(None, None)?.iter().any(|job| {
-            matches!(job.state.as_str(), "queued" | "assigned" | "running" | "cancelling")
+            matches!(job.state.as_str(), "queued" | "assigned" | "waiting" | "running" | "cancelling")
                 && job.spec.environment.as_deref() == Some(id)
         }) {
             return Err(invalid("environment is used by queued or active jobs; wait or cancel them first"));
@@ -886,6 +887,7 @@ impl Store {
             results: vec![],
             submitted_by,
             started_at: None,
+            wait_reason: None,
             last_output_at: None,
         };
         self.db
@@ -999,7 +1001,8 @@ impl Store {
                         }
                     }
                 }
-                job.state = "assigned".into();
+                job.state = "waiting".into();
+                job.wait_reason = Some("Waiting for worker admission".into());
                 job.worker_id = Some(worker.id.clone());
                 job.updated_at = now();
                 self.save_job(job)?;
@@ -1102,13 +1105,17 @@ impl Store {
         } else if matches!(report.state.as_str(), "running" | "assigned" | "cancelling") {
             job.state = if self.cancel_requested(&job.id)? {
                 "cancelling"
+            } else if report.state == "assigned" {
+                "waiting"
             } else {
                 "running"
             }
             .into();
             job.error = None;
+            if job.state == "running" { job.wait_reason = None; }
         } else if terminal(&report.state) {
             job.state = report.state;
+            job.wait_reason = None;
             job.exit_code = report.exit_code;
             job.error = report.error;
             if job.state == "succeeded" && job.exit_code != Some(0) {
@@ -1308,7 +1315,7 @@ impl Store {
             WorkerMessage::Hello { .. } => bail!("hello already received"),
             WorkerMessage::Metadata { .. } => bail!("nested metadata is not allowed"),
             WorkerMessage::Inventory { job_id, attempt_id, state: reported_state } => {
-                if matches!(reported_state.as_str(), "assigned" | "running" | "cancelling" | "unknown")
+                if matches!(reported_state.as_str(), "assigned" | "waiting" | "running" | "cancelling" | "unknown")
                     && self.assigned(worker, &job_id, &attempt_id).is_ok() {
                     self.report(worker, AttemptReport { job_id: job_id.clone(), attempt_id: attempt_id.clone(), state: reported_state, exit_code: None, error: None, results: vec![] })?;
                 }
@@ -1363,9 +1370,20 @@ impl Store {
                     }
                     .into();
                     job.error = None;
+                    job.wait_reason = None;
                     job.updated_at = now();
                     job.started_at = Some(now());
                     job.last_output_at = None;
+                    self.save_job(&job)?;
+                }
+            }
+            WorkerMessage::Waiting { job_id, attempt_id, reason } => {
+                anyhow::ensure!(reason.len() <= 128, "waiting reason is too long");
+                let mut job = self.assigned(worker, &job_id, &attempt_id)?;
+                if matches!(job.state.as_str(), "assigned" | "waiting") && job.started_at.is_none() {
+                    job.state = "waiting".into();
+                    job.wait_reason = Some(reason);
+                    job.updated_at = now();
                     self.save_job(&job)?;
                 }
             }
@@ -1846,7 +1864,7 @@ async fn delete_worker(
     let mut guard = lock(&state)?;
     // Deleting a missing worker succeeds so retries are idempotent.
     if guard.jobs(None, None).unwrap_or_default().into_iter().any(|job| {
-        (job.state == "assigned" || job.state == "running") && job.worker_id.as_deref() == Some(&id)
+        matches!(job.state.as_str(), "assigned" | "waiting" | "running") && job.worker_id.as_deref() == Some(&id)
     }) {
         return Err(invalid("worker has active jobs; drain it first"));
     }
@@ -1915,6 +1933,7 @@ struct JobSummary {
     created_at: u64,
     updated_at: u64,
     submitted_by: Option<String>,
+    wait_reason: Option<String>,
 }
 #[derive(Default, Serialize)]
 struct WorkerJobCounts { total: usize, active: usize }
@@ -2567,7 +2586,7 @@ mod tests {
             let info = store.workers().unwrap().remove(0);
             assert!(info.updating.is_none());
             assert_eq!(info.paused, paused);
-            assert_eq!(store.job(&queued.id).unwrap().unwrap().state, if paused { "queued" } else { "assigned" });
+            assert_eq!(store.job(&queued.id).unwrap().unwrap().state, if paused { "queued" } else { "waiting" });
             assert_eq!(rx.try_recv().is_ok(), !paused);
         }
     }
@@ -2589,7 +2608,7 @@ mod tests {
         let mut info = store.workers().unwrap().remove(0);
         assert!(info.updating.is_none());
         assert_eq!(info.update_error.as_deref(), Some("checksum mismatch"));
-        assert_eq!(store.job(&queued.id).unwrap().unwrap().state, "assigned");
+        assert_eq!(store.job(&queued.id).unwrap().unwrap().state, "waiting");
         assert!(matches!(rx.try_recv().unwrap(), HubMessage::Run { .. }));
         for (online, containerized) in [(false, false), (true, true)] {
             info.online = online;
@@ -2856,6 +2875,28 @@ mod tests {
     }
 
     #[test]
+    fn waiting_reason_is_visible_until_the_worker_starts() {
+        let (_dir, mut store) = test_store();
+        let (session, _rx) = worker(&mut store, "one");
+        let job = store.add_job(spec(), None).unwrap();
+        assert_eq!(job.state, "waiting");
+        assert!(job.started_at.is_none());
+        store.receive("one", session, WorkerMessage::Waiting {
+            job_id: job.id.clone(), attempt_id: job.attempt_id.clone(),
+            reason: "Waiting for disk cleanup".into(),
+        }).unwrap();
+        let waiting = store.job(&job.id).unwrap().unwrap();
+        assert_eq!(waiting.wait_reason.as_deref(), Some("Waiting for disk cleanup"));
+        assert!(waiting.started_at.is_none());
+        store.receive("one", session, WorkerMessage::Started {
+            job_id: job.id.clone(), attempt_id: job.attempt_id.clone(),
+        }).unwrap();
+        let running = store.job(&job.id).unwrap().unwrap();
+        assert_eq!(running.state, "running");
+        assert!(running.started_at.is_some());
+        assert!(running.wait_reason.is_none());
+    }
+    #[test]
     fn pause_drains_active_jobs_and_resume_assigns_queued_work() {
         let (_dir, mut store) = test_store();
         let (_session, mut rx) = worker(&mut store, "one");
@@ -2873,7 +2914,7 @@ mod tests {
         assert!(paused.paused);
         let second = store.add_job(spec(), None).unwrap();
         assert_eq!(second.state, "queued");
-        assert_eq!(store.job(&first.id).unwrap().unwrap().state, "assigned");
+        assert_eq!(store.job(&first.id).unwrap().unwrap().state, "waiting");
         assert!(rx.try_recv().is_err());
         finish(&mut store, &first);
         assert_eq!(store.job(&second.id).unwrap().unwrap().state, "queued");
@@ -2887,7 +2928,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(store.job(&second.id).unwrap().unwrap().state, "assigned");
+        assert_eq!(store.job(&second.id).unwrap().unwrap().state, "waiting");
         assert!(matches!(rx.try_recv().unwrap(), HubMessage::Run { .. }));
     }
 
@@ -3041,13 +3082,13 @@ mod tests {
             .unwrap();
         let third = store.add_job(spec(), None).unwrap();
         assert_eq!(third.state, "queued");
-        assert_eq!(store.job(&first.id).unwrap().unwrap().state, "assigned");
-        assert_eq!(store.job(&second.id).unwrap().unwrap().state, "assigned");
+        assert_eq!(store.job(&first.id).unwrap().unwrap().state, "waiting");
+        assert_eq!(store.job(&second.id).unwrap().unwrap().state, "waiting");
         assert!(rx.try_recv().is_err());
         finish(&mut store, &first);
         assert_eq!(store.job(&third.id).unwrap().unwrap().state, "queued");
         finish(&mut store, &second);
-        assert_eq!(store.job(&third.id).unwrap().unwrap().state, "assigned");
+        assert_eq!(store.job(&third.id).unwrap().unwrap().state, "waiting");
         assert!(matches!(rx.try_recv().unwrap(), HubMessage::Run { .. }));
         store
             .control_worker(
@@ -3058,7 +3099,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(store.add_job(spec(), None).unwrap().state, "assigned");
+        assert_eq!(store.add_job(spec(), None).unwrap().state, "waiting");
     }
 
     #[test]
@@ -3208,7 +3249,7 @@ mod tests {
             }, None)
             .unwrap_or_else(|e| panic!("{}", e.1));
         assert_eq!(job.worker_id.as_deref(), Some("windows"));
-        assert_eq!(job.state, "assigned");
+        assert_eq!(job.state, "waiting");
         assert!(matches!(rx.try_recv().unwrap(), HubMessage::Run { .. }));
     }
     #[test]
@@ -3216,7 +3257,7 @@ mod tests {
         let (_dir, mut store) = test_store();
         let (_session, mut rx) = worker(&mut store, "one");
         let first = store.add_job(spec(), None).unwrap_or_else(|e| panic!("{}", e.1));
-        assert_eq!(first.state, "assigned");
+        assert_eq!(first.state, "waiting");
         assert!(matches!(rx.try_recv().unwrap(), HubMessage::Run { .. }));
         assert_eq!(
             store

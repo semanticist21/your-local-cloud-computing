@@ -13,8 +13,8 @@ use std::{
     io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}},
-    time::{Duration, SystemTime},
+    sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -57,6 +57,7 @@ struct State {
     max_jobs: usize,
     slots: Arc<Semaphore>,
     drain: RwLock<()>,
+    gc_active: AtomicBool,
     attempts: Mutex<HashMap<String, Arc<Attempt>>>,
     environments: Mutex<BTreeMap<String, EnvironmentStatus>>,
     image_paths: Mutex<HashMap<String, String>>,
@@ -290,6 +291,7 @@ pub async fn run(
         max_jobs,
         slots: Arc::new(Semaphore::new(max_jobs)),
         drain: RwLock::new(()),
+        gc_active: AtomicBool::new(false),
         attempts: Mutex::new(HashMap::new()),
         environments: Mutex::new(BTreeMap::new()),
         image_paths: Mutex::new(HashMap::new()),
@@ -1613,6 +1615,7 @@ async fn execute(
     mut cancel: watch::Receiver<bool>,
     timeout: u64,
     container: Option<(String, String)>,
+    start: Option<&Job>,
 ) -> Result<i32> {
     cancelled(&cancel)?;
     command
@@ -1633,6 +1636,7 @@ async fn execute(
         journal.pid = Some(pgid);
         journal.container = container.as_ref().map(|(_, name)| name.clone());
         journal.runtime = container.as_ref().map(|(runtime, _)| runtime.clone());
+        if start.is_some() { journal.report.state = "running".into(); }
         #[cfg(windows)]
         {
             journal.windows_job = Some(windows_job.name.clone());
@@ -1658,6 +1662,9 @@ async fn execute(
         )
         .await?;
         return Err(error);
+    }
+    if let Some(job) = start {
+        state.emit(WorkerMessage::Started { job_id: job.id.clone(), attempt_id: job.attempt_id.clone() });
     }
     let stdout = tokio::spawn(pipe_logs(
         child.stdout.take().unwrap(),
@@ -1762,7 +1769,13 @@ async fn run_attempt(
         }
     }
     let (_slot, _drain) = loop {
+        if state.slots.available_permits() == 0 {
+            state.emit(WorkerMessage::Waiting { job_id: job.id.clone(), attempt_id: job.attempt_id.clone(), reason: "Waiting for a worker slot".into() });
+        }
         let slot = tokio::select! { slot = state.slots.acquire() => slot?, _ = cancel.changed() => bail!("job cancelled") };
+        if state.drain.try_read().is_err() {
+            state.emit(WorkerMessage::Waiting { job_id: job.id.clone(), attempt_id: job.attempt_id.clone(), reason: if state.gc_active.load(Ordering::SeqCst) { "Waiting for disk cleanup" } else { "Waiting for worker maintenance" }.into() });
+        }
         let drain = tokio::select! { guard = state.drain.read() => guard, _ = cancel.changed() => bail!("job cancelled") };
         // Garbage collection may have evicted the environment while this attempt waited.
         match environment {
@@ -1773,6 +1786,7 @@ async fn run_attempt(
             _ => break (slot, drain),
         }
     };
+    state.emit(WorkerMessage::Waiting { job_id: job.id.clone(), attempt_id: job.attempt_id.clone(), reason: "Preparing job inputs".into() });
     cancelled(&cancel)?;
     let env_dir = if let Some(environment) = environment {
         state.environment_dir(environment)?
@@ -1951,11 +1965,6 @@ async fn run_attempt(
             .envs(&values);
         process
     };
-    attempt.update(|journal| journal.report.state = "running".into())?;
-    state.emit(WorkerMessage::Started {
-        job_id: job.id.clone(),
-        attempt_id: job.attempt_id.clone(),
-    });
     let exit = execute(
         state,
         attempt,
@@ -1963,6 +1972,7 @@ async fn run_attempt(
         cancel.clone(),
         job.spec.timeout_secs.unwrap_or(24 * 60 * 60),
         container,
+        Some(job),
     )
     .await;
     if exit
@@ -2160,7 +2170,7 @@ async fn resolve_job_image(
                 image,
             ]);
             ensure!(
-                execute(state, attempt, pull, cancel, 3600, None).await? == 0,
+                execute(state, attempt, pull, cancel, 3600, None, None).await? == 0,
                 "image pull failed"
             );
             capture(inspect()).await?
@@ -2673,7 +2683,7 @@ async fn verify_environment(
             command.current_dir(&dir).envs(&values);
             command
         };
-        let result = execute(state, logger, command, receiver, 600, container).await;
+        let result = execute(state, logger, command, receiver, 600, container, None).await;
         drop(keepalive);
         ensure!(result? == 0, "environment verification failed");
     }
@@ -2772,7 +2782,7 @@ async fn prepare(state: &Arc<State>, environment: &Environment, explicit: bool) 
             ensure!(environment.requirements.os.as_deref().is_none_or(|os| os == "linux"), "image environments execute Linux");
             let runtime = runtime(state)?; let (cancel, receiver) = watch::channel(false);
             let mut command = Command::new(runtime); command.args(["pull", "--platform", &format!("linux/{}", image_arch(&state.capabilities.arch)?), image]);
-            let exit = execute(state, &logger, command, receiver, 3600, None).await?; drop(cancel); ensure!(exit == 0, "image pull failed");
+            let exit = execute(state, &logger, command, receiver, 3600, None, None).await?; drop(cancel); ensure!(exit == 0, "image pull failed");
             let mut inspect = Command::new(runtime); inspect.args(["image", "inspect", "--format", "{{.Id}}", image]);
             image_id = Some(normalize_image_id(&capture(inspect).await?)?);
         } else {
@@ -2781,7 +2791,7 @@ async fn prepare(state: &Arc<State>, environment: &Environment, explicit: bool) 
                 logger.log(state, "system", "preparing environment\n".into())?;
                 let mut command = native_recipe(script); command.current_dir(&dir).envs(&values);
                 let (cancel, receiver) = watch::channel(false);
-                let exit = execute(state, &logger, command, receiver, 3600, None).await?; drop(cancel); ensure!(exit == 0, "environment setup failed");
+                let exit = execute(state, &logger, command, receiver, 3600, None, None).await?; drop(cancel); ensure!(exit == 0, "environment setup failed");
             }
         }
         verify_environment(state, environment, image_id.as_deref(), &logger, None).await?;
@@ -3244,15 +3254,24 @@ enum Reclaimable {
     Cache(u64),
     Environment(Option<EnvironmentStatus>),
 }
+struct GcActive<'a>(&'a AtomicBool);
+impl Drop for GcActive<'_> {
+    fn drop(&mut self) { self.0.store(false, Ordering::SeqCst); }
+}
 
-/// Skips busy workers unless disk pressure requires draining before later admissions.
+/// On a busy worker, collect only finished attempts and caches that are not leased.
 /// Expired entries always go; under disk pressure or the cache cap, oldest first.
 fn collect_garbage(state: &State, now: SystemTime, cache_limit: u64, usage: &dyn Fn(&State) -> Result<f64>) -> Result<()> {
-    let _drain = match state.drain.try_write() {
-        Ok(drain) => drain,
-        Err(_) if usage(state)? > DISK_HIGH => state.drain.blocking_write(),
-        Err(_) => return Ok(()),
-    };
+    let started = Instant::now();
+    let exclusive = state.drain.try_write().ok();
+    let shared = if exclusive.is_none() && usage(state)? > DISK_HIGH { state.drain.try_read().ok() } else { None };
+    if exclusive.is_none() && shared.is_none() { return Ok(()); }
+    let _active = if exclusive.is_some() {
+        state.gc_active.store(true, Ordering::SeqCst);
+        Some(GcActive(&state.gc_active))
+    } else { None };
+    let wait = started.elapsed();
+    let before = crate::platform::disk_space(&state.data).ok().map(|(used, _)| used);
     let attempts: Vec<_> = state.attempts.lock().unwrap().iter().map(|(id, attempt)| (id.clone(), attempt.clone())).collect();
     let age = |time: Option<SystemTime>| time.and_then(|time| now.duration_since(time).ok()).unwrap_or_default();
     for (id, attempt) in &attempts {
@@ -3266,13 +3285,17 @@ fn collect_garbage(state: &State, now: SystemTime, cache_limit: u64, usage: &dyn
             state.attempts.lock().unwrap().remove(id);
         }
     }
-    for entry in fs::read_dir(state.data.join("workspaces"))? {
-        remove_tree(&entry?.path())?; // none is in use while idle
+    if exclusive.is_some() {
+        for entry in fs::read_dir(state.data.join("workspaces"))? {
+            remove_tree(&entry?.path())?; // none is in use while idle
+        }
     }
     let mut candidates = vec![];
-    for entry in fs::read_dir(state.data.join("blobs"))? {
-        let path = entry?.path();
-        candidates.push((modified(&path), path, Reclaimable::Blob));
+    if exclusive.is_some() {
+        for entry in fs::read_dir(state.data.join("blobs"))? {
+            let path = entry?.path();
+            candidates.push((modified(&path), path, Reclaimable::Blob));
+        }
     }
     let mut cache_bytes = 0_u64;
     for entry in fs::read_dir(state.data.join("caches"))? {
@@ -3287,8 +3310,9 @@ fn collect_garbage(state: &State, now: SystemTime, cache_limit: u64, usage: &dyn
         cache_bytes = cache_bytes.saturating_add(bytes);
         candidates.push((modified(&cache_marker(&path)).or(modified(&path)), path, Reclaimable::Cache(bytes)));
     }
-    for environment in fs::read_dir(state.data.join("environments"))? {
-        let environment = environment?.path();
+    let environments = if exclusive.is_some() { fs::read_dir(state.data.join("environments"))?.collect::<std::io::Result<Vec<_>>>()? } else { vec![] };
+    for environment in environments {
+        let environment = environment.path();
         if !environment.is_dir() {
             continue;
         }
@@ -3311,7 +3335,16 @@ fn collect_garbage(state: &State, now: SystemTime, cache_limit: u64, usage: &dyn
         if !pressure && !over_cache_cap && unused <= UNUSED_RETENTION {
             continue;
         }
-        remove_tree(&path)?;
+        let cache_key = if shared.is_some() && matches!(&kind, Reclaimable::Cache(_)) {
+            let key = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !state.caches.lock().unwrap().insert(key.clone()) { continue; }
+            Some(key)
+        } else { None };
+        let removal = remove_tree(&path);
+        if removal.is_err() {
+            if let Some(key) = &cache_key { state.caches.lock().unwrap().remove(key); }
+        }
+        removal?;
         match kind {
             Reclaimable::Blob => {}
             Reclaimable::Cache(bytes) => {
@@ -3331,10 +3364,15 @@ fn collect_garbage(state: &State, now: SystemTime, cache_limit: u64, usage: &dyn
             }
         }
         eprintln!("reclaimed {}", path.display());
+        if let Some(key) = &cache_key { state.caches.lock().unwrap().remove(key); }
         if pressure {
             pressure = usage(state)? > DISK_LOW;
         }
     }
+    let reclaimed = before.and_then(|used| crate::platform::disk_space(&state.data).ok().map(|(after, _)| used.saturating_sub(after)));
+    eprintln!("garbage collection: mode={} wait_ms={} cleanup_ms={} reclaimed_bytes={}",
+        if exclusive.is_some() { "idle" } else { "busy" }, wait.as_millis(), started.elapsed().saturating_sub(wait).as_millis(),
+        reclaimed.map_or("unknown".into(), |bytes| bytes.to_string()));
     Ok(())
 }
 
@@ -3499,6 +3537,7 @@ mod tests {
             max_jobs: 1,
             slots: Arc::new(Semaphore::new(1)),
             drain: RwLock::new(()),
+            gc_active: AtomicBool::new(false),
             attempts: Mutex::new(HashMap::new()),
             environments: Mutex::new(BTreeMap::new()),
             image_paths: Mutex::new(HashMap::new()),
@@ -3881,13 +3920,14 @@ mod tests {
         assert_eq!(status.state, "evicted");
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn busy_collection_only_drains_under_disk_pressure() {
+    async fn busy_collection_reclaims_cache_without_blocking_admission() {
         let temp = tempfile::tempdir().unwrap();
         let state = state_at(temp.path());
         let now = SystemTime::now();
         let old = state.data.join("caches/old");
         let fresh = state.data.join("caches/fresh");
-        for path in [&old, &fresh] {
+        let leased = state.data.join("caches/leased");
+        for path in [&old, &fresh, &leased] {
             fs::create_dir(path).unwrap();
             let content = File::create(path.join("dependency")).unwrap();
             content.set_modified(now - UNUSED_RETENTION - Duration::from_secs(1)).unwrap();
@@ -3899,6 +3939,9 @@ mod tests {
             .unwrap()
             .set_modified(now - MINIMUM_AGE - Duration::from_secs(1))
             .unwrap();
+        File::options().write(true).open(cache_marker(&leased)).unwrap()
+            .set_modified(now - UNUSED_RETENTION - Duration::from_secs(1)).unwrap();
+        state.caches.lock().unwrap().insert("leased".into());
         let workspace = state.data.join("workspaces/active");
         fs::create_dir(&workspace).unwrap();
         fs::write(workspace.join("in-use"), "keep until idle").unwrap();
@@ -3921,23 +3964,34 @@ mod tests {
         collected.expect("collection must skip a busy worker").unwrap().unwrap();
         let later = later_admission.expect("collection must leave free slots usable");
         drop(later);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
         let collector = {
             let state = state.clone();
             let old = old.clone();
             tokio::task::spawn_blocking(move || {
-                collect_garbage(&state, now, MAX_CACHE_BYTES, &|_| Ok(if old.exists() { 0.9 } else { 0.79 }))
+                let calls = std::sync::atomic::AtomicUsize::new(0);
+                let entered = Mutex::new(Some(entered_tx));
+                collect_garbage(&state, now, MAX_CACHE_BYTES, &|_| {
+                    if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+                        entered.lock().unwrap().take().unwrap().send(()).unwrap();
+                        continue_rx.recv().unwrap();
+                    }
+                    Ok(if old.exists() { 0.9 } else { 0.79 })
+                })
             })
         };
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while state.drain.try_read().is_ok() {
-                tokio::task::yield_now().await;
-            }
-        }).await.expect("disk pressure must queue collection ahead of later admissions");
-        assert!(old.exists() && workspace.join("in-use").exists(), "active work must finish before collection");
+        tokio::time::timeout(Duration::from_secs(5), entered_rx).await.unwrap().unwrap();
+        let later = tokio::time::timeout(Duration::from_millis(200), state.drain.read()).await
+            .expect("disk-pressure collection must not block later admissions");
+        drop(later);
+        assert!(old.exists() && workspace.join("in-use").exists());
+        continue_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), collector).await.unwrap().unwrap().unwrap();
+        assert!(!old.exists() && !cache_marker(&old).exists(), "old cache is reclaimed during active work");
+        assert!(leased.exists() && cache_marker(&leased).exists(), "a leased cache is not reclaimed");
+        assert!(workspace.join("in-use").exists(), "active workspace remains untouched");
         drop(active);
-        let _later = tokio::time::timeout(Duration::from_secs(5), state.drain.read()).await.unwrap();
-        collector.await.unwrap().unwrap();
-        assert!(!old.exists() && !cache_marker(&old).exists() && !workspace.exists());
         assert!(fresh.join("dependency").exists() && cache_marker(&fresh).exists(), "a fresh cache marker protects even old dependency files");
         assert_eq!(assigned.report().state, "assigned");
         assert_eq!(fs::read_to_string(assigned.dir.join("job.json")).unwrap(), "queued input");
@@ -4063,6 +4117,7 @@ mod tests {
             results: vec![],
             submitted_by: None,
             started_at: None,
+            wait_reason: None,
             last_output_at: None,
         };
         accept(state.clone(), job, None).unwrap();
@@ -4120,6 +4175,7 @@ mod tests {
             results: vec![],
             submitted_by: None,
             started_at: None,
+            wait_reason: None,
             last_output_at: None,
         };
         let (cancel, receiver) = watch::channel(false);
@@ -4263,6 +4319,7 @@ mod tests {
                     command,
                     receiver,
                     if mode == "timeout" { 3 } else { 15 },
+                    None,
                     None
                 ),
                 cancellation
@@ -4368,7 +4425,7 @@ mod tests {
             cancel.send(true).unwrap();
         };
         let (result, _) = tokio::join!(
-            execute(&state, &attempt, command, receiver, 10, None),
+            execute(&state, &attempt, command, receiver, 10, None, None),
             cancellation
         );
         assert!(result.is_err());
@@ -4399,7 +4456,7 @@ mod tests {
             cancel.send(true).unwrap();
         };
         let (result, _) = tokio::join!(
-            execute(&state, &attempt, command, receiver, 10, None),
+            execute(&state, &attempt, command, receiver, 10, None, None),
             cancellation
         );
         assert!(result.is_err());
@@ -4426,7 +4483,7 @@ mod tests {
             cancel.send(true).unwrap();
         };
         let (result, _) = tokio::join!(
-            execute(&state, &attempt, command, receiver, 10, None),
+            execute(&state, &attempt, command, receiver, 10, None, None),
             cancellation
         );
         let error = result.unwrap_err();
@@ -4446,7 +4503,7 @@ mod tests {
         command.args(["-c", "(trap '' TERM; printf ready > ready; sleep 3; touch leaked) & while [ ! -f ready ]; do sleep 0.01; done; exit 0"]).current_dir(temp.path());
         let (_keepalive, receiver) = watch::channel(false);
         assert_eq!(
-            execute(&state, &attempt, command, receiver, 10, None)
+            execute(&state, &attempt, command, receiver, 10, None, None)
                 .await
                 .unwrap(),
             0
@@ -4467,7 +4524,7 @@ mod tests {
             .args(["-c", "(trap '' TERM; sleep 5; touch leaked) & wait"])
             .current_dir(temp.path());
         let (_keepalive, receiver) = watch::channel(false);
-        let error = execute(&state, &attempt, command, receiver, 1, None)
+        let error = execute(&state, &attempt, command, receiver, 1, None, None)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("exceeded timeout"), "{error:#}");
@@ -4603,6 +4660,7 @@ mod tests {
             results: vec![],
             submitted_by: None,
             started_at: None,
+            wait_reason: None,
             last_output_at: None,
         };
         let (_keepalive, receiver) = watch::channel(false);
@@ -4667,6 +4725,7 @@ mod tests {
             results: vec![],
             submitted_by: None,
             started_at: None,
+            wait_reason: None,
             last_output_at: None,
         };
         let (_keepalive, receiver) = watch::channel(false);
@@ -4701,6 +4760,7 @@ mod tests {
             results: vec![],
             submitted_by: None,
             started_at: None,
+            wait_reason: None,
             last_output_at: None,
         }
     }

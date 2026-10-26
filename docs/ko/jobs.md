@@ -16,7 +16,7 @@ ylcc jobs cancel JOB_ID
 
 `--detach` 없는 `run`과 `jobs wait`는 선언된 출력물을 자동으로 가져옵니다. 결과는 `~/.local/share/ylcc/results/JOB_ID/`에 저장되며 `--results-dir`로 바꿀 수 있습니다. `jobs fetch`는 실제 경로를 알려 줍니다. 출력물을 원격에 그대로 두려면 `--no-download`를 쓰세요. 결과가 프로젝트를 자동으로 덮어쓰는 일은 없습니다.
 
-`jobs show`의 `started_at`과 `last_output_at`(Unix 초, 최대 5초 간격 갱신)으로 느린 잡과 멈춘 잡을 구분하세요. 로그에는 명령의 stdout/stderr만 담기므로 진행 상황을 파일에만 쓰지 말고 출력하세요(예: `cmd 2>&1 | tee out/log.txt`). `--worker ID`는 특정 워커에서만 실행하고, `--tool NAME`은 감지된 모든 버전을 허용합니다.
+`jobs show`는 워커가 명령을 시작하기 전까지 `waiting`과 `wait_reason`을 보여 줍니다. 이후 `started_at`과 `last_output_at`(Unix 초, 최대 5초 간격 갱신)으로 느린 잡과 멈춘 잡을 구분하세요. 로그에는 명령의 stdout/stderr만 담기므로 진행 상황을 파일에만 쓰지 말고 출력하세요(예: `cmd 2>&1 | tee out/log.txt`). `--worker ID`는 특정 워커에서만 실행하고, `--tool NAME`은 감지된 모든 버전을 허용합니다.
 
 timeout이나 cancel은 명령의 프로세스 그룹에 SIGTERM을 보내고 30초 뒤 SIGKILL을 보냅니다. 따라서 `trap cleanup EXIT TERM`으로 시뮬레이터 같은 외부 자원을 정리할 수 있습니다(Windows는 잡 객체를 즉시 종료). 잡이 실패·timeout·cancel로 끝나도 그때까지 생긴 선언 출력물은 수집됩니다.
 

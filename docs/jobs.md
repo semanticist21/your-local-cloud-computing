@@ -16,7 +16,7 @@ ylcc jobs cancel JOB_ID
 
 `run` without `--detach`, and `jobs wait`, automatically fetch declared outputs. Results go to `~/.local/share/ylcc/results/JOB_ID/`, configurable with `--results-dir`. `jobs fetch` reports the actual path. Use `--no-download` to leave outputs remote. Results never overwrite your project automatically.
 
-`jobs show` reports `started_at` and `last_output_at` (Unix seconds, updated at most every 5 s) to tell a slow job from a stalled one. Logs carry only the command's stdout/stderr; print progress there (for example `cmd 2>&1 | tee out/log.txt`) rather than only into a file. `--worker ID` pins a job to one worker; `--tool NAME` accepts any detected version.
+`jobs show` reports `waiting` with `wait_reason` until the worker starts the command. It then reports `started_at` and `last_output_at` (Unix seconds, updated at most every 5 s) to tell a slow job from a stalled one. Logs carry only the command's stdout/stderr; print progress there (for example `cmd 2>&1 | tee out/log.txt`) rather than only into a file. `--worker ID` pins a job to one worker; `--tool NAME` accepts any detected version.
 
 A timeout or cancel sends SIGTERM to the command's process group and SIGKILL 30 s later, so `trap cleanup EXIT TERM` can release external resources such as simulators (Windows terminates the job object immediately). Declared outputs that exist when a job fails, times out or is cancelled are still collected.
 

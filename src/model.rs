@@ -245,6 +245,9 @@ pub struct Job {
     /// When the current attempt started running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<u64>,
+    /// Why this assigned worker has not started the command yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_reason: Option<String>,
     /// Last stdout/stderr output of the current attempt, recorded at most every few seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_output_at: Option<u64>,
@@ -368,6 +371,11 @@ pub enum WorkerMessage {
     Started {
         job_id: String,
         attempt_id: String,
+    },
+    Waiting {
+        job_id: String,
+        attempt_id: String,
+        reason: String,
     },
     Log {
         entry: LogEntry,

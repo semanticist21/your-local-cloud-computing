@@ -1685,13 +1685,14 @@ async fn dashboard_asset(Path(path): Path<String>) -> Response {
         return StatusCode::NOT_FOUND.into_response();
     }
     let path = if path.is_empty() { "index.html" } else { &path };
-    let asset = DashboardAssets::get(path).or_else(|| {
-        (!path.contains('.') && !path.starts_with("assets/"))
-            .then(|| DashboardAssets::get("index.html"))
-            .flatten()
-    });
-    let Some(asset) = asset else {
-        return StatusCode::NOT_FOUND.into_response();
+    // A client route such as `/jobs` serves index.html, and its type must follow that file.
+    let (path, asset) = match DashboardAssets::get(path) {
+        Some(asset) => (path, asset),
+        None if !path.contains('.') && !path.starts_with("assets/") => match DashboardAssets::get("index.html") {
+            Some(asset) => ("index.html", asset),
+            None => return StatusCode::NOT_FOUND.into_response(),
+        },
+        None => return StatusCode::NOT_FOUND.into_response(),
     };
     let content_type = match path.rsplit('.').next().unwrap_or("") {
         "html" => "text/html; charset=utf-8",
@@ -2707,6 +2708,14 @@ mod tests {
         assert_eq!(
             script.headers().get(header::CONTENT_TYPE).unwrap(),
             "text/javascript; charset=utf-8"
+        );
+
+        let route = dashboard_asset(Path("jobs".into())).await;
+        assert_eq!(route.status(), StatusCode::OK);
+        assert_eq!(
+            route.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8",
+            "a reloaded client route must render, not download"
         );
 
         let unknown_api = dashboard_asset(Path("v1/not-a-route".into())).await;

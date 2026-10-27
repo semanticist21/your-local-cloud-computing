@@ -486,7 +486,7 @@ function WorkerPage() {
           <Detail label="Platform">{caps.os} · <code>{caps.arch}</code>{caps.abi && <> · <code>{caps.abi}</code></>}</Detail>
           <Detail label="Resources">{caps.cpus} CPU · {formatMemory(caps.memory_bytes)}</Detail>
           <Detail label="Running jobs">{counts?.active ?? 0} / {worker.max_jobs}</Detail>
-          <Detail label="Last seen"><RelativeTime timestamp={worker.last_seen} /></Detail>
+          <Detail label="Connection"><Connection worker={worker} /></Detail>
           <Detail label="GPU">{caps.gpu.length ? caps.gpu.join(', ') : 'None'}</Detail>
           <Detail label="Runtimes">{caps.runtimes.length ? caps.runtimes.join(', ') : 'None'}</Detail>
           <Detail label="Containerized">{caps.containerized ? 'Yes' : 'No'}</Detail>
@@ -551,7 +551,7 @@ function WorkersTable({ workers, jobsByWorker }: { workers: WorkerInfo[]; jobsBy
   const navigate = useNavigate()
   return (
     <div className="table-scroll"><table className="data-table workers-table">
-      <thead><tr><th>Worker</th><th>State</th><th>Platform</th><th>Resources</th><th>Jobs</th><th>Version / update</th><th>Last seen</th></tr></thead>
+      <thead><tr><th>Worker</th><th>State</th><th>Platform</th><th>Resources</th><th>Jobs</th><th>Version / update</th><th>Connection</th></tr></thead>
       <tbody>{workers.map((worker) => (
         <tr key={worker.id} className="clickable-row" onClick={() => navigate({ to: '/workers/$workerId', params: { workerId: worker.id } })}>
           <td><div className="worker-name"><span className={`worker-avatar worker-avatar-${worker.capabilities.os}`}>{osGlyph(worker.capabilities.os)}</span><Link className="table-link" to="/workers/$workerId" params={{ workerId: worker.id }}>{worker.id}</Link></div></td>
@@ -560,7 +560,7 @@ function WorkersTable({ workers, jobsByWorker }: { workers: WorkerInfo[]; jobsBy
           <td><div className="resource-line"><Cpu size={13} /> {worker.capabilities.cpus} CPU <span className="resource-divider">·</span> {formatMemory(worker.capabilities.memory_bytes)}</div></td>
           <td><span className="capacity-value">{jobsByWorker.get(worker.id) ?? 0}<span> / {worker.max_jobs}</span></span></td>
           <td onClick={(event) => event.stopPropagation()}><WorkerUpdate worker={worker} activeJobs={jobsByWorker.get(worker.id) ?? 0} /></td>
-          <td className="time-cell"><RelativeTime timestamp={worker.last_seen} /></td>
+          <td className="time-cell"><Connection worker={worker} /></td>
         </tr>
       ))}</tbody>
     </table></div>
@@ -1118,6 +1118,11 @@ function RelativeTime({ timestamp }: { timestamp: number }) {
   const now = useNow()
   const milliseconds = timestamp < 1_000_000_000_000 ? timestamp * 1000 : timestamp
   return <time dateTime={new Date(milliseconds).toISOString()} title={formatTime(timestamp)}>{formatRelative(timestamp, now)}</time>
+}
+
+/** An open worker socket refreshes `last_seen` with every 15 s heartbeat, so only an offline worker shows it. */
+function Connection({ worker }: { worker: WorkerInfo }) {
+  return worker.online ? <>Connected</> : <>Last seen <RelativeTime timestamp={worker.last_seen} /></>
 }
 
 function WorkerState({ worker, activeJobs }: { worker: WorkerInfo; activeJobs: number }) {

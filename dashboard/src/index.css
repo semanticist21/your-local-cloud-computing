@@ -146,6 +146,7 @@ button { cursor: pointer; }
 .capacity-value { color: #263a50; font-family: "IBM Plex Mono", monospace; font-size: 11px; }
 .capacity-value span { color: #788698; }
 .time-cell { color: #66768a !important; font-size: 11px; font-variant-numeric: tabular-nums; }
+.workers-table .time-cell { width: 150px; white-space: nowrap; }
 .data-table code { color: #3c536b; font-family: "IBM Plex Mono", monospace; font-size: 10px; }
 .job-id { padding: 3px 5px; border-radius: 3px; background: #eff3f6; }
 .command-cell { display: block; max-width: 250px; overflow: hidden; text-overflow: ellipsis; }
@@ -212,7 +213,8 @@ a.text-action { text-decoration: none; }
 .filter-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 16px; }
 .field { height: 34px; min-width: 0; padding: 0 10px; border: 1px solid var(--input); border-radius: 5px; color: #25374b; background: #fff; font: inherit; font-size: 12px; }
 .field:hover { border-color: #aab8c6; }
-select.field { padding-right: 26px; }
+/* The chevron sits at the same 10px inset as the text; 30px keeps long labels clear of it. */
+select.field { appearance: none; padding-right: 30px; background: #fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M3 4.5 6 7.5 9 4.5' fill='none' stroke='%23657386' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 10px center / 12px 12px; }
 .field-search { flex: 1 1 260px; }
 .detail-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 0; border: 1px solid var(--border); border-radius: 6px; background: #fff; }
 .detail-item { min-width: 0; padding: 12px 15px; border-bottom: 1px solid #edf0f3; }

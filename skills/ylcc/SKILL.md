@@ -11,6 +11,7 @@ Preflight before submitting:
 - For build/test commands, use `--no-daemon` for Gradle-like tools and declare every needed `--output`.
 - Check reusable environments with `ylcc --json env status`; prepare explicitly if needed.
 - If the target worker reports `capabilities.policy` in `workers`, confirm its `commands`, `containers`, `environments` and `env` allow the job before submitting. An omitted category is unrestricted and `[]` denies it; argv matches exactly (`cargo` is not `/usr/bin/cargo` or `cargo.exe`).
+- On Windows, a bare `bash` resolves through the worker's PATH and is often `C:\Windows\System32\bash.exe`, the WSL relay (`execvpe(/bin/bash) failed`). Use `powershell.exe`, or name Git Bash by full path (`C:/Program Files/Git/bin/bash.exe`) unless a test job shows `bash` is Git Bash there.
 - Prefer remote execution for expensive or platform-specific work; use the requester only for lightweight checks.
 
 1. Run `ylcc --json workers` and inspect each worker's actual capabilities. Choose the execution OS, architecture, toolchain and GPU backend the task requires. Distinguish execution platform from the produced binary's build target. A Docker worker on a Mac executes Linux; CUDA and Metal are different backends. Do not infer that requesting a GPU rewrites a CPU program to use it.

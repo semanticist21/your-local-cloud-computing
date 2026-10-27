@@ -1718,6 +1718,80 @@ fn signal_number(status: &std::process::ExitStatus) -> i32 {
     }
 }
 
+/// Reports why an assigned attempt has not started, within the Hub's 128-byte limit.
+fn waiting(state: &State, job: &Job, mut reason: String) {
+    reason.truncate(reason.floor_char_boundary(128));
+    state.emit(WorkerMessage::Waiting { job_id: job.id.clone(), attempt_id: job.attempt_id.clone(), reason });
+}
+
+async fn fetch_input<'a>(state: &State, input: &'a FileEntry) -> Result<(&'a FileEntry, PathBuf)> {
+    let path = ensure_blob(state, &input.hash, Some(input.size)).await.with_context(|| format!("fetch input {}", input.path))?;
+    Ok((input, path))
+}
+
+fn megabytes(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / 1e6)
+}
+
+/// Fetches input blobs concurrently, then copies them into the checkout, reporting progress.
+/// Thousands of small inputs are latency-bound, so one-at-a-time downloads take minutes.
+async fn materialize_inputs(state: &State, attempt: &Attempt, job: &Job, workdir: &Path, cancel: &watch::Receiver<bool>) -> Result<()> {
+    const FETCHES: usize = 16;
+    const PROGRESS: Duration = Duration::from_secs(1);
+    let inputs = &job.spec.inputs;
+    if inputs.is_empty() {
+        return Ok(());
+    }
+    let started = Instant::now();
+    // Concurrent downloads of one hash would race on the final rename.
+    let mut seen = HashSet::new();
+    let unique: Vec<&FileEntry> = inputs.iter().filter(|input| seen.insert(input.hash.as_str())).collect();
+    let total: u64 = unique.iter().map(|input| input.size).sum();
+    let missing = unique.iter().filter(|input| !state.data.join("blobs").join(&input.hash).exists()).count();
+    let mut shown: Option<Instant> = None;
+    let mut progress = |text: String| {
+        if shown.is_none_or(|at| at.elapsed() >= PROGRESS) {
+            shown = Some(Instant::now());
+            waiting(state, job, text);
+        }
+    };
+    let mut blobs = HashMap::new();
+    let mut fetched = 0;
+    let mut pending = unique.iter();
+    let mut fetches = futures_util::stream::FuturesUnordered::new();
+    progress(format!("Fetching job inputs 0/{} (0.0 MB of {}, {missing} to download)", unique.len(), megabytes(total)));
+    loop {
+        while fetches.len() < FETCHES
+            && let Some(&input) = pending.next()
+        {
+            fetches.push(fetch_input(state, input));
+        }
+        let Some(result) = fetches.next().await else { break };
+        cancelled(cancel)?;
+        let (input, path) = result?;
+        fetched += input.size;
+        blobs.insert(input.hash.as_str(), path);
+        progress(format!("Fetching job inputs {}/{} ({} of {}, {missing} to download)", blobs.len(), unique.len(), megabytes(fetched), megabytes(total)));
+    }
+    for (index, input) in inputs.iter().enumerate() {
+        cancelled(cancel)?;
+        progress(format!("Copying job inputs {index}/{}", inputs.len()));
+        let dest = workdir.join(&input.path);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut destination = crate::platform::create_private_file(&dest)?;
+        std::io::copy(&mut File::open(&blobs[input.hash.as_str()])?, &mut destination)?;
+        crate::platform::set_mode(&destination, input.mode)?;
+    }
+    attempt.log(state, "system", format!(
+        "inputs ready: {} files, {} ({missing} downloaded) in {}s\n",
+        inputs.len(),
+        megabytes(total),
+        started.elapsed().as_secs()
+    ))
+}
+
 async fn run_attempt(
     state: &Arc<State>,
     attempt: &Arc<Attempt>,
@@ -1765,28 +1839,29 @@ async fn run_attempt(
             .get(&env_key(&environment.id, &environment.revision))
             .is_some_and(|e| e.state == "ready");
         if !ready {
+            waiting(state, job, format!("Preparing environment {}", environment.id));
             prepare(state, environment, false).await?;
         }
     }
     let (_slot, _drain) = loop {
         if state.slots.available_permits() == 0 {
-            state.emit(WorkerMessage::Waiting { job_id: job.id.clone(), attempt_id: job.attempt_id.clone(), reason: "Waiting for a worker slot".into() });
+            waiting(state, job, "Waiting for a worker slot".into());
         }
         let slot = tokio::select! { slot = state.slots.acquire() => slot?, _ = cancel.changed() => bail!("job cancelled") };
         if state.drain.try_read().is_err() {
-            state.emit(WorkerMessage::Waiting { job_id: job.id.clone(), attempt_id: job.attempt_id.clone(), reason: if state.gc_active.load(Ordering::SeqCst) { "Waiting for disk cleanup" } else { "Waiting for worker maintenance" }.into() });
+            waiting(state, job, if state.gc_active.load(Ordering::SeqCst) { "Waiting for disk cleanup" } else { "Waiting for worker maintenance" }.into());
         }
         let drain = tokio::select! { guard = state.drain.read() => guard, _ = cancel.changed() => bail!("job cancelled") };
         // Garbage collection may have evicted the environment while this attempt waited.
         match environment {
             Some(environment) if !state.environments.lock().unwrap().contains_key(&env_key(&environment.id, &environment.revision)) => {
                 drop((drain, slot));
+                waiting(state, job, format!("Preparing environment {}", environment.id));
                 prepare(state, environment, false).await?;
             }
             _ => break (slot, drain),
         }
     };
-    state.emit(WorkerMessage::Waiting { job_id: job.id.clone(), attempt_id: job.attempt_id.clone(), reason: "Preparing job inputs".into() });
     cancelled(&cancel)?;
     let env_dir = if let Some(environment) = environment {
         state.environment_dir(environment)?
@@ -1815,6 +1890,7 @@ async fn run_attempt(
             ready,
             "environment is no longer ready; inspect its status and explicitly prepare it again"
         );
+        waiting(state, job, format!("Verifying environment {}", environment.id));
         if let Err(error) = verify_environment(
             state,
             environment,
@@ -1839,17 +1915,8 @@ async fn run_attempt(
     let workspace = Workspace::claim(state, &job.spec, &attempt.dir)?;
     let workdir = workspace.dir.clone();
     fs::create_dir(&workdir).context("create fresh attempt checkout")?;
-    for input in &job.spec.inputs {
-        cancelled(&cancel)?;
-        let blob = ensure_blob(state, &input.hash, Some(input.size)).await?;
-        let dest = workdir.join(&input.path);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut destination = crate::platform::create_private_file(&dest)?;
-        std::io::copy(&mut File::open(blob)?, &mut destination)?;
-        crate::platform::set_mode(&destination, input.mode)?;
-    }
+    materialize_inputs(state, attempt, job, &workdir, &cancel).await?;
+    waiting(state, job, "Checking job requirements".into());
     let path = if let Some(image) = &image {
         Some(image_path(state, image).await?)
     } else {
@@ -4741,6 +4808,58 @@ mod tests {
             fs::read_to_string(attempt.dir.join("work/completed")).unwrap(),
             "ok"
         );
+    }
+    #[tokio::test]
+    async fn inputs_download_concurrently_once_per_hash_and_report_progress() {
+        let temp = tempfile::tempdir().unwrap();
+        let contents = ["one", "two", "three"];
+        let requests = Arc::new(AtomicUsize::new(0));
+        // Each blob completes only once all three requests are in flight together.
+        let barrier = Arc::new(tokio::sync::Barrier::new(contents.len()));
+        let app = {
+            let requests = requests.clone();
+            axum::Router::new().route("/v1/blobs/{hash}", axum::routing::get(move |axum::extract::Path(hash): axum::extract::Path<String>| {
+                let requests = requests.clone();
+                let barrier = barrier.clone();
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    barrier.wait().await;
+                    contents.into_iter().find(|c| hex::encode(Sha256::digest(c)) == hash).unwrap()
+                }
+            }))
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut state = state_at(temp.path());
+        Arc::get_mut(&mut state).unwrap().hub = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let attempt = attempt_at(temp.path(), "attempt");
+        let entry = |path: &str, content: &str| FileEntry { path: path.into(), hash: hex::encode(Sha256::digest(content)), size: content.len() as u64, mode: 0o644 };
+        let mut job = policy_job(&["true"], None);
+        job.spec.inputs = vec![entry("a", "one"), entry("dir/b", "two"), entry("c", "three"), entry("copy-of-a", "one")];
+        let mut events = state.events.subscribe();
+        let workdir = temp.path().join("work");
+        fs::create_dir(&workdir).unwrap();
+        let (_cancel, receiver) = watch::channel(false);
+        tokio::time::timeout(Duration::from_secs(10), materialize_inputs(&state, &attempt, &job, &workdir, &receiver))
+            .await
+            .expect("inputs must download concurrently")
+            .unwrap();
+        server.abort();
+        assert_eq!(requests.load(Ordering::SeqCst), 3, "a repeated hash downloads once");
+        for (path, content) in [("a", "one"), ("dir/b", "two"), ("c", "three"), ("copy-of-a", "one")] {
+            assert_eq!(fs::read_to_string(workdir.join(path)).unwrap(), content);
+        }
+        let first = std::iter::from_fn(|| events.try_recv().ok()).find_map(|message| match message {
+            WorkerMessage::Waiting { reason, .. } => Some(reason),
+            _ => None,
+        });
+        assert_eq!(first.as_deref(), Some("Fetching job inputs 0/3 (0.0 MB of 0.0 MB, 3 to download)"));
+        let logs = fs::read_to_string(attempt.dir.join("logs.jsonl")).unwrap();
+        assert!(logs.contains("inputs ready: 4 files, 0.0 MB (3 downloaded)"), "{logs}");
+        while events.try_recv().is_ok() {}
+        waiting(&state, &job, "x".repeat(127) + "\u{e9}");
+        let Ok(WorkerMessage::Waiting { reason, .. }) = events.try_recv() else { panic!("expected a waiting reason") };
+        assert_eq!(reason.len(), 127, "truncation keeps the Hub limit on a char boundary");
     }
     fn policy_job(command: &[&str], environment: Option<&str>) -> Job {
         Job {

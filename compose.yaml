@@ -1,6 +1,6 @@
 services:
   hub:
-    image: ghcr.io/semanticist21/your-local-cloud-computing:0.5.13
+    image: ghcr.io/semanticist21/your-local-cloud-computing:0.5.14
     user: "${YLCC_UID:?Set YLCC_UID to id -u}:${YLCC_GID:?Set YLCC_GID to id -g}"
     command: ["--token-file", "/run/secrets/token", "hub", "--listen", "0.0.0.0:7443", "--data-dir", "/data"]
     ports: ["127.0.0.1:7443:7443"]
@@ -10,7 +10,7 @@ services:
   worker:
     init: true
     network_mode: service:hub
-    image: ghcr.io/semanticist21/your-local-cloud-computing:0.5.13
+    image: ghcr.io/semanticist21/your-local-cloud-computing:0.5.14
     user: "${YLCC_UID:?Set YLCC_UID to id -u}:${YLCC_GID:?Set YLCC_GID to id -g}"
     command: ["--hub", "http://127.0.0.1:7443", "--token-file", "/run/secrets/token", "worker", "--id", "container-worker", "--data-dir", "/data", "--max-jobs", "1"]
     volumes: ["${YLCC_DATA_DIR:?Set an absolute YLCC_DATA_DIR}/worker:/data"]

@@ -34,6 +34,7 @@ import {
   X,
 } from 'lucide-react'
 import { Badge, Button } from './components/ui'
+import { HostEditor, HostStatus } from './components/HostSettings'
 
 // Recharts loads only when a worker page is opened.
 const WorkerMetricsCharts = lazy(() => import('./components/WorkerMetrics'))
@@ -75,7 +76,7 @@ import {
   type WorkerPolicy,
 } from './lib/api'
 
-const activeJobStates = new Set(['assigned', 'waiting', 'running'])
+const activeJobStates = new Set(['assigned', 'waiting', 'running', 'cancelling', 'unknown'])
 const terminalJobStates = new Set(['succeeded', 'failed', 'cancelled'])
 const jobStates = ['queued', 'waiting', 'running', 'cancelling', 'succeeded', 'failed', 'cancelled']
 
@@ -381,16 +382,16 @@ function PageHeading({ title, description, back, children }: { title: ReactNode;
 // ---------- Overview ----------
 
 function OverviewPage() {
-  const { workers, jobList, environmentStatuses } = useSnapshot()
+  const { workers, hosts, jobList, environmentStatuses } = useSnapshot()
   const jobs = jobList.jobs
   const onlineWorkers = workers.filter((worker) => worker.online)
-  const activeCount = (jobList.stats?.states.assigned ?? 0) + (jobList.stats?.states.waiting ?? 0) + (jobList.stats?.states.running ?? 0)
+  const activeCount = (jobList.stats?.states.assigned ?? 0) + (jobList.stats?.states.waiting ?? 0) + (jobList.stats?.states.running ?? 0) + (jobList.stats?.states.cancelling ?? 0) + (jobList.stats?.states.unknown ?? 0)
   const queuedCount = jobList.stats?.states.queued ?? 0
   const failedCount = jobList.stats?.states.failed ?? 0
   const jobsByWorker = countActiveJobs(jobList.stats)
   const schedulable = onlineWorkers.filter((worker) => !worker.paused && !worker.updating)
-  const totalCapacity = schedulable.reduce((sum, worker) => sum + worker.max_jobs, 0)
-  const availableSlots = schedulable.reduce((sum, worker) => sum + Math.max(worker.max_jobs - (jobsByWorker.get(worker.id) ?? 0), 0), 0)
+  const totalCapacity = hosts ? hosts.reduce((sum, host) => sum + host.capacity, 0) : schedulable.reduce((sum, worker) => sum + worker.max_jobs, 0)
+  const availableSlots = hosts ? hosts.reduce((sum, host) => sum + host.available_slots, 0) : schedulable.reduce((sum, worker) => sum + Math.max(worker.max_jobs - (jobsByWorker.get(worker.id) ?? 0), 0), 0)
   const readyStatuses = environmentStatuses.filter((status) => status.state === 'ready').length
   const recentJobs = [...jobs].sort((a, b) => b.updated_at - a.updated_at).slice(0, 6)
 
@@ -443,24 +444,36 @@ function countActiveJobs(stats: JobStats | undefined) {
 // ---------- Workers ----------
 
 function WorkersPage() {
-  const { workers, jobList } = useSnapshot()
+  const { workers, hosts, jobList } = useSnapshot()
   const sorted = [...workers].sort((a, b) => Number(b.online) - Number(a.online) || a.id.localeCompare(b.id))
+  const managed = hosts?.filter((host) => host.managed) ?? []
+  const grouped = new Set(managed.flatMap((host) => host.workers))
+  const independent = sorted.filter((worker) => !grouped.has(worker.id))
   return (
     <>
-      <PageHeading title="Workers" description="Connected machines and their available capacity." />
-      <section className="content-section">
-        <SectionHeading title="Registered workers" detail={`${workers.filter((worker) => worker.online).length} online now`} />
-        {workers.length ? <WorkersTable workers={sorted} jobsByWorker={countActiveJobs(jobList.stats)} /> : (
+      <PageHeading title="Workers" description="Connected machines and their shared host capacity.">
+        {hosts && <HostEditor workers={workers} hosts={hosts} />}
+      </PageHeading>
+      {!hosts && <p className="muted-text">Upgrade the Hub to configure shared physical hosts.</p>}
+      {managed.map((host) => (
+        <section className="content-section" key={host.id}>
+          <SectionHeading title={host.id} detail={<HostStatus host={host} />} action={<HostEditor host={host} workers={workers} hosts={hosts!} />} />
+          <WorkersTable workers={sorted.filter((worker) => host.workers.includes(worker.id))} jobsByWorker={countActiveJobs(jobList.stats)} />
+        </section>
+      ))}
+      {(independent.length > 0 || !workers.length) && <section className="content-section">
+        <SectionHeading title={managed.length ? 'Independent workers' : 'Registered workers'} detail={`${workers.filter((worker) => worker.online).length} online now`} />
+        {independent.length ? <WorkersTable workers={independent} jobsByWorker={countActiveJobs(jobList.stats)} /> : !workers.length ? (
           <EmptyState icon={<Server />} title="No workers registered" detail="Workers appear after they connect to this Hub." />
-        )}
-      </section>
+        ) : null}
+      </section>}
     </>
   )
 }
 
 function WorkerPage() {
   const { workerId } = workerRoute.useParams()
-  const { workers, jobList, environmentStatuses } = useSnapshot()
+  const { workers, hosts, jobList, environmentStatuses } = useSnapshot()
   const history = useQuery(jobListQuery({ worker: workerId }))
   const worker = workers.find((candidate) => candidate.id === workerId)
   const back = <Link className="back-link" to="/workers"><ArrowLeft size={14} /> Workers</Link>
@@ -472,6 +485,7 @@ function WorkerPage() {
       </>
     )
   }
+  const host = hosts?.find((host) => host.workers.includes(worker.id))
   const caps = worker.capabilities
   const workerJobs = [...(history.data?.jobs ?? [])].sort((a, b) => b.updated_at - a.updated_at)
   const counts = jobList.stats?.workers[worker.id]
@@ -483,6 +497,7 @@ function WorkerPage() {
       <PageHeading title={worker.id} back={back} description={<WorkerState worker={worker} activeJobs={counts?.active ?? 0} />}><ResumeWorker worker={worker} /></PageHeading>
       <section className="content-section">
         <dl className="detail-grid">
+          {host?.managed && <Detail label="Physical host">{host.id}<HostStatus host={host} /></Detail>}
           <Detail label="Platform">{caps.os} · <code>{caps.arch}</code>{caps.abi && <> · <code>{caps.abi}</code></>}</Detail>
           <Detail label="Resources">{caps.cpus} CPU · {formatMemory(caps.memory_bytes)}</Detail>
           <Detail label="Running jobs">{counts?.active ?? 0} / {worker.max_jobs}</Detail>
@@ -811,7 +826,7 @@ function JobPage() {
   return (
     <>
       <PageHeading title={<code className="heading-code">{job.id}</code>} back={back} description={<StatusBadge state={job.state} />} />
-      {job.state === 'waiting' && job.wait_reason && <p role="status" className="muted-text">{job.wait_reason}</p>}
+      {(job.state === 'waiting' || job.state === 'queued') && job.wait_reason && <p role="status" className="muted-text">{job.wait_reason}</p>}
       {job.error && (
         <div className="error-notice" role="alert"><CircleAlert size={16} /><span>{job.error}</span></div>
       )}
@@ -880,7 +895,7 @@ function JobsTable({ jobs }: { jobs: JobSummary[] }) {
       <tbody>{jobs.map((job) => (
         <tr key={job.id} className="clickable-row" onClick={() => navigate({ to: '/jobs/$jobId', params: { jobId: job.id } })}>
           <td><Link className="table-link" to="/jobs/$jobId" params={{ jobId: job.id }}><code className="job-id">{job.id.slice(0, 8)}</code></Link></td>
-          <td><StatusBadge state={job.state} />{job.state === 'waiting' && job.wait_reason && <span className="muted-text"> {job.wait_reason}</span>}</td>
+          <td><StatusBadge state={job.state} />{(job.state === 'waiting' || job.state === 'queued') && job.wait_reason && <span className="muted-text"> {job.wait_reason}</span>}</td>
           <td><code className="command-cell" title={job.command}>{job.command || '—'}</code></td>
           <td>{job.worker_id
             ? <Link className="table-link" to="/workers/$workerId" params={{ workerId: job.worker_id }} onClick={(event) => event.stopPropagation()}>{job.worker_id}</Link>
@@ -1101,7 +1116,7 @@ function Metric({ icon, label, value, note, tone }: { icon: ReactNode; label: st
   )
 }
 
-function SectionHeading({ title, detail, action }: { title: string; detail: string; action?: ReactNode }) {
+function SectionHeading({ title, detail, action }: { title: string; detail: ReactNode; action?: ReactNode }) {
   return (
     <div className="section-heading">
       <div><h2>{title}</h2><span>{detail}</span></div>

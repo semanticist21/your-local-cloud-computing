@@ -97,6 +97,9 @@ impl Client {
     ) -> Result<T> {
         Self::decode(self.request(Method::POST, path).json(input).send().await?).await
     }
+    pub async fn put<I: Serialize, T: DeserializeOwned>(&self, path: &str, input: &I) -> Result<T> {
+        Self::decode(self.request(Method::PUT, path).json(input).send().await?).await
+    }
     pub async fn upload(&self, s: &Snapshot) -> Result<(usize, u64)> {
         let hashes = s.files.iter().map(|f| f.hash.clone()).collect();
         let missing: MissingBlobs = self

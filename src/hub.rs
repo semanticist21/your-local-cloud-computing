@@ -1,3 +1,5 @@
+mod hosts;
+use hosts::{CpuGate, CpuObservation};
 use crate::model::*;
 use anyhow::{Context, Result, bail};
 use axum::{
@@ -99,6 +101,8 @@ struct Store {
     /// Last audited connect signature per worker id, so steady reconnects are not re-logged.
     connect_seen: HashMap<String, String>,
     audit_inserts: u64,
+    cpu_samples: HashMap<String, CpuObservation>,
+    cpu_gates: HashMap<String, CpuGate>,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct WorkerSettings {
@@ -172,6 +176,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, data TEXT NOT NULL, environment TEXT, cancel_requested INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS jobs_state_worker ON jobs(json_extract(data,'$.state'),json_extract(data,'$.worker_id'));
             CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS hosts (id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS worker_settings (id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS environments (id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS environment_revisions (id TEXT NOT NULL, revision TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(id, revision));
@@ -198,6 +203,8 @@ impl Store {
             worker_audit: HashMap::new(),
             connect_seen: HashMap::new(),
             audit_inserts: 0,
+            cpu_samples: HashMap::new(),
+            cpu_gates: HashMap::new(),
         };
         {
             let mut statement = store.db.prepare("SELECT hash, data FROM tokens")?;
@@ -404,6 +411,7 @@ impl Store {
             Ok(WorkerMetrics {
                 at: r.get::<_, i64>(0)? as u64,
                 cpu_percent: r.get(1)?,
+                cpu_valid: None,
                 memory_used: r.get::<_, f64>(2)? as u64,
                 memory_total: r.get::<_, i64>(3)? as u64,
                 load: r.get(4)?,
@@ -903,7 +911,8 @@ impl Store {
         self.schedule()?;
         Ok(self.job(&job.id)?.expect("inserted job"))
     }
-    fn schedule(&mut self) -> Result<()> {
+    fn schedule(&mut self) -> Result<()> { self.schedule_at(now()) }
+    fn schedule_at(&mut self, at: u64) -> Result<()> {
         let workers = self.workers()?;
         let mut jobs = self.jobs(None, None)?;
         // Stable ordering retains the database creation order for equal priorities.
@@ -915,110 +924,110 @@ impl Store {
                 self.save_job(job)?;
             }
         }
-        for worker in workers
-            .iter()
-            .filter(|worker| worker.online && !worker.paused && worker.updating.is_none())
-        {
-            let Some(tx) = self.sessions.get(&worker.id).filter(|s| !s.reconciling).map(|s| s.tx.clone()) else {
-                continue;
-            };
-            let mut occupied = jobs
-                .iter()
-                .filter(|job| job.worker_id.as_deref() == Some(&worker.id) && active(&job.state))
-                .count();
-            let statuses = self.statuses()?;
-            if statuses
-                .iter()
-                .any(|status| status.worker_id == worker.id && status.state == "preparing")
-            {
+        let mut hosts = self.host_infos(at)?;
+        let mut statuses = self.statuses()?;
+        let worker_used = |id: &str, jobs: &[Job]| jobs.iter()
+            .filter(|j| j.worker_id.as_deref() == Some(id) && active(&j.state)).count();
+        let host_index = |id: &str, hosts: &[HostInfo]| hosts.iter().position(|h| h.config.workers.iter().any(|w| w == id)).expect("every worker has a host");
+        // Explicit and previously queued preparations share the same host admission budget.
+        let mut pending: Vec<_> = statuses.iter().filter(|s| s.state == "pending" && workers.iter().any(|w| w.id == s.worker_id)).cloned().collect();
+        pending.sort_by(|a, b| {
+            let ah = &hosts[host_index(&a.worker_id, &hosts)];
+            let bh = &hosts[host_index(&b.worker_id, &hosts)];
+            host_score(ah).total_cmp(&host_score(bh)).then_with(|| a.worker_id.cmp(&b.worker_id))
+        });
+        for mut status in pending {
+            let Some(worker) = workers.iter().find(|w| w.id == status.worker_id) else { continue; };
+            let index = host_index(&worker.id, &hosts);
+            if !worker.online || worker.paused || worker.updating.is_some()
+                || self.sessions.get(&worker.id).is_none_or(|s| s.reconciling)
+                || !hosts[index].schedulable || hosts[index].available_slots == 0
+                || worker_used(&worker.id, &jobs) > 0
+                || statuses.iter().any(|s| s.worker_id == worker.id && matches!(s.state.as_str(), "preparing" | "unknown")) {
                 continue;
             }
-            let pending = statuses
-                .iter()
-                .find(|status| status.worker_id == worker.id && status.state == "pending");
-            if let Some(status) = pending {
-                if occupied == 0
-                    && let Some(environment) =
-                        self.environment_revision(&status.environment_id, &status.revision)?
-                {
-                    let mut status = status.clone();
-                    status.state = "preparing".into();
-                    self.save_status(&status)?;
-                    // Persist before delivery: an interrupted setup is never silently rerun.
-                    if tx.send(HubMessage::Prepare { environment }).is_err() {
-                        status.state = "unknown".into();
-                        status.error = Some(
-                            "worker connection lost before preparation acknowledgement".into(),
-                        );
-                        self.save_status(&status)?;
-                    }
+            if let Some(environment) = self.environment_revision(&status.environment_id, &status.revision)? {
+                self.dispatch_prepare(worker, &mut status, environment)?;
+                if let Some(current) = statuses.iter_mut().find(|s| s.worker_id == status.worker_id && s.environment_id == status.environment_id && s.revision == status.revision) {
+                    *current = status;
                 }
-                continue;
+                reserve_host(&mut hosts[index]);
             }
-            for job in &mut jobs {
-                if occupied >= worker.max_jobs || job.state != "queued" {
+        }
+        // Choose again after each assignment; reservations count before processes start.
+        for job_index in 0..jobs.len() {
+            if jobs[job_index].state != "queued" { continue; }
+            let environment = self.job_environment(&jobs[job_index].id)?;
+            let mut candidates: Vec<_> = workers.iter().filter(|w| {
+                w.online && !w.paused && w.updating.is_none()
+                    && self.sessions.get(&w.id).is_some_and(|s| !s.reconciling)
+                    && candidate(w, &jobs[job_index].spec, environment.as_ref()).is_empty()
+            }).collect();
+            candidates.sort_by(|a, b| {
+                let ah = &hosts[host_index(&a.id, &hosts)];
+                let bh = &hosts[host_index(&b.id, &hosts)];
+                host_score(ah).total_cmp(&host_score(bh))
+                    .then_with(|| (worker_used(&a.id, &jobs) as f64 / a.max_jobs as f64)
+                        .total_cmp(&(worker_used(&b.id, &jobs) as f64 / b.max_jobs as f64)))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            let mut reason = "Waiting for a compatible online worker".to_string();
+            for worker in candidates {
+                let index = host_index(&worker.id, &hosts);
+                if let Some(blocked) = &hosts[index].wait_reason {
+                    reason = blocked.clone();
                     continue;
                 }
-                let environment = self.job_environment(&job.id)?;
-                if !candidate(worker, &job.spec, environment.as_ref()).is_empty() {
+                let used = worker_used(&worker.id, &jobs);
+                if hosts[index].available_slots == 0 || used >= worker.max_jobs {
+                    reason = "Waiting for host or worker concurrency slots".into();
+                    continue;
+                }
+                if statuses.iter().any(|s| s.worker_id == worker.id && matches!(s.state.as_str(), "pending" | "preparing" | "unknown")) {
+                    reason = "Waiting for environment preparation or reconciliation".into();
                     continue;
                 }
                 if let Some(environment) = &environment {
                     match self.status(&worker.id, environment)? {
                         Some(status) if status.state == "ready" => {}
-                        Some(status) if matches!(status.state.as_str(), "failed" | "unknown") => {
-                            continue;
-                        }
+                        Some(status) if matches!(status.state.as_str(), "failed" | "unknown") => { continue; }
                         _ => {
-                            self.save_status(&EnvironmentStatus {
-                                worker_id: worker.id.clone(),
-                                environment_id: environment.id.clone(),
-                                revision: environment.revision.clone(),
-                                state: "pending".into(),
-                                error: None,
-                            })?;
-                            if occupied == 0 {
-                                let mut status = self
-                                    .status(&worker.id, environment)?
-                                    .expect("pending status");
-                                status.state = "preparing".into();
-                                self.save_status(&status)?;
-                                if tx
-                                    .send(HubMessage::Prepare {
-                                        environment: environment.clone(),
-                                    })
-                                    .is_err()
-                                {
-                                    status.state = "unknown".into();
-                                    status.error = Some(
-                                        "worker connection lost before preparation acknowledgement"
-                                            .into(),
-                                    );
-                                    self.save_status(&status)?;
-                                }
+                            let mut status = EnvironmentStatus {
+                                worker_id: worker.id.clone(), environment_id: environment.id.clone(),
+                                revision: environment.revision.clone(), state: "pending".into(), error: None,
+                            };
+                            self.save_status(&status)?;
+                            if used == 0 {
+                                self.dispatch_prepare(worker, &mut status, environment.clone())?;
+                                reserve_host(&mut hosts[index]);
                             }
+                            statuses.push(status);
+                            reason = format!("Waiting for environment {} preparation", environment.id);
                             break;
                         }
                     }
                 }
+                let job = &mut jobs[job_index];
                 job.state = "waiting".into();
                 job.wait_reason = Some("Waiting for worker admission".into());
                 job.worker_id = Some(worker.id.clone());
                 job.updated_at = now();
                 self.save_job(job)?;
-                // A lost delivery remains an unknown attempt; it is not queued on another host.
-                if tx
-                    .send(HubMessage::Run {
-                        job: Box::new(job.clone()),
-                        environment,
-                    })
-                    .is_err()
-                {
+                // A lost delivery remains an unknown attempt; never retry it on another host.
+                if self.sessions[&worker.id].tx.send(HubMessage::Run {
+                    job: Box::new(job.clone()), environment: environment.clone(),
+                }).is_err() {
                     job.state = "unknown".into();
                     job.error = Some("worker connection lost during assignment".into());
                     self.save_job(job)?;
                 }
-                occupied += 1;
+                reserve_host(&mut hosts[index]);
+                break;
+            }
+            let job = &mut jobs[job_index];
+            if job.state == "queued" && job.wait_reason.as_deref() != Some(&reason) {
+                job.wait_reason = Some(reason);
+                self.save_job(job)?;
             }
         }
         // Failed setup is actionable; only an explicit prepare call can retry that revision.
@@ -1046,6 +1055,17 @@ impl Store {
                 job.updated_at = now();
                 self.save_job(&job)?;
             }
+        }
+        Ok(())
+    }
+    fn dispatch_prepare(&mut self, worker: &WorkerInfo, status: &mut EnvironmentStatus, environment: Environment) -> Result<()> {
+        status.state = "preparing".into();
+        self.save_status(status)?;
+        // Persist before delivery: interrupted setup is never silently rerun.
+        if self.sessions[&worker.id].tx.send(HubMessage::Prepare { environment }).is_err() {
+            status.state = "unknown".into();
+            status.error = Some("worker connection lost before preparation acknowledgement".into());
+            self.save_status(status)?;
         }
         Ok(())
     }
@@ -1214,6 +1234,7 @@ impl Store {
         if !matches!(capabilities.arch.as_str(), "x86_64" | "aarch64") {
             bail!("unsupported worker architecture")
         }
+        self.cpu_samples.remove(&id);
         let session = Uuid::new_v4();
         let previous = self.one::<WorkerInfo>("SELECT data FROM workers WHERE id=?1", &id)?;
         let updating = previous.as_ref().and_then(|worker| worker.updating.clone())
@@ -1447,6 +1468,10 @@ impl Store {
             WorkerMessage::Heartbeat => {}
             WorkerMessage::Metrics { metrics: m } => {
                 let at = now() as i64;
+                self.cpu_samples.insert(worker.into(), CpuObservation {
+                    at: at as u64,
+                    percent: (m.cpu_valid == Some(true) && m.cpu_percent.is_finite() && (0.0..=100.0).contains(&m.cpu_percent)).then_some(m.cpu_percent),
+                });
                 self.db.execute(
                     "INSERT OR REPLACE INTO metrics(worker,at,cpu,memory_used,memory_total,load,disk,disk_used,disk_total) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                     params![worker, at, m.cpu_percent, m.memory_used as i64, m.memory_total as i64, m.load, m.disk_percent, m.disk_used as i64, m.disk_total as i64],
@@ -1504,6 +1529,17 @@ impl Store {
     }
 }
 
+fn host_score(host: &HostInfo) -> f64 {
+    (host.occupied as f64 / host.config.max_jobs as f64).max(host.cpu_percent.unwrap_or_default() / 100.0)
+}
+fn reserve_host(host: &mut HostInfo) {
+    host.occupied += 1;
+    host.available_slots = host.available_slots.saturating_sub(1);
+    if host.available_slots == 0 {
+        host.schedulable = false;
+        host.wait_reason = Some("Waiting for host concurrency slots".into());
+    }
+}
 fn candidate(
     worker: &WorkerInfo,
     spec: &JobSpec,
@@ -1606,14 +1642,25 @@ fn incompatibilities(
 pub async fn run(listen: String, data_dir: PathBuf, token_file: PathBuf) -> Result<()> {
     let token = crate::client::read_token(&token_file)?;
     let state = Arc::new(Mutex::new(Store::open(data_dir, token)?));
-    let app = router(state);
+    let app = router(state.clone());
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     eprintln!("YLCC hub listening on {listen}");
-    axum::serve(listener, app)
+    let scheduler = state.clone();
+    let task = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            tick.tick().await;
+            if let Ok(mut store) = scheduler.lock()
+                && let Err(error) = store.schedule() { eprintln!("hub scheduler: {error:#}"); }
+        }
+    });
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
-        .await?;
+        .await;
+    task.abort();
+    result?;
     Ok(())
 }
 fn router(state: Shared) -> Router {
@@ -1621,6 +1668,7 @@ fn router(state: Shared) -> Router {
     // Every /v1 route belongs to exactly one role group; a route outside these groups would be
     // unauthenticated, so add new routes to the narrowest group that fits.
     let admin = Router::new()
+        .route("/v1/hosts/{id}", put(hosts::set_host).delete(hosts::delete_host))
         .route("/v1/workers/{id}", axum::routing::delete(delete_worker))
         .route("/v1/workers/{id}/control", post(control_worker))
         .route("/v1/workers/{id}/update", post(update_worker))
@@ -1633,6 +1681,7 @@ fn router(state: Shared) -> Router {
         .route("/v1/audit", get(audit))
         .route_layer(middleware::from_fn_with_state(state.clone(), admin_only));
     let requester = Router::new()
+        .route("/v1/hosts", get(hosts::hosts))
         .route("/v1/workers", get(workers))
         .route("/v1/workers/{id}/metrics", get(worker_metrics))
         .route("/v1/blobs/missing", post(missing_blobs))
@@ -1668,7 +1717,7 @@ fn router(state: Shared) -> Router {
                     "status":"ok",
                     "version":crate::VERSION,
                     "transfer_limits":limits,
-                    "capabilities":["job_priority", "worker_control", "scoped_tokens", "audit_log", "command_policy", "job_worker", "worker_metrics", "incremental_reconnect", "worker_updates"]
+                    "capabilities":["host_scheduling", "job_priority", "worker_control", "scoped_tokens", "audit_log", "command_policy", "job_worker", "worker_metrics", "incremental_reconnect", "worker_updates"]
                 }))
             }),
         )
@@ -1863,6 +1912,9 @@ async fn delete_worker(
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     let mut guard = lock(&state)?;
+    if guard.host_configs()?.iter().any(|(_, h)| h.workers.contains(&id)) {
+        return Err(ApiError(StatusCode::CONFLICT, "remove this worker from its host before deleting it".into()));
+    }
     // Deleting a missing worker succeeds so retries are idempotent.
     if guard.jobs(None, None).unwrap_or_default().into_iter().any(|job| {
         matches!(job.state.as_str(), "assigned" | "waiting" | "running") && job.worker_id.as_deref() == Some(&id)
@@ -1881,6 +1933,7 @@ async fn control_worker(
     Json(control): Json<WorkerControl>,
 ) -> ApiResult<Json<WorkerInfo>> {
     let mut store = lock(&state)?;
+
     let detail = encode(&control)?;
     let worker = store.control_worker(&id, control)?;
     store.record(&principal, "worker.control", &id, Some(detail));
@@ -2514,6 +2567,209 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().into(), "test-token-long-enough".into()).unwrap();
         (dir, store)
+    }
+    fn host_config(ids: &[&str], max_jobs: usize) -> HostConfig {
+        HostConfig { workers: ids.iter().map(|id| id.to_string()).collect(), max_jobs, cpu_guard: None }
+    }
+    fn capable_worker(store: &mut Store, id: &str, max_jobs: usize) -> (Uuid, mpsc::UnboundedReceiver<HubMessage>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut capabilities = caps();
+        capabilities.cpu_metrics = true;
+        let session = store.connect(id.into(), capabilities, max_jobs, vec![], vec![], String::new(), tx, &pool_principal(), false).unwrap();
+        (session, rx)
+    }
+    #[test]
+    fn shared_host_reserves_before_starting_and_keeps_unknown_occupied() {
+        let (_dir, mut store) = test_store();
+        let (_, _a) = capable_worker(&mut store, "a", 2);
+        let (_, _b) = capable_worker(&mut store, "b", 2);
+        store.set_host_config("shared", host_config(&["a", "b"], 1)).unwrap();
+        let first = store.add_job(spec(), None).unwrap();
+        let second = store.add_job(spec(), None).unwrap();
+        assert_eq!(second.state, "queued");
+        assert!(second.worker_id.is_none());
+        let host = store.host_infos(now()).unwrap().remove(0);
+        assert_eq!((host.occupied, host.available_slots), (1, 0));
+        for state in ["unknown", "cancelling", "assigned", "running"] {
+            let mut unresolved = first.clone();
+            unresolved.state = state.into();
+            store.save_job(&unresolved).unwrap();
+            store.schedule().unwrap();
+            assert_eq!(store.job(&second.id).unwrap().unwrap().state, "queued");
+            assert_eq!(store.host_infos(now()).unwrap()[0].occupied, 1);
+        }
+        finish(&mut store, &first);
+        assert_eq!(store.job(&second.id).unwrap().unwrap().state, "waiting");
+    }
+    #[test]
+    fn distribution_uses_reservations_and_fresh_cpu_ties() {
+        let (_dir, mut store) = test_store();
+        let (_, _a) = capable_worker(&mut store, "a", 4);
+        let (_, _b) = capable_worker(&mut store, "b", 4);
+        store.cpu_samples.insert("a".into(), CpuObservation { at: now(), percent: Some(80.0) });
+        store.cpu_samples.insert("b".into(), CpuObservation { at: now(), percent: Some(10.0) });
+        assert_eq!(store.add_job(spec(), None).unwrap().worker_id.as_deref(), Some("b"));
+        store.cpu_samples.clear();
+        let jobs: Vec<_> = (0..5).map(|_| store.add_job(spec(), None).unwrap()).collect();
+        let a = jobs.iter().filter(|j| j.worker_id.as_deref() == Some("a")).count();
+        let b = jobs.iter().filter(|j| j.worker_id.as_deref() == Some("b")).count();
+        assert_eq!((a, b), (3, 2));
+    }
+    #[test]
+    fn host_membership_and_limits_persist_and_busy_changes_are_rejected() {
+        let (dir, mut store) = test_store();
+        let (_, _a) = capable_worker(&mut store, "a", 3);
+        let (_, _b) = capable_worker(&mut store, "b", 3);
+        store.set_host_config("shared", host_config(&["a", "b"], 3)).unwrap();
+        let mut first = store.add_job(spec(), None).unwrap();
+        let second = store.add_job(spec(), None).unwrap();
+        store.set_host_config("shared", host_config(&["a", "b"], 1)).unwrap();
+        let third = store.add_job(spec(), None).unwrap();
+        assert_eq!(third.state, "queued");
+        first.state = "unknown".into(); store.save_job(&first).unwrap();
+        assert_eq!(store.delete_host_config("shared").unwrap_err().0, StatusCode::CONFLICT);
+        assert_eq!(store.set_host_config("shared", host_config(&["b"], 1)).unwrap_err().0, StatusCode::CONFLICT);
+        drop(store);
+        let mut store = Store::open(dir.path().into(), "test-token-long-enough".into()).unwrap();
+        assert_eq!(store.host_configs().unwrap(), vec![("shared".into(), host_config(&["a", "b"], 1))]);
+        assert_eq!(store.host_infos(now()).unwrap()[0].occupied, 2);
+        assert!(active(&store.job(&second.id).unwrap().unwrap().state));
+    }
+    #[test]
+    fn host_validates_membership_thresholds_and_measurement_support() {
+        let (_dir, mut store) = test_store();
+        let (_, _a) = capable_worker(&mut store, "a", 2);
+        let (_, _b) = worker(&mut store, "b");
+        assert!(store.set_host_config("bad", host_config(&[], 1)).is_err());
+        assert!(store.set_host_config("bad", host_config(&["a", "a"], 1)).is_err());
+        assert!(store.set_host_config("bad", host_config(&["missing"], 1)).is_err());
+        assert!(store.set_host_config("bad", host_config(&["a"], 0)).is_err());
+        store.set_host_config("first", host_config(&["a"], 1)).unwrap();
+        assert!(store.set_host_config("second", host_config(&["a"], 1)).is_err());
+        let mut config = host_config(&["b"], 1);
+        config.cpu_guard = Some(CpuGuard { metrics_worker: "b".into(), pause_above: 90.0, resume_below: 75.0 });
+        assert!(store.set_host_config("legacy", config.clone()).is_err());
+        config.cpu_guard.as_mut().unwrap().metrics_worker = "a".into();
+        assert!(store.set_host_config("external", config).is_err());
+        let mut config = host_config(&["a"], 1);
+        config.cpu_guard = Some(CpuGuard { metrics_worker: "a".into(), pause_above: 75.0, resume_below: 75.0 });
+        assert!(store.set_host_config("first", config.clone()).is_err());
+        config.cpu_guard.as_mut().unwrap().pause_above = 90.0;
+        let mut a = store.workers().unwrap().into_iter().find(|w| w.id == "a").unwrap();
+        a.capabilities.containerized = true; store.save_worker(&a).unwrap();
+        assert!(store.set_host_config("first", config).is_err());
+    }
+    #[test]
+    fn cpu_guard_blocks_until_recovery_and_rechecks_after_disconnect_and_restart() {
+        let (dir, mut store) = test_store();
+        let (session, _rx) = capable_worker(&mut store, "a", 2);
+        let mut config = host_config(&["a"], 2);
+        config.cpu_guard = Some(CpuGuard { metrics_worker: "a".into(), pause_above: 90.0, resume_below: 75.0 });
+        store.set_host_config("guarded", config).unwrap();
+        let job = store.add_job(spec(), None).unwrap();
+        assert_eq!(job.state, "queued");
+        assert!(job.wait_reason.unwrap().contains("CPU"));
+        let base = now();
+        for offset in [0, 15, 30] {
+            store.cpu_samples.insert("a".into(), CpuObservation { at: base + offset, percent: Some(50.0) });
+            store.schedule_at(base + offset).unwrap();
+        }
+        let running = store.job(&job.id).unwrap().unwrap();
+        assert_eq!(running.state, "waiting");
+        store.disconnect("a", session).unwrap();
+        assert!(!store.host_infos(base + 30).unwrap()[0].schedulable);
+        drop(store);
+        let mut store = Store::open(dir.path().into(), "test-token-long-enough".into()).unwrap();
+        let (_, _rx) = capable_worker(&mut store, "a", 2);
+        let host = store.host_infos(base + 30).unwrap().remove(0);
+        assert!(!host.schedulable);
+        assert!(host.wait_reason.unwrap().contains("CPU"));
+    }
+    #[tokio::test]
+    async fn host_endpoints_are_role_scoped_and_changes_are_audited() {
+        let (_dir, mut store) = test_store();
+        let (_, _rx) = capable_worker(&mut store, "a", 1);
+        let requester = store.create_token(TokenRequest { name: "host-reader".into(), role: Role::Requester, worker_id: None }, &pool_principal()).unwrap();
+        let worker = store.create_token(TokenRequest { name: "host-worker".into(), role: Role::Worker, worker_id: Some("a".into()) }, &pool_principal()).unwrap();
+        let state = Arc::new(Mutex::new(store));
+        let app = router(state.clone());
+        use tower::ServiceExt;
+        for (token, method, path, expected) in [
+            (requester.secret.as_str(), "GET", "/v1/hosts", StatusCode::OK),
+            (worker.secret.as_str(), "GET", "/v1/hosts", StatusCode::FORBIDDEN),
+            ("test-token-long-enough", "PUT", "/v1/hosts/shared", StatusCode::OK),
+            (requester.secret.as_str(), "PUT", "/v1/hosts/shared", StatusCode::FORBIDDEN),
+            (requester.secret.as_str(), "DELETE", "/v1/hosts/shared", StatusCode::FORBIDDEN),
+            ("", "GET", "/v1/hosts", StatusCode::UNAUTHORIZED),
+        ] {
+            let request = axum::http::Request::builder().method(method).uri(path).header("Authorization", format!("Bearer {token}")).header("Content-Type", "application/json").body(Body::from(r#"{"workers":["a"]}"#)).unwrap();
+            assert_eq!(app.clone().oneshot(request).await.unwrap().status(), expected);
+        }
+        let _ = hosts::set_host(State(state.clone()), Extension(pool_principal()), Path("shared".into()), Json(host_config(&["a"], 1))).await.unwrap();
+        let store = state.lock().unwrap();
+        assert!(store.audit_events(20, None).unwrap().iter().any(|e| e.action == "host.set"));
+    }
+    #[tokio::test]
+    async fn grouped_workers_can_still_pause_resume_and_limit_but_not_be_deleted() {
+        let (_dir, mut store) = test_store();
+        let (_, _rx) = capable_worker(&mut store, "a", 2);
+        store.set_host_config("shared", host_config(&["a"], 1)).unwrap();
+        let state = Arc::new(Mutex::new(store));
+        for paused in [true, false] {
+            let result = control_worker(State(state.clone()), Extension(pool_principal()), Path("a".into()), Json(WorkerControl { paused: Some(paused), max_jobs: Some(1) })).await.unwrap();
+            assert_eq!(result.0.paused, paused);
+        }
+        assert_eq!(delete_worker(State(state.clone()), Extension(pool_principal()), Path("a".into())).await.unwrap_err().0, StatusCode::CONFLICT);
+    }
+    #[tokio::test]
+    async fn explicit_and_automatic_preparations_share_the_host_budget() {
+        let (_dir, mut store) = test_store();
+        let (_, mut a) = capable_worker(&mut store, "a", 2);
+        let (_, mut b) = capable_worker(&mut store, "b", 2);
+        store.set_host_config("shared", host_config(&["a", "b"], 1)).unwrap();
+        let state = Arc::new(Mutex::new(store));
+        let environment = Environment { id: "tools".into(), revision: "v1".into(), ..Default::default() };
+        let _ = upsert_environment(State(state.clone()), Extension(pool_principal()), Json(environment.clone())).await.unwrap();
+        let _ = prepare(State(state.clone()), Extension(pool_principal()), Path("tools".into()), Json(PrepareRequest { worker_id: None })).await.unwrap();
+        assert!(matches!(a.try_recv().unwrap(), HubMessage::Prepare { .. }));
+        assert!(b.try_recv().is_err());
+        let mut store = state.lock().unwrap();
+        assert_eq!(store.host_infos(now()).unwrap()[0].occupied, 1);
+        let queued = store.add_job(spec(), None).unwrap();
+        assert_eq!(queued.state, "queued");
+        store.receive_status("a", EnvironmentStatus { worker_id: "a".into(), environment_id: "tools".into(), revision: "v1".into(), state: "ready".into(), error: None }).unwrap();
+        store.schedule().unwrap();
+        assert!(matches!(b.try_recv().unwrap(), HubMessage::Prepare { .. }));
+        assert_eq!(store.job(&queued.id).unwrap().unwrap().state, "queued");
+        store.receive_status("b", EnvironmentStatus { worker_id: "b".into(), environment_id: "tools".into(), revision: "v1".into(), state: "ready".into(), error: None }).unwrap();
+        store.schedule().unwrap();
+        assert_eq!(store.job(&queued.id).unwrap().unwrap().state, "waiting");
+    }
+    #[test]
+    fn one_scheduling_pass_spreads_a_priority_sorted_batch_without_overbooking_hosts() {
+        let (_dir, mut store) = test_store();
+        let (_, _a) = capable_worker(&mut store, "a", 3);
+        let (_, _b) = capable_worker(&mut store, "b", 3);
+        let (_, _c) = capable_worker(&mut store, "c", 3);
+        store.set_host_config("shared", host_config(&["a", "b"], 2)).unwrap();
+        for mut worker in store.workers().unwrap() { worker.paused = true; store.save_worker(&worker).unwrap(); }
+        let jobs: Vec<_> = [0, 20, 10, 20, 0, -1].into_iter().map(|priority| store.add_job(JobSpec { priority, ..spec() }, None).unwrap()).collect();
+        for mut worker in store.workers().unwrap() { worker.paused = false; store.save_worker(&worker).unwrap(); }
+        store.schedule().unwrap();
+        let hosts = store.host_infos(now()).unwrap();
+        assert_eq!(hosts.iter().find(|h| h.id == "shared").unwrap().occupied, 2);
+        assert_eq!(hosts.iter().find(|h| h.id == "worker:c").unwrap().occupied, 3);
+        for job in &jobs[..5] { assert_eq!(store.job(&job.id).unwrap().unwrap().state, "waiting"); }
+        assert_eq!(store.job(&jobs[5].id).unwrap().unwrap().state, "queued");
+        assert_eq!(store.job(&jobs[1].id).unwrap().unwrap().worker_id.as_deref(), Some("a"));
+        assert_eq!(store.job(&jobs[3].id).unwrap().unwrap().worker_id.as_deref(), Some("c"));
+    }
+    #[test]
+    fn stale_orphan_preparation_status_does_not_panic_scheduling() {
+        let (_dir, mut store) = test_store();
+        store.save_status(&EnvironmentStatus { worker_id: "removed".into(), environment_id: "old".into(), revision: "1".into(), state: "pending".into(), error: None }).unwrap();
+        store.save_status(&EnvironmentStatus { worker_id: "another-removed".into(), environment_id: "old".into(), revision: "1".into(), state: "pending".into(), error: None }).unwrap();
+        store.schedule().unwrap();
     }
     fn caps() -> Capabilities {
         Capabilities {

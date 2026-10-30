@@ -103,3 +103,23 @@ test('snapshot and filters use summaries; full data is requested by the detail q
     assert.equal(paths.at(-1), '/v1/jobs/old%2Fjob')
   } finally { client.clear() }
 })
+
+
+test('host snapshots are capability-gated for old Hubs', async (t) => {
+  for (const supported of [false, true]) {
+    const paths: string[] = []
+    t.mock.method(globalThis, 'fetch', async (path: string) => {
+      paths.push(path)
+      if (path === '/health') return Response.json({ capabilities: supported ? ['host_scheduling'] : [] })
+      if (path === '/v1/hosts') return Response.json([{ id: 'shared', available_slots: 1 }])
+      return Response.json(path.includes('/summary') ? { jobs: [], total: 0 } : [])
+    })
+    const client = new QueryClient({ defaultOptions: { queries: { gcTime: Infinity, retry: false } } })
+    try {
+      const snapshot = await client.fetchQuery(snapshotQuery)
+      assert.equal(paths.includes('/v1/hosts'), supported)
+      assert.equal(snapshot.hosts?.[0]?.id, supported ? 'shared' : undefined)
+    } finally { client.clear() }
+    t.mock.restoreAll()
+  }
+})

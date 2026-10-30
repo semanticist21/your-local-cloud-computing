@@ -303,3 +303,19 @@ select.field { appearance: none; padding-right: 30px; background: #fff url("data
 .worker-update-note { display: inline-flex; align-items: baseline; gap: 5px; color: var(--muted-foreground, #59677b); font-size: 12px; }
 .worker-update-note > svg { flex-shrink: 0; align-self: flex-start; margin-top: 2px; }
 .worker-resume { display: inline-flex; flex-direction: column; align-items: flex-start; gap: 4px; margin-left: 8px; }
+
+.host-editor { min-width: 0; }
+.host-status { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: #526277; }
+.host-form { width: min(100%, 520px); margin-top: 12px; text-align: left; }
+.host-form .muted-text { color: #526277; }
+.host-form > fieldset { display: grid; gap: 10px; min-width: 0; margin: 0; padding: 16px; border: 1px solid var(--border); border-radius: 6px; background: #fff; }
+.host-form legend, .host-form label { font-size: 12px; font-weight: 500; }
+.host-form input:not([type="checkbox"]), .host-form select { width: 100%; min-width: 0; min-height: 38px; padding: 8px; border: 1px solid #cfd8e2; border-radius: 5px; background: #fff; color: #25374b; font: inherit; }
+.host-members { display: grid; gap: 8px; min-width: 0; margin: 0; padding: 12px; border: 1px solid var(--border); }
+.host-members label, .host-toggle { display: flex; align-items: center; gap: 8px; overflow-wrap: anywhere; }
+.host-thresholds { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.host-thresholds label { display: grid; gap: 6px; }
+.host-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.page-heading:has(.host-form), .section-heading:has(.host-form) { flex-direction: column; align-items: flex-start; }
+.page-heading:has(.host-form) > .host-editor, .section-heading:has(.host-form) > .host-editor { width: 100%; }
+.section-heading > .host-editor { display: block; }

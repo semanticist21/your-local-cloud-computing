@@ -110,6 +110,9 @@ pub struct Capabilities {
     pub cpu_features: Vec<String>,
     #[serde(default)]
     pub runtimes: Vec<String>,
+    /// Reports explicit CPU measurement validity (older workers do not).
+    #[serde(default)]
+    pub cpu_metrics: bool,
     pub cpus: usize,
     pub memory_bytes: u64,
     #[serde(default)]
@@ -270,6 +273,44 @@ pub struct WorkerInfo {
     pub update_error: Option<String>,
 }
 
+/// Shared admission budget for workers on one operator-identified physical machine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HostConfig {
+    pub workers: Vec<String>,
+    #[serde(default = "default_host_jobs")]
+    pub max_jobs: usize,
+    #[serde(default)]
+    pub cpu_guard: Option<CpuGuard>,
+}
+fn default_host_jobs() -> usize { 1 }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CpuGuard {
+    pub metrics_worker: String,
+    #[serde(default = "default_cpu_pause")]
+    pub pause_above: f64,
+    #[serde(default = "default_cpu_resume")]
+    pub resume_below: f64,
+}
+fn default_cpu_pause() -> f64 { 90.0 }
+fn default_cpu_resume() -> f64 { 75.0 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostInfo {
+    pub id: String,
+    #[serde(flatten)]
+    pub config: HostConfig,
+    pub managed: bool,
+    pub occupied: usize,
+    /// Online member capacity capped by the shared host budget.
+    pub capacity: usize,
+    pub available_slots: usize,
+    pub cpu_percent: Option<f64>,
+    pub cpu_at: Option<u64>,
+    pub schedulable: bool,
+    pub wait_reason: Option<String>,
+}
+
 pub fn valid_release_version(version: &str) -> bool {
     version.len() <= 64
         && version.strip_prefix('v').is_some_and(|v| !v.is_empty()
@@ -338,6 +379,8 @@ pub struct WorkerMetrics {
     #[serde(default)]
     pub at: u64,
     pub cpu_percent: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_valid: Option<bool>,
     pub memory_used: u64,
     pub memory_total: u64,
     /// One-minute load average; 0 where the OS has none (Windows).

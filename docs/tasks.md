@@ -92,6 +92,28 @@ Pausing stops new assignments and new environment preparation while existing wor
 
 Priority submission requires a Hub advertising priority support; older Hubs are rejected instead of silently ignoring a nonzero priority.
 
+## Physical hosts and CPU admission control
+
+An administrator can group native and container workers sharing one physical machine. Pause and drain affected workers before changing membership; active or unresolved (`unknown`) work prevents moving or ungrouping a worker. Settings persist in the Hub. Ungrouped workers retain independent limits.
+
+```bash
+ylcc hosts list
+ylcc hosts set desktop --workers desktop-native,desktop-linux --max-jobs 2
+ylcc hosts set desktop --workers desktop-native,desktop-linux --max-jobs 2 \
+  --metrics-worker desktop-native --cpu-pause 90 --cpu-resume 75
+ylcc hosts delete desktop
+```
+
+`set` replaces the complete configuration. The default maximum is 1; omitting `--metrics-worker` disables CPU guarding. `delete` returns idle members to independent scheduling. The Workers dashboard provides the same admin settings; requesters can view host status.
+
+Host and worker limits both apply. Preparation and unresolved work consume slots. Jobs prefer the lowest of the candidates' scores: the larger of CPU usage fraction and reserved host slot fraction, then worker occupancy fraction and worker ID. Job priority and submission order remain intact. Reservations count immediately, before execution starts.
+
+CPU guarding requires one member native worker reporting explicit CPU validity. Choose a worker measuring the physical machine: container or VM measurements are not automatically treated as physical-host CPU. Other members may run older versions.
+
+Defaults pause new assignments after CPU stays at or above 90% for 30 seconds, and resume after it stays at or below 75% for 30 seconds. Invalid measurements, source disconnects or measurements older than 60 seconds hold new work. Startup and recovery require the same 30-second low-CPU window; sample gaps over 30 seconds reset duration tracking. Existing jobs continue, while queued jobs use other eligible hosts or show the hold reason. Disable CPU guarding to continue under concurrency limits alone.
+
+This is admission control, not a CPU hard cap: one job can still use all CPU. The CLI checks Hub capability before using these endpoints, and dashboard controls are unavailable on older Hubs.
+
 ## Setup and fast task templates
 
 Run first-run discovery without printing secrets:

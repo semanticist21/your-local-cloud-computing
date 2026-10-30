@@ -69,6 +69,11 @@ enum Commands {
         #[command(subcommand)]
         command: Option<Workers>,
     },
+    /// Manage physical-host admission budgets shared by multiple workers.
+    Hosts {
+        #[command(subcommand)]
+        command: Hosts,
+    },
     Jobs {
         #[command(subcommand)]
         command: Jobs,
@@ -295,6 +300,27 @@ enum Tasks {
         #[arg(long)]
         no_download: bool,
     },
+}
+#[derive(Subcommand)]
+enum Hosts {
+    List,
+    /// Replace a host's complete configuration; omit --metrics-worker to disable CPU guarding.
+    Set {
+        id: String,
+        #[arg(long, value_delimiter = ',', required = true, num_args = 1..)]
+        workers: Vec<String>,
+        #[arg(long, default_value = "1", value_parser = parse_max_jobs)]
+        max_jobs: usize,
+        /// Native worker on this physical machine; enables CPU guarding.
+        #[arg(long)]
+        metrics_worker: Option<String>,
+        #[arg(long, requires = "metrics_worker")]
+        cpu_pause: Option<f64>,
+        #[arg(long, requires = "metrics_worker")]
+        cpu_resume: Option<f64>,
+    },
+    /// Return idle member workers to independent scheduling.
+    Delete { id: String },
 }
 #[derive(Subcommand)]
 enum Workers {
@@ -1270,6 +1296,25 @@ async fn execute() -> Result<()> {
                     .context("control worker; this command requires a Hub with queue controls")?,
             )
         }
+        Commands::Hosts { command } => {
+            let client = Client::new(&hub, &token)?;
+            require_capability(&client, "host_scheduling", "physical host scheduling").await?;
+            match command {
+                Hosts::List => print(&client.get::<Vec<HostInfo>>("/v1/hosts").await?),
+                Hosts::Set { id, workers, max_jobs, metrics_worker, cpu_pause, cpu_resume } => {
+                    ylcc::client::segment(&id)?;
+                    let config = HostConfig { workers, max_jobs, cpu_guard: metrics_worker.map(|metrics_worker| CpuGuard {
+                        metrics_worker, pause_above: cpu_pause.unwrap_or(90.0), resume_below: cpu_resume.unwrap_or(75.0),
+                    }) };
+                    print(&client.put::<_, HostInfo>(&format!("/v1/hosts/{id}"), &config).await?)
+                }
+                Hosts::Delete { id } => {
+                    ylcc::client::segment(&id)?;
+                    client.delete(&format!("/v1/hosts/{id}")).await?;
+                    print(&serde_json::json!({"deleted":id}))
+                }
+            }
+        }
         Commands::Jobs { command } => {
             let c = Client::new(&hub, &token)?;
             match command {
@@ -1686,6 +1731,24 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
+    #[test]
+    fn host_cli_parses_complete_configuration_and_requires_a_cpu_source() {
+        let cli = Cli::try_parse_from(["ylcc", "hosts", "set", "desktop", "--workers", "native,container", "--metrics-worker", "native"]).unwrap();
+        assert!(matches!(cli.command, Commands::Hosts { command: Hosts::Set { workers, max_jobs: 1, metrics_worker: Some(_), .. } } if workers == vec!["native", "container"]));
+        assert!(Cli::try_parse_from(["ylcc", "hosts", "set", "desktop", "--workers", "native", "--cpu-pause", "90"]).is_err());
+        assert!(Cli::try_parse_from(["ylcc", "hosts", "set", "desktop", "--workers", "native", "--max-jobs", "0"]).is_err());
+    }
+    #[tokio::test]
+    async fn hosts_refuse_an_old_hub_before_sending_host_requests() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().route("/health", axum::routing::get(|| async { axum::Json(serde_json::json!({"capabilities": []})) }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let token = test_token();
+        let client = Client::new(&hub, &token).unwrap();
+        assert!(require_capability(&client, "host_scheduling", "physical host scheduling").await.unwrap_err().to_string().contains("upgrade the Hub"));
+        server.abort();
+    }
     #[test]
     fn token_and_audit_commands_parse() {
         let cli = Cli::try_parse_from([

@@ -9,6 +9,7 @@ export type Capabilities = {
   gpu: string[]
   cpu_features?: string[]
   runtimes: string[]
+  cpu_metrics?: boolean
   cpus: number
   memory_bytes: number
   containerized: boolean
@@ -35,6 +36,23 @@ export type WorkerInfo = {
   version?: string
   updating?: string | null
   update_error?: string | null
+}
+
+export type HostConfig = {
+  workers: string[]
+  max_jobs: number
+  cpu_guard: { metrics_worker: string; pause_above: number; resume_below: number } | null
+}
+export type HostInfo = HostConfig & {
+  id: string
+  managed: boolean
+  occupied: number
+  capacity: number
+  available_slots: number
+  cpu_percent: number | null
+  cpu_at: number | null
+  schedulable: boolean
+  wait_reason: string | null
 }
 
 export function workerUpdateProgress(worker: Pick<WorkerInfo, 'updating' | 'online'>, activeJobs: number) {
@@ -137,6 +155,7 @@ export type AuditEvent = {
 
 export type Snapshot = {
   workers: WorkerInfo[]
+  hosts?: HostInfo[]
   jobList: JobList
   environments: Environment[]
   environmentStatuses: EnvironmentStatus[]
@@ -249,6 +268,10 @@ export async function post<T = void>(path: string, body?: unknown): Promise<T> {
   })
 }
 
+export async function put<T = void>(path: string, body: unknown): Promise<T> {
+  return request<T>(path, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+}
+
 export async function del<T = void>(path: string): Promise<T> {
   return request<T>(path, { method: 'DELETE' })
 }
@@ -270,13 +293,15 @@ export const latestReleaseQuery = queryOptions({
 export const snapshotQuery = queryOptions({
   queryKey: ['snapshot'],
   queryFn: async (): Promise<Snapshot> => {
-    const [workers, jobList, environments, environmentStatuses] = await Promise.all([
+    const [workers, jobList, environments, environmentStatuses, health] = await Promise.all([
       get<WorkerInfo[]>('/v1/workers'),
       fetchJobList(),
       get<Environment[]>('/v1/environments'),
       get<EnvironmentStatus[]>('/v1/environments/status'),
+      get<{ capabilities?: string[] }>('/health'),
     ])
-    return { workers, jobList, environments, environmentStatuses }
+    const hosts = health.capabilities?.includes('host_scheduling') ? await get<HostInfo[]>('/v1/hosts') : undefined
+    return { workers, hosts, jobList, environments, environmentStatuses }
   },
   refetchInterval: pollMs,
   placeholderData: keepPreviousData,

@@ -68,10 +68,8 @@ impl CpuGate {
 fn preparing(status: &EnvironmentStatus) -> bool {
     matches!(status.state.as_str(), "preparing" | "unknown")
 }
-fn occupied(worker: &str, jobs: &[Job], statuses: &[EnvironmentStatus]) -> usize {
-    jobs.iter()
-        .filter(|job| job.worker_id.as_deref() == Some(worker) && active(&job.state))
-        .count()
+fn occupied(worker: &str, jobs: &HashMap<String, usize>, statuses: &[EnvironmentStatus]) -> usize {
+    jobs.get(worker).copied().unwrap_or_default()
         + usize::from(
             statuses
                 .iter()
@@ -80,6 +78,15 @@ fn occupied(worker: &str, jobs: &[Job], statuses: &[EnvironmentStatus]) -> usize
 }
 
 impl Store {
+    fn host_job_counts(&self) -> Result<HashMap<String, usize>> {
+        let mut statement = self.db.prepare(
+            "SELECT json_extract(data,'$.worker_id'), COUNT(*) FROM jobs
+             WHERE json_extract(data,'$.state') IN ('assigned','waiting','running','cancelling','unknown')
+             AND json_extract(data,'$.worker_id') IS NOT NULL GROUP BY json_extract(data,'$.worker_id')"
+        )?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
     pub(super) fn host_configs(&self) -> Result<Vec<(String, HostConfig)>> {
         let mut statement = self.db.prepare("SELECT id,data FROM hosts ORDER BY id")?;
         let rows =
@@ -93,7 +100,7 @@ impl Store {
 
     pub(super) fn host_infos(&mut self, at: u64) -> Result<Vec<HostInfo>> {
         let workers = self.workers()?;
-        let jobs = self.jobs(None, None)?;
+        let jobs = self.host_job_counts()?;
         let statuses = self.statuses()?;
         let mut configs = self.host_configs()?;
         let grouped: BTreeSet<_> = configs
@@ -254,7 +261,7 @@ impl Store {
             .flat_map(|c| c.workers.iter())
             .collect();
         let after: BTreeSet<_> = config.workers.iter().collect();
-        let jobs = self.jobs(None, None)?;
+        let jobs = self.host_job_counts()?;
         let statuses = self.statuses()?;
         for worker in before.symmetric_difference(&after) {
             if occupied(worker, &jobs, &statuses) != 0 {
@@ -286,7 +293,7 @@ impl Store {
         else {
             return Ok(());
         };
-        let jobs = self.jobs(None, None)?;
+        let jobs = self.host_job_counts()?;
         let statuses = self.statuses()?;
         if config
             .workers

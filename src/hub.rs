@@ -2590,11 +2590,14 @@ mod tests {
         assert!(second.worker_id.is_none());
         let host = store.host_infos(now()).unwrap().remove(0);
         assert_eq!((host.occupied, host.available_slots), (1, 0));
-        let mut unresolved = first.clone();
-        unresolved.state = "unknown".into();
-        store.save_job(&unresolved).unwrap();
-        store.schedule().unwrap();
-        assert_eq!(store.job(&second.id).unwrap().unwrap().state, "queued");
+        for state in ["unknown", "cancelling", "assigned", "running"] {
+            let mut unresolved = first.clone();
+            unresolved.state = state.into();
+            store.save_job(&unresolved).unwrap();
+            store.schedule().unwrap();
+            assert_eq!(store.job(&second.id).unwrap().unwrap().state, "queued");
+            assert_eq!(store.host_infos(now()).unwrap()[0].occupied, 1);
+        }
         finish(&mut store, &first);
         assert_eq!(store.job(&second.id).unwrap().unwrap().state, "waiting");
     }
@@ -2702,7 +2705,7 @@ mod tests {
             let request = axum::http::Request::builder().method(method).uri(path).header("Authorization", format!("Bearer {token}")).header("Content-Type", "application/json").body(Body::from(r#"{"workers":["a"]}"#)).unwrap();
             assert_eq!(app.clone().oneshot(request).await.unwrap().status(), expected);
         }
-        set_host_test_call(state.clone()).await;
+        let _ = hosts::set_host(State(state.clone()), Extension(pool_principal()), Path("shared".into()), Json(host_config(&["a"], 1))).await.unwrap();
         let store = state.lock().unwrap();
         assert!(store.audit_events(20, None).unwrap().iter().any(|e| e.action == "host.set"));
     }
@@ -2718,9 +2721,6 @@ mod tests {
         }
         assert_eq!(delete_worker(State(state.clone()), Extension(pool_principal()), Path("a".into())).await.unwrap_err().0, StatusCode::CONFLICT);
     }
-    async fn set_host_test_call(state: Shared) {
-        hosts::set_host(State(state), Extension(pool_principal()), Path("shared".into()), Json(host_config(&["a"], 1))).await.unwrap();
-    }
     #[tokio::test]
     async fn explicit_and_automatic_preparations_share_the_host_budget() {
         let (_dir, mut store) = test_store();
@@ -2729,8 +2729,8 @@ mod tests {
         store.set_host_config("shared", host_config(&["a", "b"], 1)).unwrap();
         let state = Arc::new(Mutex::new(store));
         let environment = Environment { id: "tools".into(), revision: "v1".into(), ..Default::default() };
-        upsert_environment(State(state.clone()), Extension(pool_principal()), Json(environment.clone())).await.unwrap();
-        prepare(State(state.clone()), Extension(pool_principal()), Path("tools".into()), Json(PrepareRequest { worker_id: None })).await.unwrap();
+        let _ = upsert_environment(State(state.clone()), Extension(pool_principal()), Json(environment.clone())).await.unwrap();
+        let _ = prepare(State(state.clone()), Extension(pool_principal()), Path("tools".into()), Json(PrepareRequest { worker_id: None })).await.unwrap();
         assert!(matches!(a.try_recv().unwrap(), HubMessage::Prepare { .. }));
         assert!(b.try_recv().is_err());
         let mut store = state.lock().unwrap();

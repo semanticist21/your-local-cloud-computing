@@ -868,18 +868,20 @@ impl Sampler {
     /// A value the OS cannot report is sent as 0.
     fn sample(&mut self, data: &Path) -> WorkerMetrics {
         let cpu = cpu_ticks();
-        let cpu_percent = match (self.cpu, cpu) {
+        let measurement = match (self.cpu, cpu) {
             (Some((busy, total)), Some((busy2, total2))) if total2 > total => {
-                busy2.saturating_sub(busy) as f64 * 100.0 / (total2 - total) as f64
+                Some(busy2.saturating_sub(busy) as f64 * 100.0 / (total2 - total) as f64)
             }
-            _ => 0.0,
+            _ => None,
         };
         self.cpu = cpu;
+        let valid = measurement.is_some_and(|v| v.is_finite() && (0.0..=100.0).contains(&v));
         let (memory_used, memory_total) = memory_usage().unwrap_or_default();
         let (disk_used, disk_total) = crate::platform::disk_space(data).unwrap_or_default();
         WorkerMetrics {
             at: 0,
-            cpu_percent,
+            cpu_percent: measurement.filter(|_| valid).unwrap_or_default(),
+            cpu_valid: Some(valid),
             memory_used,
             memory_total,
             load: load_average().unwrap_or_default(),
@@ -3104,6 +3106,7 @@ print(MPSSupportsMTLDevice(device) ? "metal mps" : "metal")"##;
         gpu,
         cpu_features,
         runtimes,
+        cpu_metrics: true,
         cpus: std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1),

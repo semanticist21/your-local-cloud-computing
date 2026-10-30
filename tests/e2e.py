@@ -346,6 +346,31 @@ def main():
             cli("tokens", "list", ok=False, token_file=laptop_token)
             second = start("worker", "--id", "second-worker", "--data-dir", str(base / "worker2"), token_file=second_token)
             until(lambda: any(w["id"] == "second-worker" and w["online"] for w in cli("workers")[0]))
+            # Disposable workers share a physical-host budget; real CPU work must stay serial.
+            configured, _ = cli("hosts", "set", "shared-test-host", "--workers", "test-worker,second-worker")
+            assert configured["max_jobs"] == 1 and configured["cpu_guard"] is None
+            cli("workers", "pause", "test-worker")
+            cli("workers", "resume", "test-worker")
+            cli("workers", "delete", "test-worker", ok=False)
+            burn_cpu = "import time\nend = time.monotonic() + 3\nwhile time.monotonic() < end: pass"
+            serial_a, _ = cli("run", "--no-input", *common, "--detach", "--", *python(burn_cpu))
+            until(lambda: state(serial_a)["state"] == "running")
+            serial_b, _ = cli("run", "--no-input", *common, "--detach", "--", *python(burn_cpu))
+            assert state(serial_b)["state"] == "queued" and state(serial_b)["worker_id"] is None
+            host = next(h for h in cli("hosts", "list")[0] if h["id"] == "shared-test-host")
+            assert host["occupied"] == 1 and host["available_slots"] == 0, host
+            cli("hosts", "delete", "shared-test-host", ok=False)
+            wait(serial_a)
+            wait(serial_b)
+            # Turning on CPU guarding with no observed recovery holds new work, not existing work.
+            cli("hosts", "set", "shared-test-host", "--workers", "test-worker,second-worker", "--metrics-worker", "test-worker")
+            guarded, _ = cli("run", "--no-input", *common, "--detach", "--", *noop)
+            assert state(guarded)["state"] == "queued" and "CPU" in state(guarded)["wait_reason"]
+            cli("hosts", "set", "shared-test-host", "--workers", "test-worker,second-worker")
+            wait(guarded)
+            cli("hosts", "delete", "shared-test-host")
+            assert all(not h["managed"] for h in cli("hosts", "list")[0])
+
             impostor = start("worker", "--id", "impostor", "--data-dir", str(base / "worker3"), token_file=second_token)
             until(lambda: any(e["action"] == "worker.rejected" and e["target"] == "impostor" for e in cli("audit")[0]))
             assert not any(w["id"] == "impostor" for w in cli("workers")[0])

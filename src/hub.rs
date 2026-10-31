@@ -229,7 +229,7 @@ impl Store {
                 .min(settings.capacity);
             store.save_worker(&worker)?;
         }
-        for mut job in store.jobs(None, None)? {
+        for mut job in store.unfinished_jobs()? {
             if active(&job.state) {
                 job.state = "unknown".into();
                 job.error = Some(
@@ -262,6 +262,9 @@ impl Store {
     }
     fn workers(&self) -> Result<Vec<WorkerInfo>> {
         self.rows("SELECT data FROM workers ORDER BY id")
+    }
+    fn unfinished_jobs(&self) -> Result<Vec<Job>> {
+        self.rows("SELECT data FROM jobs WHERE json_extract(data,'$.state') IN ('queued','assigned','waiting','running','cancelling','unknown') ORDER BY rowid")
     }
     fn jobs(&self, limit: Option<usize>, offset: Option<usize>) -> Result<Vec<Job>> {
         match (limit, offset) {
@@ -425,7 +428,7 @@ impl Store {
     /// Removes an environment with its revisions, worker statuses and preparation logs.
     /// Deleting a missing id succeeds so retries are idempotent; jobs that still use it block deletion.
     fn delete_environment(&mut self, id: &str) -> Result<(), ApiError> {
-        if self.jobs(None, None)?.iter().any(|job| {
+        if self.unfinished_jobs()?.iter().any(|job| {
             matches!(job.state.as_str(), "queued" | "assigned" | "waiting" | "running" | "cancelling")
                 && job.spec.environment.as_deref() == Some(id)
         }) {
@@ -914,7 +917,7 @@ impl Store {
     fn schedule(&mut self) -> Result<()> { self.schedule_at(now()) }
     fn schedule_at(&mut self, at: u64) -> Result<()> {
         let workers = self.workers()?;
-        let mut jobs = self.jobs(None, None)?;
+        let mut jobs = self.unfinished_jobs()?;
         // Stable ordering retains the database creation order for equal priorities.
         jobs.sort_by_key(|job| std::cmp::Reverse(job.spec.priority));
         for job in &mut jobs {
@@ -1247,7 +1250,7 @@ impl Store {
         settings.capacity = max_jobs;
         self.save_worker_settings(&id, &settings)?;
         let missing = if incremental {
-            self.jobs(None, None)?.into_iter()
+            self.unfinished_jobs()?.into_iter()
                 .filter(|job| job.worker_id.as_deref() == Some(&id) && active(&job.state))
                 .map(|job| (job.id, job.attempt_id)).collect()
         } else { BTreeSet::new() };
@@ -1281,7 +1284,7 @@ impl Store {
                 eprintln!("ignored worker reconciliation report: {error:#}");
             }
         }
-        for mut job in self.jobs(None, None)? {
+        for mut job in self.unfinished_jobs()? {
             if job.worker_id.as_deref() == Some(&id) && active(&job.state) {
                 if !incremental && !reported.contains(&(job.id.clone(), job.attempt_id.clone())) {
                     job.state = "unknown".into();
@@ -1506,7 +1509,7 @@ impl Store {
             info.last_seen = now();
             self.save_worker(&info)?;
         }
-        for mut job in self.jobs(None, None)? {
+        for mut job in self.unfinished_jobs()? {
             if job.worker_id.as_deref() == Some(worker) && active(&job.state) {
                 job.state = "unknown".into();
                 job.updated_at = now();
@@ -1916,7 +1919,7 @@ async fn delete_worker(
         return Err(ApiError(StatusCode::CONFLICT, "remove this worker from its host before deleting it".into()));
     }
     // Deleting a missing worker succeeds so retries are idempotent.
-    if guard.jobs(None, None).unwrap_or_default().into_iter().any(|job| {
+    if guard.unfinished_jobs().unwrap_or_default().into_iter().any(|job| {
         matches!(job.state.as_str(), "assigned" | "waiting" | "running") && job.worker_id.as_deref() == Some(&id)
     }) {
         return Err(invalid("worker has active jobs; drain it first"));
@@ -2567,6 +2570,46 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().into(), "test-token-long-enough".into()).unwrap();
         (dir, store)
+    }
+    #[test]
+    fn unfinished_jobs_keep_all_reservations_and_preserve_history_order() {
+        let (_dir, mut store) = test_store();
+        let (_session, _rx) = worker(&mut store, "one");
+        store.control_worker("one", WorkerControl { paused: Some(true), ..Default::default() }).unwrap();
+        let mut expected = Vec::new();
+        let mut history = Vec::new();
+        for state in ["succeeded", "queued", "assigned", "failed", "waiting", "running", "cancelling", "cancelled", "unknown"] {
+            let mut job = store.add_job(spec(), None).unwrap();
+            job.state = state.into();
+            store.save_job(&job).unwrap();
+            if state == "queued" || active(state) { expected.push(job.id.clone()); }
+            history.push(job.id);
+        }
+        assert_eq!(store.unfinished_jobs().unwrap().into_iter().map(|j| j.id).collect::<Vec<_>>(), expected);
+        assert_eq!(store.jobs(None, None).unwrap().into_iter().map(|j| j.id).collect::<Vec<_>>(), history);
+    }
+    #[test]
+    fn scheduling_and_reconciliation_do_not_decode_terminal_manifests() {
+        let (dir, mut store) = test_store();
+        let mut history = Vec::new();
+        for state in ["succeeded", "failed", "cancelled"] {
+            // A deliberately undecodable manifest proves exclusion happens before deserialization.
+            let data = serde_json::json!({"state": state, "spec": {"inputs": "not a manifest"}}).to_string();
+            store.db.execute("INSERT INTO jobs(id,data) VALUES(?1,?2)", params![state, data]).unwrap();
+            history.push(data);
+        }
+        assert!(store.jobs(None, None).is_err());
+        store.schedule().unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = store.connect("one".into(), caps(), 1, vec![], vec![], String::new(), tx, &pool_principal(), true).unwrap();
+        store.receive("one", session, WorkerMessage::Heartbeat).unwrap();
+        store.disconnect("one", session).unwrap();
+        drop(store);
+        let store = Store::open(dir.path().into(), "test-token-long-enough".into()).unwrap();
+        assert!(store.unfinished_jobs().unwrap().is_empty());
+        let mut statement = store.db.prepare("SELECT data FROM jobs ORDER BY rowid").unwrap();
+        let preserved = statement.query_map([], |r| r.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(preserved, history);
     }
     fn host_config(ids: &[&str], max_jobs: usize) -> HostConfig {
         HostConfig { workers: ids.iter().map(|id| id.to_string()).collect(), max_jobs, cpu_guard: None }

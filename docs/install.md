@@ -11,9 +11,9 @@ Use `--prefix /your/prefix` to change the install location. You can also downloa
 The binary installer installs the executable and license notices. Before using the example jobs, environment recipes, Compose/Quadlet files or agent installer in these docs, fetch the matching versioned support checkout outside your application project:
 
 ```bash
-export YLCC_SUPPORT_DIR="$HOME/.local/share/ylcc/support/v0.5.15"
+export YLCC_SUPPORT_DIR="$HOME/.local/share/ylcc/support/v0.5.16"
 mkdir -p "$(dirname "$YLCC_SUPPORT_DIR")"
-git clone --depth 1 --branch v0.5.15 \
+git clone --depth 1 --branch v0.5.16 \
   https://github.com/semanticist21/your-local-cloud-computing.git "$YLCC_SUPPORT_DIR"
 ```
 

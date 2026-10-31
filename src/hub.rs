@@ -110,6 +110,13 @@ struct WorkerSettings {
     max_jobs: Option<usize>,
     capacity: usize,
 }
+#[derive(Deserialize)]
+struct QueuedJob {
+    id: String,
+    state: String,
+    spec: JobSpec,
+    wait_reason: Option<String>,
+}
 
 fn identifier(value: &str) -> Result<()> {
     safe_relative(value)?;
@@ -229,16 +236,11 @@ impl Store {
                 .min(settings.capacity);
             store.save_worker(&worker)?;
         }
-        for mut job in store.unfinished_jobs()? {
-            if active(&job.state) {
-                job.state = "unknown".into();
-                job.error = Some(
-                    "hub restarted; awaiting worker reconciliation, no automatic retry".into(),
-                );
-                job.updated_at = now();
-                store.save_job(&job)?;
-            }
-        }
+        store.db.execute(
+            "UPDATE jobs SET data=json_set(data,'$.state','unknown','$.error',?1,'$.updated_at',?2)
+             WHERE json_extract(data,'$.state') IN ('assigned','waiting','running','cancelling','unknown')",
+            params!["hub restarted; awaiting worker reconciliation, no automatic retry", now() as i64],
+        )?;
         for mut status in store.statuses()? {
             if status.state == "preparing" {
                 status.state = "unknown".into();
@@ -263,8 +265,20 @@ impl Store {
     fn workers(&self) -> Result<Vec<WorkerInfo>> {
         self.rows("SELECT data FROM workers ORDER BY id")
     }
-    fn unfinished_jobs(&self) -> Result<Vec<Job>> {
-        self.rows("SELECT data FROM jobs WHERE json_extract(data,'$.state') IN ('queued','assigned','waiting','running','cancelling','unknown') ORDER BY rowid")
+    fn queued_jobs(&self) -> Result<Vec<QueuedJob>> {
+        self.rows("SELECT json_object('id',id,'state',json_extract(data,'$.state'),
+            'spec',json_remove(json_extract(data,'$.spec'),'$.inputs','$.outputs'),
+            'wait_reason',json_extract(data,'$.wait_reason'))
+            FROM jobs WHERE json_extract(data,'$.state')='queued' ORDER BY rowid")
+    }
+    fn worker_attempts(&self, worker: &str) -> Result<BTreeSet<(String, String)>> {
+        let mut statement = self.db.prepare(
+            "SELECT id,json_extract(data,'$.attempt_id') FROM jobs
+             WHERE json_extract(data,'$.state') IN ('assigned','waiting','running','cancelling','unknown')
+             AND json_extract(data,'$.worker_id')=?1 ORDER BY rowid"
+        )?;
+        let rows = statement.query_map([worker], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
     fn jobs(&self, limit: Option<usize>, offset: Option<usize>) -> Result<Vec<Job>> {
         match (limit, offset) {
@@ -428,10 +442,10 @@ impl Store {
     /// Removes an environment with its revisions, worker statuses and preparation logs.
     /// Deleting a missing id succeeds so retries are idempotent; jobs that still use it block deletion.
     fn delete_environment(&mut self, id: &str) -> Result<(), ApiError> {
-        if self.unfinished_jobs()?.iter().any(|job| {
-            matches!(job.state.as_str(), "queued" | "assigned" | "waiting" | "running" | "cancelling")
-                && job.spec.environment.as_deref() == Some(id)
-        }) {
+        if self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE json_extract(data,'$.state') IN ('queued','assigned','waiting','running','cancelling') AND json_extract(data,'$.spec.environment')=?1)",
+            [id], |r| r.get::<_, bool>(0),
+        ).map_err(anyhow::Error::from)? {
             return Err(invalid("environment is used by queued or active jobs; wait or cancel them first"));
         }
         let tx = self.db.transaction().map_err(anyhow::Error::from)?;
@@ -917,20 +931,19 @@ impl Store {
     fn schedule(&mut self) -> Result<()> { self.schedule_at(now()) }
     fn schedule_at(&mut self, at: u64) -> Result<()> {
         let workers = self.workers()?;
-        let mut jobs = self.unfinished_jobs()?;
+        let mut jobs = self.queued_jobs()?;
+        let mut counts = self.host_job_counts()?;
         // Stable ordering retains the database creation order for equal priorities.
         jobs.sort_by_key(|job| std::cmp::Reverse(job.spec.priority));
         for job in &mut jobs {
             if job.state == "queued" && self.cancel_requested(&job.id)? {
                 job.state = "cancelled".into();
-                job.updated_at = now();
-                self.save_job(job)?;
+                self.db.execute("UPDATE jobs SET data=json_set(data,'$.state','cancelled','$.updated_at',?2) WHERE id=?1", params![job.id, now() as i64])?;
             }
         }
         let mut hosts = self.host_infos(at)?;
         let mut statuses = self.statuses()?;
-        let worker_used = |id: &str, jobs: &[Job]| jobs.iter()
-            .filter(|j| j.worker_id.as_deref() == Some(id) && active(&j.state)).count();
+        let worker_used = |id: &str, counts: &HashMap<String, usize>| counts.get(id).copied().unwrap_or_default();
         let host_index = |id: &str, hosts: &[HostInfo]| hosts.iter().position(|h| h.config.workers.iter().any(|w| w == id)).expect("every worker has a host");
         // Explicit and previously queued preparations share the same host admission budget.
         let mut pending: Vec<_> = statuses.iter().filter(|s| s.state == "pending" && workers.iter().any(|w| w.id == s.worker_id)).cloned().collect();
@@ -945,7 +958,7 @@ impl Store {
             if !worker.online || worker.paused || worker.updating.is_some()
                 || self.sessions.get(&worker.id).is_none_or(|s| s.reconciling)
                 || !hosts[index].schedulable || hosts[index].available_slots == 0
-                || worker_used(&worker.id, &jobs) > 0
+                || worker_used(&worker.id, &counts) > 0
                 || statuses.iter().any(|s| s.worker_id == worker.id && matches!(s.state.as_str(), "preparing" | "unknown")) {
                 continue;
             }
@@ -970,8 +983,8 @@ impl Store {
                 let ah = &hosts[host_index(&a.id, &hosts)];
                 let bh = &hosts[host_index(&b.id, &hosts)];
                 host_score(ah).total_cmp(&host_score(bh))
-                    .then_with(|| (worker_used(&a.id, &jobs) as f64 / a.max_jobs as f64)
-                        .total_cmp(&(worker_used(&b.id, &jobs) as f64 / b.max_jobs as f64)))
+                    .then_with(|| (worker_used(&a.id, &counts) as f64 / a.max_jobs as f64)
+                        .total_cmp(&(worker_used(&b.id, &counts) as f64 / b.max_jobs as f64)))
                     .then_with(|| a.id.cmp(&b.id))
             });
             let mut reason = "Waiting for a compatible online worker".to_string();
@@ -981,7 +994,7 @@ impl Store {
                     reason = blocked.clone();
                     continue;
                 }
-                let used = worker_used(&worker.id, &jobs);
+                let used = worker_used(&worker.id, &counts);
                 if hosts[index].available_slots == 0 || used >= worker.max_jobs {
                     reason = "Waiting for host or worker concurrency slots".into();
                     continue;
@@ -1010,31 +1023,33 @@ impl Store {
                         }
                     }
                 }
-                let job = &mut jobs[job_index];
+                let queued = &mut jobs[job_index];
+                let mut job = self.job(&queued.id)?.context("queued job disappeared")?;
                 job.state = "waiting".into();
                 job.wait_reason = Some("Waiting for worker admission".into());
                 job.worker_id = Some(worker.id.clone());
                 job.updated_at = now();
-                self.save_job(job)?;
+                self.save_job(&job)?;
+                queued.state = job.state.clone();
                 // A lost delivery remains an unknown attempt; never retry it on another host.
-                if self.sessions[&worker.id].tx.send(HubMessage::Run {
-                    job: Box::new(job.clone()), environment: environment.clone(),
-                }).is_err() {
+                if let Err(mpsc::error::SendError(HubMessage::Run { mut job, .. })) = self.sessions[&worker.id].tx.send(HubMessage::Run {
+                    job: Box::new(job), environment: environment.clone(),
+                }) {
                     job.state = "unknown".into();
                     job.error = Some("worker connection lost during assignment".into());
-                    self.save_job(job)?;
+                    self.save_job(&job)?;
                 }
+                *counts.entry(worker.id.clone()).or_default() += 1;
                 reserve_host(&mut hosts[index]);
                 break;
             }
             let job = &mut jobs[job_index];
             if job.state == "queued" && job.wait_reason.as_deref() != Some(&reason) {
-                job.wait_reason = Some(reason);
-                self.save_job(job)?;
+                self.db.execute("UPDATE jobs SET data=json_set(data,'$.wait_reason',?2) WHERE id=?1", params![job.id, reason])?;
             }
         }
         // Failed setup is actionable; only an explicit prepare call can retry that revision.
-        for mut job in jobs.into_iter().filter(|job| job.state == "queued") {
+        for job in jobs.into_iter().filter(|job| job.state == "queued") {
             let Some(environment) = self.job_environment(&job.id)? else {
                 continue;
             };
@@ -1050,13 +1065,11 @@ impl Store {
                         .is_some_and(|s| s.state == "failed")
                 })
             {
-                job.state = "failed".into();
-                job.error = Some(format!(
+                let error = format!(
                     "environment {} revision {} preparation failed; inspect status and explicitly prepare to retry",
                     environment.id, environment.revision
-                ));
-                job.updated_at = now();
-                self.save_job(&job)?;
+                );
+                self.db.execute("UPDATE jobs SET data=json_set(data,'$.state','failed','$.error',?2,'$.updated_at',?3) WHERE id=?1", params![job.id, error, now() as i64])?;
             }
         }
         Ok(())
@@ -1112,67 +1125,62 @@ impl Store {
         }
         Ok(job)
     }
+    fn assignment_state(&self, worker: &str, job_id: &str, attempt: &str) -> Result<Option<String>> {
+        Ok(self.db.query_row(
+            "SELECT json_extract(data,'$.state') FROM jobs WHERE id=?1 AND json_extract(data,'$.worker_id')=?2 AND json_extract(data,'$.attempt_id')=?3",
+            params![job_id, worker, attempt], |r| r.get(0),
+        ).optional()?)
+    }
     fn report(&mut self, worker: &str, report: AttemptReport) -> Result<()> {
-        let mut job = self.assigned(worker, &report.job_id, &report.attempt_id)?;
-        if terminal(&job.state) {
+        let state = self.assignment_state(worker, &report.job_id, &report.attempt_id)?.context("worker/attempt does not own job")?;
+        if terminal(&state) {
             return Ok(());
         }
-        if !active(&job.state) {
+        if !active(&state) {
             bail!("job is not assigned")
         }
         if report.state == "unknown" {
-            job.state = "unknown".into();
-            job.error = report.error.or_else(|| {
-                Some("worker cannot establish the attempt outcome; no automatic retry".into())
-            });
+            let error = report.error.unwrap_or_else(|| "worker cannot establish the attempt outcome; no automatic retry".into());
+            self.db.execute("UPDATE jobs SET data=json_set(data,'$.state','unknown','$.error',?2,'$.updated_at',?3) WHERE id=?1",
+                params![report.job_id, error, now() as i64])?;
         } else if matches!(report.state.as_str(), "running" | "assigned" | "cancelling") {
-            job.state = if self.cancel_requested(&job.id)? {
-                "cancelling"
-            } else if report.state == "assigned" {
-                "waiting"
-            } else {
-                "running"
-            }
-            .into();
-            job.error = None;
-            if job.state == "running" { job.wait_reason = None; }
+            let state = if self.cancel_requested(&report.job_id)? { "cancelling" }
+                else if report.state == "assigned" { "waiting" } else { "running" };
+            self.db.execute("UPDATE jobs SET data=json_set(data,'$.state',?2,'$.error',NULL,'$.wait_reason',CASE WHEN ?2='running' THEN NULL ELSE json_extract(data,'$.wait_reason') END,'$.updated_at',?3) WHERE id=?1",
+                params![report.job_id, state, now() as i64])?;
         } else if terminal(&report.state) {
-            job.state = report.state;
-            job.wait_reason = None;
-            job.exit_code = report.exit_code;
-            job.error = report.error;
-            if job.state == "succeeded" && job.exit_code != Some(0) {
-                job.state = "failed".into();
-                job.error = Some("worker reported success without exit code 0".into());
+            let mut state = report.state;
+            let mut error = report.error;
+            let mut results = report.results;
+            if state == "succeeded" && report.exit_code != Some(0) {
+                state = "failed".into();
+                error = Some("worker reported success without exit code 0".into());
             }
-            match self.validate_files(&report.results) {
+            match self.validate_files(&results) {
                 Ok(()) => {
-                    if report.results.iter().all(|file| {
-                        job.spec.outputs.iter().any(|output| {
-                            file.path == *output || file.path.starts_with(&format!("{output}/"))
-                        })
-                    }) {
-                        job.results = report.results;
-                    } else {
-                        job.state = "failed".into();
-                        job.error =
-                            Some("worker returned a result outside declared outputs".into());
-                        job.results.clear();
+                    let outputs: Vec<String> = self.one("SELECT COALESCE(json_extract(data,'$.spec.outputs'),'[]') FROM jobs WHERE id=?1", &report.job_id)?.context("unknown job")?;
+                    if !results.iter().all(|file| outputs.iter().any(|output| {
+                        file.path == *output || file.path.starts_with(&format!("{output}/"))
+                    })) {
+                        state = "failed".into();
+                        error = Some("worker returned a result outside declared outputs".into());
+                        results.clear();
                     }
                 }
-                Err(error) => {
-                    job.state = "failed".into();
-                    job.error = Some(format!("invalid result manifest: {error:#}"));
-                    job.results.clear();
+                Err(invalid) => {
+                    state = "failed".into();
+                    error = Some(format!("invalid result manifest: {invalid:#}"));
+                    results.clear();
                 }
             }
+            self.db.execute("UPDATE jobs SET data=json_set(data,'$.state',?2,'$.wait_reason',NULL,'$.exit_code',?3,'$.error',?4,'$.results',json(?5),'$.updated_at',?6) WHERE id=?1",
+                params![report.job_id, state, report.exit_code, error, encode(&results)?, now() as i64])?;
         } else {
             bail!("unsupported attempt report state")
         }
-        job.updated_at = now();
-        self.save_job(&job)?;
         Ok(())
     }
+
     fn receive_status(&mut self, worker: &str, status: EnvironmentStatus) -> Result<()> {
         if status.worker_id != worker {
             bail!("environment status belongs to a different worker")
@@ -1250,9 +1258,7 @@ impl Store {
         settings.capacity = max_jobs;
         self.save_worker_settings(&id, &settings)?;
         let missing = if incremental {
-            self.unfinished_jobs()?.into_iter()
-                .filter(|job| job.worker_id.as_deref() == Some(&id) && active(&job.state))
-                .map(|job| (job.id, job.attempt_id)).collect()
+            self.worker_attempts(&id)?
         } else { BTreeSet::new() };
         self.sessions.insert(
             id.clone(),
@@ -1284,23 +1290,15 @@ impl Store {
                 eprintln!("ignored worker reconciliation report: {error:#}");
             }
         }
-        for mut job in self.unfinished_jobs()? {
-            if job.worker_id.as_deref() == Some(&id) && active(&job.state) {
-                if !incremental && !reported.contains(&(job.id.clone(), job.attempt_id.clone())) {
-                    job.state = "unknown".into();
-                    job.updated_at = now();
-                    job.error = Some(
-                        "worker did not report this attempt; cancel explicitly before retrying"
-                            .into(),
-                    );
-                    self.save_job(&job)?;
-                }
-                if self.cancel_requested(&job.id)? {
-                    let _ = self.sessions[&id].tx.send(HubMessage::Cancel {
-                        job_id: job.id.clone(),
-                        attempt_id: job.attempt_id.clone(),
-                    });
-                }
+        for (job_id, attempt_id) in self.worker_attempts(&id)? {
+            if !incremental && !reported.contains(&(job_id.clone(), attempt_id.clone())) {
+                self.db.execute(
+                    "UPDATE jobs SET data=json_set(data,'$.state','unknown','$.error',?2,'$.updated_at',?3) WHERE id=?1",
+                    params![job_id, "worker did not report this attempt; cancel explicitly before retrying", now() as i64],
+                )?;
+            }
+            if self.cancel_requested(&job_id)? {
+                let _ = self.sessions[&id].tx.send(HubMessage::Cancel { job_id, attempt_id });
             }
         }
         for status in environments { self.reconcile_status(&id, status)?; }
@@ -1340,7 +1338,7 @@ impl Store {
             WorkerMessage::Metadata { .. } => bail!("nested metadata is not allowed"),
             WorkerMessage::Inventory { job_id, attempt_id, state: reported_state } => {
                 if matches!(reported_state.as_str(), "assigned" | "waiting" | "running" | "cancelling" | "unknown")
-                    && self.assigned(worker, &job_id, &attempt_id).is_ok() {
+                    && self.assignment_state(worker, &job_id, &attempt_id)?.is_some() {
                     self.report(worker, AttemptReport { job_id: job_id.clone(), attempt_id: attempt_id.clone(), state: reported_state, exit_code: None, error: None, results: vec![] })?;
                 }
                 let (done, discard) = if let Some(environment) = job_id.strip_prefix("environment:") {
@@ -1350,8 +1348,8 @@ impl Store {
                     anyhow::ensure!(attempt_id == format!("environment:{worker}:{id}:{revision}"), "environment log ownership mismatch");
                     (false, self.environment_revision(id, revision)?.is_none())
                 } else {
-                    match self.job(&job_id)? {
-                        Some(job) if job.worker_id.as_deref() == Some(worker) && job.attempt_id == attempt_id => (terminal(&job.state), false),
+                    match self.assignment_state(worker, &job_id, &attempt_id)? {
+                        Some(state) => (terminal(&state), false),
                         _ => (true, true), // Locally retained history may outlive an explicit Hub deletion/retry.
                     }
                 };
@@ -1375,44 +1373,33 @@ impl Store {
                 let missing = std::mem::take(&mut session.missing);
                 session.tx.send(HubMessage::Ready)?;
                 for (id, attempt) in missing {
-                    let mut job = self.assigned(worker, &id, &attempt)?;
-                    if active(&job.state) {
-                        job.state = "unknown".into();
-                        job.error = Some("worker did not report this attempt; cancel explicitly before retrying".into());
-                        job.updated_at = now();
-                        self.save_job(&job)?;
+                    let state = self.assignment_state(worker, &id, &attempt)?.context("worker/attempt does not own job")?;
+                    if active(&state) {
+                        self.db.execute("UPDATE jobs SET data=json_set(data,'$.state','unknown','$.error',?2,'$.updated_at',?3) WHERE id=?1",
+                            params![id, "worker did not report this attempt; cancel explicitly before retrying", now() as i64])?;
                     }
                 }
             }
             WorkerMessage::Started { job_id, attempt_id } => {
-                let mut job = self.assigned(worker, &job_id, &attempt_id)?;
-                if active(&job.state) {
-                    job.state = if self.cancel_requested(&job.id)? {
+                let state = self.assignment_state(worker, &job_id, &attempt_id)?.context("worker/attempt does not own job")?;
+                if active(&state) {
+                    let state = if self.cancel_requested(&job_id)? {
                         "cancelling"
                     } else {
                         "running"
-                    }
-                    .into();
-                    job.error = None;
-                    job.wait_reason = None;
-                    job.updated_at = now();
-                    job.started_at = Some(now());
-                    job.last_output_at = None;
-                    self.save_job(&job)?;
+                    };
+                    self.db.execute("UPDATE jobs SET data=json_set(data,'$.state',?2,'$.error',NULL,'$.wait_reason',NULL,'$.updated_at',?3,'$.started_at',?3,'$.last_output_at',NULL) WHERE id=?1",
+                        params![job_id, state, now() as i64])?;
                 }
             }
             WorkerMessage::Waiting { job_id, attempt_id, reason } => {
                 anyhow::ensure!(reason.len() <= 128, "waiting reason is too long");
-                let mut job = self.assigned(worker, &job_id, &attempt_id)?;
-                if matches!(job.state.as_str(), "assigned" | "waiting") && job.started_at.is_none() {
-                    job.state = "waiting".into();
-                    job.wait_reason = Some(reason);
-                    job.updated_at = now();
-                    self.save_job(&job)?;
-                }
+                self.assignment_state(worker, &job_id, &attempt_id)?.context("worker/attempt does not own job")?;
+                self.db.execute("UPDATE jobs SET data=json_set(data,'$.state','waiting','$.wait_reason',?2,'$.updated_at',?3) WHERE id=?1 AND json_extract(data,'$.state') IN ('assigned','waiting') AND json_extract(data,'$.started_at') IS NULL",
+                    params![job_id, reason, now() as i64])?;
             }
             WorkerMessage::Log { entry } => {
-                let job = if let Some(environment) = entry.job_id.strip_prefix("environment:") {
+                let is_job = if let Some(environment) = entry.job_id.strip_prefix("environment:") {
                     let (id, revision) = environment
                         .split_once(':')
                         .context("invalid environment log ID")?;
@@ -1433,9 +1420,10 @@ impl Store {
                     if entry.attempt_id != stable && Uuid::parse_str(&entry.attempt_id).is_err() {
                         bail!("invalid preparation log attempt")
                     }
-                    None
+                    false
                 } else {
-                    Some(self.assigned(worker, &entry.job_id, &entry.attempt_id)?)
+                    self.assignment_state(worker, &entry.job_id, &entry.attempt_id)?.context("worker/attempt does not own job")?;
+                    true
                 };
                 if entry.seq > i64::MAX as u64
                     || !matches!(entry.stream.as_str(), "stdout" | "stderr" | "system")
@@ -1453,14 +1441,10 @@ impl Store {
                     ],
                 )? == 1;
                 // Throttled so streaming output does not rewrite the job on every chunk; replays are skipped.
-                if let Some(mut job) = job.filter(|job| {
-                    inserted
-                        && entry.stream != "system"
-                        && active(&job.state)
-                        && job.last_output_at.is_none_or(|at| now() >= at + 5)
-                }) {
-                    job.last_output_at = Some(now());
-                    self.save_job(&job)?;
+                if is_job && inserted && entry.stream != "system" {
+                    let at = now();
+                    self.db.execute("UPDATE jobs SET data=json_set(data,'$.last_output_at',?2) WHERE id=?1 AND json_extract(data,'$.state') IN ('assigned','waiting','running','cancelling','unknown') AND (json_extract(data,'$.last_output_at') IS NULL OR json_extract(data,'$.last_output_at')<=?3)",
+                        params![entry.job_id, at as i64, at.saturating_sub(5) as i64])?;
                 }
             }
             WorkerMessage::Finished { report } => self.report(worker, report)?,
@@ -1509,15 +1493,11 @@ impl Store {
             info.last_seen = now();
             self.save_worker(&info)?;
         }
-        for mut job in self.unfinished_jobs()? {
-            if job.worker_id.as_deref() == Some(worker) && active(&job.state) {
-                job.state = "unknown".into();
-                job.updated_at = now();
-                job.error =
-                    Some("worker disconnected; awaiting reconciliation, no automatic retry".into());
-                self.save_job(&job)?;
-            }
-        }
+        self.db.execute(
+            "UPDATE jobs SET data=json_set(data,'$.state','unknown','$.error',?2,'$.updated_at',?3)
+             WHERE json_extract(data,'$.worker_id')=?1 AND json_extract(data,'$.state') IN ('assigned','waiting','running','cancelling','unknown')",
+            params![worker, "worker disconnected; awaiting reconciliation, no automatic retry", now() as i64],
+        )?;
         for mut status in self.statuses()? {
             if status.worker_id == worker && status.state == "preparing" {
                 status.state = "unknown".into();
@@ -1919,9 +1899,10 @@ async fn delete_worker(
         return Err(ApiError(StatusCode::CONFLICT, "remove this worker from its host before deleting it".into()));
     }
     // Deleting a missing worker succeeds so retries are idempotent.
-    if guard.unfinished_jobs().unwrap_or_default().into_iter().any(|job| {
-        matches!(job.state.as_str(), "assigned" | "waiting" | "running") && job.worker_id.as_deref() == Some(&id)
-    }) {
+    if guard.db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM jobs WHERE json_extract(data,'$.state') IN ('assigned','waiting','running') AND json_extract(data,'$.worker_id')=?1)",
+        [&id], |r| r.get::<_, bool>(0),
+    ).map_err(anyhow::Error::from)? {
         return Err(invalid("worker has active jobs; drain it first"));
     }
     guard.delete_worker(&id)?;
@@ -2068,7 +2049,7 @@ async fn logs(
     Query(query): Query<LogQuery>,
 ) -> ApiResult<Json<Vec<LogEntry>>> {
     let store = lock(&state)?;
-    if store.job(&id)?.is_none() {
+    if !store.db.query_row("SELECT EXISTS(SELECT 1 FROM jobs WHERE id=?1)", [&id], |r| r.get::<_, bool>(0)).map_err(anyhow::Error::from)? {
         return Err(missing("job"));
     }
     let mut statement = store
@@ -2572,20 +2553,28 @@ mod tests {
         (dir, store)
     }
     #[test]
-    fn unfinished_jobs_keep_all_reservations_and_preserve_history_order() {
+    fn metadata_queries_keep_queue_order_and_all_active_reservations() {
         let (_dir, mut store) = test_store();
         let (_session, _rx) = worker(&mut store, "one");
         store.control_worker("one", WorkerControl { paused: Some(true), ..Default::default() }).unwrap();
-        let mut expected = Vec::new();
+        let mut queued = Vec::new();
+        let mut attempts = BTreeSet::new();
         let mut history = Vec::new();
-        for state in ["succeeded", "queued", "assigned", "failed", "waiting", "running", "cancelling", "cancelled", "unknown"] {
+        for state in ["succeeded", "queued", "assigned", "failed", "queued", "waiting", "running", "cancelling", "cancelled", "unknown"] {
             let mut job = store.add_job(spec(), None).unwrap();
             job.state = state.into();
+            if active(state) {
+                job.worker_id = Some("one".into());
+                attempts.insert((job.id.clone(), job.attempt_id.clone()));
+            }
             store.save_job(&job).unwrap();
-            if state == "queued" || active(state) { expected.push(job.id.clone()); }
+            if state == "queued" { queued.push(job.id.clone()); }
             history.push(job.id);
         }
-        assert_eq!(store.unfinished_jobs().unwrap().into_iter().map(|j| j.id).collect::<Vec<_>>(), expected);
+        assert_eq!(store.queued_jobs().unwrap().into_iter().map(|j| j.id).collect::<Vec<_>>(), queued);
+        assert_eq!(store.worker_attempts("one").unwrap(), attempts);
+        assert!(store.worker_attempts("other").unwrap().is_empty());
+        assert_eq!(store.host_job_counts().unwrap()["one"], attempts.len());
         assert_eq!(store.jobs(None, None).unwrap().into_iter().map(|j| j.id).collect::<Vec<_>>(), history);
     }
     #[test]
@@ -2606,10 +2595,77 @@ mod tests {
         store.disconnect("one", session).unwrap();
         drop(store);
         let store = Store::open(dir.path().into(), "test-token-long-enough".into()).unwrap();
-        assert!(store.unfinished_jobs().unwrap().is_empty());
+        assert!(store.queued_jobs().unwrap().is_empty());
+        assert!(store.worker_attempts("one").unwrap().is_empty());
         let mut statement = store.db.prepare("SELECT data FROM jobs ORDER BY rowid").unwrap();
         let preserved = statement.query_map([], |r| r.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
         assert_eq!(preserved, history);
+    }
+    #[test]
+    fn scheduling_projects_manifests_but_delivers_and_preserves_the_full_job() {
+        let (_dir, mut store) = test_store();
+        let (_session, mut rx) = worker(&mut store, "one");
+        store.control_worker("one", WorkerControl { paused: Some(true), ..Default::default() }).unwrap();
+        let mut job = store.add_job(spec(), None).unwrap();
+        job.spec.inputs = (0..10_000).map(|i| FileEntry { path: format!("input/{i}"), hash: "a".repeat(64), size: 1, mode: 0o644 }).collect();
+        job.spec.outputs = (0..10_000).map(|i| format!("output/{i}")).collect();
+        job.results = job.spec.inputs[..1].to_vec();
+        job.wait_reason = None;
+        store.save_job(&job).unwrap();
+        store.schedule().unwrap();
+        let projection = store.queued_jobs().unwrap().remove(0);
+        assert!(projection.spec.inputs.is_empty() && projection.spec.outputs.is_empty());
+        assert!(encode(&projection.spec).unwrap().len() < 1024);
+        assert_eq!(encode(&store.job(&job.id).unwrap().unwrap().spec).unwrap(), encode(&job.spec).unwrap());
+        let mut cancelled = store.add_job(spec(), None).unwrap();
+        cancelled.spec = job.spec.clone();
+        store.save_job(&cancelled).unwrap();
+        store.db.execute("UPDATE jobs SET cancel_requested=1 WHERE id=?1", [&cancelled.id]).unwrap();
+        store.schedule().unwrap();
+        let cancelled = store.job(&cancelled.id).unwrap().unwrap();
+        assert_eq!(cancelled.state, "cancelled");
+        assert_eq!(encode(&cancelled.spec).unwrap(), encode(&job.spec).unwrap());
+        store.control_worker("one", WorkerControl { paused: Some(false), ..Default::default() }).unwrap();
+        let HubMessage::Run { job: delivered, .. } = rx.try_recv().unwrap() else { panic!("expected assignment") };
+        assert_eq!(encode(&delivered.spec).unwrap(), encode(&job.spec).unwrap());
+        assert_eq!(encode(&delivered.results).unwrap(), encode(&job.results).unwrap());
+        assert_eq!(encode(&store.job(&job.id).unwrap().unwrap().spec).unwrap(), encode(&job.spec).unwrap());
+    }
+    #[tokio::test]
+    async fn ownership_and_reconciliation_leave_opaque_manifests_untouched() {
+        let (dir, mut store) = test_store();
+        let (session, _rx) = worker(&mut store, "one");
+        let job = store.add_job(spec(), None).unwrap();
+        store.db.execute("UPDATE jobs SET data=json_set(data,'$.spec.inputs','opaque inputs','$.spec.outputs','opaque outputs','$.results','opaque results') WHERE id=?1", [&job.id]).unwrap();
+        assert!(store.job(&job.id).is_err());
+        assert!(store.assignment_state("other", &job.id, &job.attempt_id).unwrap().is_none());
+        assert!(store.assignment_state("one", &job.id, "other-attempt").unwrap().is_none());
+        store.receive("one", session, WorkerMessage::Waiting { job_id: job.id.clone(), attempt_id: job.attempt_id.clone(), reason: "admission".into() }).unwrap();
+        store.receive("one", session, WorkerMessage::Started { job_id: job.id.clone(), attempt_id: job.attempt_id.clone() }).unwrap();
+        store.receive("one", session, WorkerMessage::Log { entry: LogEntry { job_id: job.id.clone(), attempt_id: job.attempt_id.clone(), seq: 1, stream: "stdout".into(), text: "output".into() } }).unwrap();
+        for state in ["assigned", "running", "unknown"] {
+            store.report("one", AttemptReport { job_id: job.id.clone(), attempt_id: job.attempt_id.clone(), state: state.into(), exit_code: None, error: None, results: vec![] }).unwrap();
+        }
+        store.schedule().unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = store.connect("one".into(), caps(), 1, vec![], vec![], String::new(), tx, &pool_principal(), true).unwrap();
+        store.receive("one", session, WorkerMessage::Ready).unwrap();
+        store.disconnect("one", session).unwrap();
+        drop(store);
+        let mut store = Store::open(dir.path().into(), "test-token-long-enough".into()).unwrap();
+        assert_eq!(store.assignment_state("one", &job.id, &job.attempt_id).unwrap().as_deref(), Some("unknown"));
+        store.db.execute("UPDATE jobs SET data=json_set(data,'$.state','succeeded') WHERE id=?1", [&job.id]).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = store.connect("one".into(), caps(), 1, vec![], vec![], String::new(), tx, &pool_principal(), true).unwrap();
+        store.receive("one", session, WorkerMessage::Inventory { job_id: job.id.clone(), attempt_id: job.attempt_id.clone(), state: "running".into() }).unwrap();
+        let data: String = store.db.query_row("SELECT data FROM jobs WHERE id=?1", [&job.id], |r| r.get(0)).unwrap();
+        let data: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(data["spec"]["inputs"], "opaque inputs");
+        assert_eq!(data["spec"]["outputs"], "opaque outputs");
+        assert_eq!(data["results"], "opaque results");
+        assert!(data["last_output_at"].as_u64().is_some());
+        let Json(entries) = logs(State(Arc::new(Mutex::new(store))), Path(job.id), Query(LogQuery { after: 0 })).await.unwrap();
+        assert_eq!(entries.len(), 1);
     }
     fn host_config(ids: &[&str], max_jobs: usize) -> HostConfig {
         HostConfig { workers: ids.iter().map(|id| id.to_string()).collect(), max_jobs, cpu_guard: None }

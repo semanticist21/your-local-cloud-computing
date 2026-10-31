@@ -11,9 +11,9 @@
 바이너리 설치 스크립트는 실행 파일과 라이선스 고지만 설치합니다. 이 문서들에 나오는 예제 잡, 환경 레시피, Compose/Quadlet 파일, 에이전트 설치 스크립트를 쓰기 전에, 버전이 맞는 지원 체크아웃을 애플리케이션 프로젝트 바깥에 받아 두세요.
 
 ```bash
-export YLCC_SUPPORT_DIR="$HOME/.local/share/ylcc/support/v0.5.16"
+export YLCC_SUPPORT_DIR="$HOME/.local/share/ylcc/support/v0.5.17"
 mkdir -p "$(dirname "$YLCC_SUPPORT_DIR")"
-git clone --depth 1 --branch v0.5.16 \
+git clone --depth 1 --branch v0.5.17 \
   https://github.com/semanticist21/your-local-cloud-computing.git "$YLCC_SUPPORT_DIR"
 ```
 

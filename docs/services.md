@@ -49,7 +49,7 @@ Paused workers have an admin-only **Resume** button in the list and detail page.
 
 ```bash
 ylcc workers update --all                      # newest published release, one worker at a time
-ylcc workers update mac-build --version v0.5.16
+ylcc workers update mac-build --version v0.5.17
 ```
 
 The CLI uses the same Hub-managed assignment hold on current Hubs, without changing the worker's saved pause setting. On older Hubs it temporarily pauses and then resumes workers that were initially running; keep that CLI connected until it finishes. Each worker finishes its running jobs, downloads the release archive for its OS/architecture, checks it against the release's `SHA256SUMS` and the new binary's `--version`, swaps it in place of its own executable and exits with status 75. systemd (`Restart=on-failure`), launchd (`KeepAlive`) and the Windows task runner restart it on the new binary. The command moves to the next worker, stopping at the first failure. The executable's directory must be writable by the worker account, so install the worker binary under that account (for example `~/.local/bin`), not in a root-owned directory. On macOS, correct ownership alone does not grant external-volume privacy access; see the Full Disk Access steps above. Container workers are skipped: recreate them from the new release image. Update the Hub first with `ylcc update --apply` on its host; `workers` shows each worker's `version`.

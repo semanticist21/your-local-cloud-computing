@@ -78,7 +78,7 @@ fn occupied(worker: &str, jobs: &HashMap<String, usize>, statuses: &[Environment
 }
 
 impl Store {
-    fn host_job_counts(&self) -> Result<HashMap<String, usize>> {
+    pub(super) fn host_job_counts(&self) -> Result<HashMap<String, usize>> {
         let mut statement = self.db.prepare(
             "SELECT json_extract(data,'$.worker_id'), COUNT(*) FROM jobs
              WHERE json_extract(data,'$.state') IN ('assigned','waiting','running','cancelling','unknown')

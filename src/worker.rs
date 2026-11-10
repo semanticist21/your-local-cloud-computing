@@ -513,7 +513,7 @@ async fn connection(state: Arc<State>) -> Result<()> {
         .insert("Authorization", format!("Bearer {}", state.token).parse()?);
     let events = state.events.subscribe();
     request.headers_mut().insert(METADATA_LIMIT_HEADER, state.limits.metadata.to_string().parse()?);
-    let health = hub_health(&state).await;
+    let health = hub_health(&state).await.context("read Hub health")?;
     let capabilities: Vec<String> = serde_json::from_value(health["capabilities"].clone()).unwrap_or_default();
     let peer_metadata = health["transfer_limits"]["metadata"].as_u64()
         .and_then(|bytes| usize::try_from(bytes).ok()).filter(|bytes| *bytes > 0 && *bytes <= isize::MAX as usize)
@@ -852,12 +852,13 @@ async fn replay_attempt(state: &State, attempt: &Attempt, tx: &tokio::sync::mpsc
     Ok(true)
 }
 
-async fn hub_health(state: &State) -> serde_json::Value {
-    let health = async {
-        let response = state.client.get(format!("{}/health", state.hub)).send().await?;
-        response.error_for_status()?.json::<serde_json::Value>().await
-    };
-    health.await.unwrap_or_default()
+async fn hub_health(state: &State) -> Result<serde_json::Value> {
+    let health = state.client.get(format!("{}/health", state.hub))
+        .timeout(Duration::from_secs(20))
+        .send().await?
+        .error_for_status()?
+        .json().await?;
+    Ok(health)
 }
 
 /// CPU usage is the change in cumulative ticks between two samples.
@@ -3620,6 +3621,60 @@ mod tests {
         metrics: false,
         })
     }
+    #[tokio::test]
+    async fn worker_sends_metrics_after_transient_hub_health_failure() {
+        use axum::{
+            extract::ws::{Message, WebSocketUpgrade}, http::StatusCode,
+            response::IntoResponse, routing::get,
+        };
+
+        let first_request = Arc::new(AtomicBool::new(true));
+        let metrics_received = Arc::new(tokio::sync::Notify::new());
+        let app = axum::Router::new()
+            .route("/health", get(move || {
+                let first_request = first_request.clone();
+                async move {
+                    if first_request.swap(false, Ordering::Relaxed) {
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    }
+                    axum::Json(serde_json::json!({"capabilities": ["worker_metrics"]})).into_response()
+                }
+            }))
+            .route("/v1/worker/ws", get({
+                let metrics_received = metrics_received.clone();
+                move |ws: WebSocketUpgrade| {
+                    let metrics_received = metrics_received.clone();
+                    async move {
+                        ws.on_upgrade(move |mut socket| async move {
+                            let _hello = socket.recv().await;
+                            if let Some(Ok(Message::Text(text))) = socket.recv().await {
+                                if matches!(serde_json::from_str::<WorkerMessage>(&text).unwrap(), WorkerMessage::Metrics { .. }) {
+                                    metrics_received.notify_one();
+                                }
+                            }
+                        })
+                    }
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = state_at(dir.path());
+        let config = Arc::get_mut(&mut state).unwrap();
+        config.hub = format!("http://{}", listener.local_addr().unwrap());
+        config.metrics = true;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let error = tokio::time::timeout(Duration::from_secs(5), connection(state.clone()))
+            .await.unwrap().unwrap_err();
+        assert!(format!("{error:#}").contains("503"), "{error:#}");
+
+        let worker = tokio::spawn(connection(state));
+        tokio::time::timeout(Duration::from_secs(30), metrics_received.notified())
+            .await.expect("worker should send metrics on the next connection");
+        worker.abort();
+        server.abort();
+    }
+
     #[tokio::test]
     async fn log_tail_preserves_gaps_and_retries_an_incomplete_append() {
         let dir = tempfile::tempdir().unwrap();

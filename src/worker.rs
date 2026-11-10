@@ -513,13 +513,17 @@ async fn connection(state: Arc<State>) -> Result<()> {
         .insert("Authorization", format!("Bearer {}", state.token).parse()?);
     let events = state.events.subscribe();
     request.headers_mut().insert(METADATA_LIMIT_HEADER, state.limits.metadata.to_string().parse()?);
-    let health = hub_health(&state).await.context("read Hub health")?;
-    let capabilities: Vec<String> = serde_json::from_value(health["capabilities"].clone()).unwrap_or_default();
+    let health = hub_health(&state).await;
+    let mut retry_metrics = state.metrics && health.is_err();
+    let health = health.unwrap_or_else(|error| {
+        eprintln!("read Hub health: {error:#}; connecting with legacy defaults");
+        serde_json::Value::Null
+    });
     let peer_metadata = health["transfer_limits"]["metadata"].as_u64()
         .and_then(|bytes| usize::try_from(bytes).ok()).filter(|bytes| *bytes > 0 && *bytes <= isize::MAX as usize)
         .unwrap_or(LEGACY_METADATA_BYTES);
     state.peer_metadata.store(peer_metadata, Ordering::Relaxed);
-    let incremental = capabilities.iter().any(|c| c == "incremental_reconnect");
+    let incremental = hub_supports(&health, "incremental_reconnect");
     let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(state.limits.websocket)).max_frame_size(Some(state.limits.websocket));
     let (socket, _) = tokio_tungstenite::connect_async_with_config(request, Some(config), false).await?;
@@ -532,13 +536,28 @@ async fn connection(state: Arc<State>) -> Result<()> {
     let cancelled = Arc::new(Mutex::new(HashSet::new()));
     let producer = replay_and_follow(state.clone(), events, out_tx, incremental, resumes.clone(), ready_rx);
     let writer = async {
-        let mut sampler = (state.metrics && capabilities.iter().any(|c| c == "worker_metrics")).then(|| Sampler { cpu: cpu_ticks() });
+        let mut sampler = (state.metrics && hub_supports(&health, "worker_metrics"))
+            .then(|| Sampler { cpu: cpu_ticks() });
+        let metrics_probe = async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                if let Ok(health) = hub_health(&state).await {
+                    break hub_supports(&health, "worker_metrics");
+                }
+            }
+        };
+        tokio::pin!(metrics_probe);
         let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
         heartbeat.tick().await;
         loop {
             let message = tokio::select! {
                 text = out_rx.recv() => { let Some(text) = text else { break }; Message::Text(text.into()) },
                 bytes = pong_rx.recv() => { let Some(bytes) = bytes else { break }; Message::Pong(bytes) },
+                supported = &mut metrics_probe, if retry_metrics => {
+                    retry_metrics = false;
+                    sampler = supported.then(|| Sampler { cpu: cpu_ticks() });
+                    continue;
+                }
                 _ = heartbeat.tick() => {
                     let message = match sampler.as_mut() {
                         Some(sampler) => WorkerMessage::Metrics { metrics: sampler.sample(&state.data) },
@@ -859,6 +878,11 @@ async fn hub_health(state: &State) -> Result<serde_json::Value> {
         .error_for_status()?
         .json().await?;
     Ok(health)
+}
+
+fn hub_supports(health: &serde_json::Value, capability: &str) -> bool {
+    health["capabilities"].as_array()
+        .is_some_and(|caps| caps.iter().any(|cap| cap == capability))
 }
 
 /// CPU usage is the change in cumulative ticks between two samples.
@@ -3622,34 +3646,43 @@ mod tests {
         })
     }
     #[tokio::test]
-    async fn worker_sends_metrics_after_transient_hub_health_failure() {
+    async fn worker_recovers_metrics_without_reconnecting_after_hub_health_failure() {
         use axum::{
             extract::ws::{Message, WebSocketUpgrade}, http::StatusCode,
             response::IntoResponse, routing::get,
         };
 
-        let first_request = Arc::new(AtomicBool::new(true));
+        let health_available = Arc::new(AtomicBool::new(false));
         let metrics_received = Arc::new(tokio::sync::Notify::new());
         let app = axum::Router::new()
-            .route("/health", get(move || {
-                let first_request = first_request.clone();
-                async move {
-                    if first_request.swap(false, Ordering::Relaxed) {
-                        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            .route("/health", get({
+                let health_available = health_available.clone();
+                move || {
+                    let health_available = health_available.clone();
+                    async move {
+                        if !health_available.load(Ordering::Relaxed) {
+                            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
+                        axum::Json(serde_json::json!({"capabilities": ["worker_metrics"]})).into_response()
                     }
-                    axum::Json(serde_json::json!({"capabilities": ["worker_metrics"]})).into_response()
                 }
             }))
             .route("/v1/worker/ws", get({
                 let metrics_received = metrics_received.clone();
                 move |ws: WebSocketUpgrade| {
                     let metrics_received = metrics_received.clone();
+                    let health_available = health_available.clone();
                     async move {
                         ws.on_upgrade(move |mut socket| async move {
-                            let _hello = socket.recv().await;
-                            if let Some(Ok(Message::Text(text))) = socket.recv().await {
-                                if matches!(serde_json::from_str::<WorkerMessage>(&text).unwrap(), WorkerMessage::Metrics { .. }) {
-                                    metrics_received.notify_one();
+                            while let Some(Ok(Message::Text(text))) = socket.recv().await {
+                                match serde_json::from_str::<WorkerMessage>(&text).unwrap() {
+                                    WorkerMessage::Heartbeat => health_available.store(true, Ordering::Relaxed),
+                                    WorkerMessage::Metrics { .. } => {
+                                        assert!(health_available.load(Ordering::Relaxed));
+                                        metrics_received.notify_one();
+                                        break;
+                                    }
+                                    _ => {}
                                 }
                             }
                         })
@@ -3664,13 +3697,14 @@ mod tests {
         config.metrics = true;
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let error = tokio::time::timeout(Duration::from_secs(5), connection(state.clone()))
-            .await.unwrap().unwrap_err();
-        assert!(format!("{error:#}").contains("503"), "{error:#}");
-
-        let worker = tokio::spawn(connection(state));
-        tokio::time::timeout(Duration::from_secs(30), metrics_received.notified())
-            .await.expect("worker should send metrics on the next connection");
+        let mut worker = tokio::spawn(connection(state));
+        tokio::select! {
+            biased;
+            result = tokio::time::timeout(Duration::from_secs(60), metrics_received.notified()) => {
+                result.expect("worker should send a heartbeat during the outage and metrics after recovery on the same connection");
+            }
+            result = &mut worker => panic!("worker disconnected before reporting metrics: {result:?}"),
+        }
         worker.abort();
         server.abort();
     }

@@ -158,8 +158,10 @@ function App() {
 const isInsecureRemote = () =>
   window.location.protocol !== 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(window.location.hostname)
 
+const signInMethodKey = 'ylcc-dashboard-sign-in-method'
+
 function ConnectScreen({ error, onConnect }: { error: string; onConnect: (token: string, persist?: boolean) => void }) {
-  const [usePassword, setUsePassword] = useState(false)
+  const [usePassword, setUsePassword] = useState(() => localStorage.getItem(signInMethodKey) === 'password')
   const [token, setToken] = useState('')
   const [localError, setLocalError] = useState('')
   const submit = async (event: FormEvent<HTMLFormElement>) => {
@@ -202,7 +204,9 @@ function ConnectScreen({ error, onConnect }: { error: string; onConnect: (token:
         <form onSubmit={submit} className="connect-form">
           <label htmlFor="credential-type">Sign in with</label>
           <select id="credential-type" className="field" value={usePassword ? 'password' : 'token'} onChange={(event) => {
-            setUsePassword(event.target.value === 'password')
+            const method = event.target.value
+            localStorage.setItem(signInMethodKey, method)
+            setUsePassword(method === 'password')
             setToken('')
             setLocalError('')
           }}>

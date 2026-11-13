@@ -1266,7 +1266,9 @@ impl Store {
         let previous = self.one::<WorkerInfo>("SELECT data FROM workers WHERE id=?1", &id)?;
         let updating = previous.as_ref().and_then(|worker| worker.updating.clone())
             .filter(|target| version != target.trim_start_matches('v'));
-        let update_error = previous.as_ref().and_then(|worker| worker.update_error.clone());
+        let update_error = previous.as_ref()
+            .filter(|worker| worker.version == version)
+            .and_then(|worker| worker.update_error.clone());
         let mut settings = match previous {
             Some(worker) => self.worker_settings(&worker)?,
             None => WorkerSettings::default(),
@@ -2996,6 +2998,12 @@ mod tests {
         store.save_worker(&info).unwrap();
         assert_eq!(store.start_worker_update("one", "v0.5.7".into()).unwrap_err().0, StatusCode::CONFLICT);
         assert!(rx.try_recv().is_err());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        store.connect("one".into(), caps(), 1, vec![], vec![], "0.5.5".into(), tx, &pool_principal(), false).unwrap();
+        assert_eq!(store.workers().unwrap()[0].update_error.as_deref(), Some("checksum mismatch"));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        store.connect("one".into(), caps(), 1, vec![], vec![], "0.5.7".into(), tx, &pool_principal(), false).unwrap();
+        assert!(store.workers().unwrap()[0].update_error.is_none());
     }
 
     #[test]

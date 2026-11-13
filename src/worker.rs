@@ -52,6 +52,7 @@ struct State {
     token: String,
     data: PathBuf,
     id: String,
+    executable: Result<PathBuf>,
     client: reqwest::Client,
     capabilities: Capabilities,
     max_jobs: usize,
@@ -238,6 +239,10 @@ pub async fn run(
     policy: Option<Policy>,
     metrics: bool,
 ) -> Result<()> {
+    let executable = std::env::current_exe()
+        .and_then(fs::canonicalize)
+        .map(|path| crate::platform::command_path(&path))
+        .context("resolve the worker executable at startup");
     let limits = TransferLimits::from_env()?;
     identifier(&id)?;
     ensure!(max_jobs > 0, "max-jobs must be positive");
@@ -283,6 +288,7 @@ pub async fn run(
         token,
         data,
         id,
+        executable,
         client: reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(20))
             .redirect(reqwest::redirect::Policy::none())
@@ -304,8 +310,8 @@ pub async fn run(
         metrics,
     });
     load_state(&state).await?;
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = fs::remove_file(previous_binary(&exe)); // left by the last self-update
+    if let Ok(exe) = &state.executable {
+        let _ = fs::remove_file(previous_binary(exe)); // left by the last self-update
     }
     {
         let state = state.clone();
@@ -3488,6 +3494,38 @@ async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
     Ok(response.bytes().await?.to_vec())
 }
 
+async fn drain_for_update(state: &State) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+    loop {
+        let drain = state.drain.write().await;
+        if !state.attempts.lock().unwrap().values().any(|a| matches!(a.report().state.as_str(), "assigned" | "running")) {
+            return drain;
+        }
+        drop(drain);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn executable_was_replaced(exe: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let running = fs::metadata("/proc/self/exe").context("inspect the running worker executable")?;
+    let installed = fs::metadata(exe).context("inspect the installed worker executable")?;
+    Ok((running.dev(), running.ino()) != (installed.dev(), installed.ino()))
+}
+
+#[cfg(target_os = "linux")]
+async fn verify_replacement(exe: &Path, version: &str) -> Result<()> {
+    let output = Command::new(exe).arg("--version").output().await.context("check the externally installed worker version")?;
+    ensure!(output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == format!("ylcc {}", &version[1..]),
+        "the worker executable was replaced with a different version; restart the worker before requesting another update");
+    Ok(())
+}
+
+fn restart_updated_worker(version: &str) -> ! {
+    eprintln!("updated to {version}; exiting for the service manager to restart");
+    std::process::exit(RESTART_EXIT_CODE)
+}
+
 /// Replaces this worker's binary with a published release verified against its SHA256SUMS,
 /// waits until no attempt is active, and exits so the service manager restarts it.
 async fn self_update(state: &Arc<State>, version: &str) -> Result<()> {
@@ -3496,7 +3534,14 @@ async fn self_update(state: &Arc<State>, version: &str) -> Result<()> {
         "invalid release tag"
     );
     ensure!(!state.capabilities.containerized, "container workers update by recreating the container from the new image");
-    let exe = crate::platform::command_path(&std::env::current_exe()?.canonicalize()?);
+    // On Linux current_exe() can point at the deleted inode after an external install.
+    let exe = state.executable.as_ref().map_err(|error| anyhow::anyhow!("{error:#}"))?;
+    #[cfg(target_os = "linux")]
+    if executable_was_replaced(exe)? {
+        let _drain = drain_for_update(state).await;
+        verify_replacement(exe, version).await?;
+        restart_updated_worker(version);
+    }
     let dir = exe.parent().context("worker binary has no directory")?;
     let staging = tempfile::Builder::new().prefix(".ylcc-update-").tempdir_in(dir).map_err(|error| {
         let help = if cfg!(target_os = "macos") && error.kind() == std::io::ErrorKind::PermissionDenied {
@@ -3525,25 +3570,28 @@ async fn self_update(state: &Arc<State>, version: &str) -> Result<()> {
     let output = Command::new(&new).arg("--version").output().await.context("run the downloaded binary")?;
     let reported = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     ensure!(output.status.success() && reported == format!("ylcc {}", &version[1..]), "downloaded binary reports {reported:?}, not {version}");
-    // The Hub stops assigning work to a paused worker; wait out anything already accepted.
-    let _drain = loop {
-        let drain = state.drain.write().await;
-        if !state.attempts.lock().unwrap().values().any(|a| matches!(a.report().state.as_str(), "assigned" | "running")) {
-            break drain;
+    // The Hub holds new assignments; wait out anything already accepted.
+    let _drain = drain_for_update(state).await;
+    #[cfg(target_os = "linux")]
+    if executable_was_replaced(exe)? {
+        verify_replacement(exe, version).await?;
+        drop(staging);
+        restart_updated_worker(version);
+    }
+    #[cfg(unix)]
+    fs::rename(&new, exe).context("install the new worker binary")?;
+    #[cfg(windows)]
+    {
+        let previous = previous_binary(exe);
+        let _ = fs::remove_file(&previous);
+        fs::rename(exe, &previous).context("move the installed worker binary aside")?;
+        if let Err(error) = fs::rename(&new, exe) {
+            let _ = fs::rename(&previous, exe);
+            return Err(error).context("install the new worker binary");
         }
-        drop(drain);
-        tokio::time::sleep(Duration::from_secs(5)).await;
-    };
-    let previous = previous_binary(&exe);
-    let _ = fs::remove_file(&previous);
-    fs::rename(&exe, &previous).context("move the running binary aside")?;
-    if let Err(error) = fs::rename(&new, &exe) {
-        let _ = fs::rename(&previous, &exe);
-        return Err(error).context("install the new binary");
     }
     drop(staging);
-    eprintln!("updated to {version}; exiting for the service manager to restart");
-    std::process::exit(RESTART_EXIT_CODE)
+    restart_updated_worker(version)
 }
 
 #[cfg(test)]
@@ -3627,6 +3675,7 @@ mod tests {
             token: "test-token".into(),
             data: data.into(),
             id: "test".into(),
+            executable: std::env::current_exe().map_err(Into::into),
             client: reqwest::Client::new(),
             capabilities: Capabilities {
                 os: std::env::consts::OS.into(),

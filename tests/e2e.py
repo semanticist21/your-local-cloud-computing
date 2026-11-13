@@ -152,6 +152,39 @@ def main():
             until(lambda: cli("workers")[0] == [])
             with urllib.request.urlopen(hub_url + "/health") as response:
                 assert json.load(response)["transfer_limits"] == {"websocket": 128 * 1024 * 1024, "http_json": 128 * 1024 * 1024, "metadata": 512 * 1024 * 1024}
+            if sys.platform.startswith("linux"):
+                # A supervisor can restart the worker at its install path after that path is
+                # atomically replaced while the old worker is still draining a job.
+                worker_exe = base / "replaceable-ylcc"
+                shutil.copy2(binary, worker_exe)
+                stream = (base / "replaceable-worker.log").open("w+")
+                streams.append(stream)
+                replaceable = subprocess.Popen(
+                    [str(worker_exe), *prefix[1:], "worker", "--id", "replaceable", "--data-dir", str(base / "replaceable")],
+                    stdout=stream, stderr=stream, start_new_session=True,
+                    env={**os.environ, "YLCC_RELEASE_BASE_URL": hub_url + "/v1/missing-release"},
+                )
+                processes.append(replaceable)
+                def replaceable_info():
+                    return next((w for w in cli("workers")[0] if w["id"] == "replaceable"), {})
+                until(lambda: replaceable_info().get("online"))
+                staged = base / "replacement"
+                replacement = "#!/bin/sh\nprintf 'ylcc 99.0.0\\n'\n"
+                staged.write_text(replacement)
+                staged.chmod(0o755)
+                staged.replace(worker_exe)
+                cli("workers", "update", "replaceable", "--version", "v98.0.0", "--timeout-secs", "15", ok=False)
+                assert "replaced with a different version" in (replaceable_info().get("update_error") or "")
+                assert replaceable.poll() is None and worker_exe.read_text() == replacement
+                request = urllib.request.Request(hub_url + "/v1/workers/replaceable/update",
+                    data=b'{"version":"v99.0.0"}',
+                    headers={"Authorization": "Bearer " + token.read_text().strip(), "Content-Type": "application/json"})
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    assert response.status == 200
+                assert replaceable.wait(timeout=15) == 75
+                assert worker_exe.read_text() == replacement
+                until(lambda: replaceable_info().get("online") is False)
+                cli("workers", "delete", "replaceable")
             worker = start("worker", "--id", "test-worker", "--data-dir", str(base / "worker"))
             until(lambda: any(w["online"] for w in cli("workers")[0]))
             os_name = "windows" if os.name == "nt" else "macos" if sys.platform == "darwin" else "linux"

@@ -542,7 +542,7 @@ def main():
                 curl.write_text("#!/bin/sh\nprintf '%s\\n' '(( 1 ))' 'printf %s \"$YLCC_PREFIX\"'\n")
                 update = subprocess.run([str(installed), "update", "--apply", "--force"],
                                         env=env, capture_output=True, text=True, timeout=10)
-                assert update.returncode == 0 and update.stdout.startswith(str(install_prefix)), update
+                assert update.returncode == 0 and update.stdout.startswith(str(install_prefix.resolve())), update
             print("PASS: native compile, snapshots, dedup, isolation, cancellation, reconnect, persistent environments, YAML task, priority, pause/resume, live concurrency, scoped tokens, streamed Run/results, deleted-environment reconnect, audit, command policy")
         except BaseException:
             for stream in streams:

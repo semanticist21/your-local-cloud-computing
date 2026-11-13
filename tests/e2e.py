@@ -515,6 +515,34 @@ def main():
             refused_env = cli("run", "--no-input", *common, "--env", "FOO=1", "--", *noop, ok=False)
             assert "FOO is not allowed" in refused_env.stderr, refused_env.stderr
             stop(strict)
+            # Local cleanup preserves shared history, even with an admin token.
+            old_result = base / "results" / submitted["id"]
+            old_result.mkdir(exist_ok=True)
+            os.utime(old_result, (1, 1))
+            preview, _ = cli("cleanup")
+            assert str(old_result) in preview["candidates"] and old_result.is_dir()
+            cli("cleanup", "--apply")
+            assert not old_result.exists() and state(submitted)["state"] == "succeeded"
+            cli("cleanup", "--hub-history", "--max-total-mb", "0", "--apply")
+            assert "404" in cli("jobs", "show", submitted["id"], ok=False).stderr
+            if os.name != "nt":
+                install_prefix = base / "prefix with 'quote'"
+                install_bin = install_prefix / "bin"
+                install_bin.mkdir(parents=True)
+                installed = install_bin / "ylcc"
+                shutil.copy2(binary, installed)
+                curl = install_bin / "curl"
+                curl.write_text("#!/bin/sh\nexit 22\n")
+                curl.chmod(0o755)
+                env = {**os.environ, "PATH": str(install_bin) + os.pathsep + os.environ["PATH"]}
+                env.pop("YLCC_PREFIX", None)
+                update = subprocess.run([str(installed), "update", "--apply", "--force"],
+                                        env=env, capture_output=True, text=True, timeout=10)
+                assert update.returncode and "installer exited with status" in update.stderr, update
+                curl.write_text("#!/bin/sh\nprintf '%s\\n' '(( 1 ))' 'printf %s \"$YLCC_PREFIX\"'\n")
+                update = subprocess.run([str(installed), "update", "--apply", "--force"],
+                                        env=env, capture_output=True, text=True, timeout=10)
+                assert update.returncode == 0 and update.stdout.startswith(str(install_prefix)), update
             print("PASS: native compile, snapshots, dedup, isolation, cancellation, reconnect, persistent environments, YAML task, priority, pause/resume, live concurrency, scoped tokens, streamed Run/results, deleted-environment reconnect, audit, command policy")
         except BaseException:
             for stream in streams:

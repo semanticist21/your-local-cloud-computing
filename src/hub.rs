@@ -143,9 +143,6 @@ fn image_ref(image: &str) -> Result<()> {
     }
     Ok(())
 }
-fn terminal(state: &str) -> bool {
-    matches!(state, "succeeded" | "failed" | "cancelled")
-}
 /// Worker resource samples older than this are deleted as new ones arrive.
 const METRICS_RETENTION: u64 = 7 * 24 * 60 * 60;
 fn active(state: &str) -> bool {
@@ -312,18 +309,19 @@ impl Store {
         let filtered = !state.is_empty() || !worker.is_empty() || !needle.is_empty();
         let mut predicates = Vec::new();
         let mut values: Vec<rusqlite::types::Value> = Vec::new();
+        let command = "(SELECT group_concat(value,' ' ORDER BY key) FROM json_each(jobs.data,'$.spec.command'))";
         if state == "active" {
-            predicates.push("json_extract(data,'$.state') IN ('assigned','waiting','running')");
+            predicates.push("json_extract(data,'$.state') IN ('assigned','waiting','running','cancelling','unknown')".into());
         } else if !state.is_empty() {
-            predicates.push("json_extract(data,'$.state')=?");
+            predicates.push("json_extract(data,'$.state')=?".into());
             values.push(state.to_owned().into());
         }
         if !worker.is_empty() {
-            predicates.push("json_extract(data,'$.worker_id')=?");
+            predicates.push("json_extract(data,'$.worker_id')=?".into());
             values.push(worker.to_owned().into());
         }
         if !needle.is_empty() {
-            predicates.push("instr(lower(id || ' ' || json_extract(data,'$.state') || ' ' || COALESCE(json_extract(data,'$.worker_id'),'') || ' ' || COALESCE(environment,'') || ' ' || COALESCE(json_extract(data,'$.submitted_by'),'') || ' ' || json_extract(data,'$.spec.command')),lower(?))>0");
+            predicates.push(format!("instr(lower(id || ' ' || json_extract(data,'$.state') || ' ' || COALESCE(json_extract(data,'$.worker_id'),'') || ' ' || COALESCE(environment,'') || ' ' || COALESCE(json_extract(data,'$.submitted_by'),'') || ' ' || COALESCE({command},'')),lower(?))>0"));
             values.push(needle.to_owned().into());
         }
         let predicate = if filtered { predicates.join(" AND ") } else { "1".into() };
@@ -334,7 +332,7 @@ impl Store {
         };
         let mut statement = self.db.prepare(&format!("SELECT json_object(
             'id',id,'state',json_extract(data,'$.state'),
-            'command',COALESCE(substr((SELECT group_concat(value,' ') FROM json_each(jobs.data,'$.spec.command')),1,241),''),
+            'command',COALESCE(substr({command},1,241),''),
             'environment',json_extract(data,'$.spec.environment'),
             'worker_id',json_extract(data,'$.worker_id'),
             'created_at',json_extract(data,'$.created_at'),'updated_at',json_extract(data,'$.updated_at'),
@@ -381,9 +379,16 @@ impl Store {
     }
 
     fn delete_job(&mut self, id: &str) -> ApiResult<()> {
+        let state: Option<String> = self.one(
+            "SELECT json_quote(json_extract(data,'$.state')) FROM jobs WHERE id=?1",
+            id,
+        )?;
+        if state.is_some_and(|state| !job_is_terminal(&state)) {
+            return Err(ApiError(StatusCode::CONFLICT, "only finished jobs can be deleted".into()));
+        }
         let tx = self.db.transaction().map_err(anyhow::Error::from)?;
-        tx.execute("DELETE FROM jobs WHERE id=?1", params![id])
-            .map_err(anyhow::Error::from)?;
+        tx.execute("DELETE FROM jobs WHERE id=?1", [id]).map_err(anyhow::Error::from)?;
+        tx.execute("DELETE FROM logs WHERE job=?1", [id]).map_err(anyhow::Error::from)?;
         tx.commit().map_err(anyhow::Error::from)?;
         Ok(())
     }
@@ -1131,9 +1136,20 @@ impl Store {
             params![job_id, worker, attempt], |r| r.get(0),
         ).optional()?)
     }
+    fn report_state(&self, worker: &str, job_id: &str, attempt: &str) -> Result<Option<String>> {
+        let assignment = self.assignment_state(worker, job_id, attempt)?;
+        if assignment.is_none() && self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE id=?1)", [job_id], |row| row.get::<_, bool>(0),
+        )? {
+            bail!("worker/attempt does not own job");
+        }
+        Ok(assignment)
+    }
     fn report(&mut self, worker: &str, report: AttemptReport) -> Result<()> {
-        let state = self.assignment_state(worker, &report.job_id, &report.attempt_id)?.context("worker/attempt does not own job")?;
-        if terminal(&state) {
+        let Some(state) = self.report_state(worker, &report.job_id, &report.attempt_id)? else {
+            return Ok(());
+        };
+        if job_is_terminal(&state) {
             return Ok(());
         }
         if !active(&state) {
@@ -1148,7 +1164,7 @@ impl Store {
                 else if report.state == "assigned" { "waiting" } else { "running" };
             self.db.execute("UPDATE jobs SET data=json_set(data,'$.state',?2,'$.error',NULL,'$.wait_reason',CASE WHEN ?2='running' THEN NULL ELSE json_extract(data,'$.wait_reason') END,'$.updated_at',?3) WHERE id=?1",
                 params![report.job_id, state, now() as i64])?;
-        } else if terminal(&report.state) {
+        } else if job_is_terminal(&report.state) {
             let mut state = report.state;
             let mut error = report.error;
             let mut results = report.results;
@@ -1349,7 +1365,7 @@ impl Store {
                     (false, self.environment_revision(id, revision)?.is_none())
                 } else {
                     match self.assignment_state(worker, &job_id, &attempt_id)? {
-                        Some(state) => (terminal(&state), false),
+                        Some(state) => (job_is_terminal(&state), false),
                         _ => (true, true), // Locally retained history may outlive an explicit Hub deletion/retry.
                     }
                 };
@@ -1373,16 +1389,14 @@ impl Store {
                 let missing = std::mem::take(&mut session.missing);
                 session.tx.send(HubMessage::Ready)?;
                 for (id, attempt) in missing {
-                    let state = self.assignment_state(worker, &id, &attempt)?.context("worker/attempt does not own job")?;
-                    if active(&state) {
+                    if self.report_state(worker, &id, &attempt)?.is_some_and(|state| active(&state)) {
                         self.db.execute("UPDATE jobs SET data=json_set(data,'$.state','unknown','$.error',?2,'$.updated_at',?3) WHERE id=?1",
                             params![id, "worker did not report this attempt; cancel explicitly before retrying", now() as i64])?;
                     }
                 }
             }
             WorkerMessage::Started { job_id, attempt_id } => {
-                let state = self.assignment_state(worker, &job_id, &attempt_id)?.context("worker/attempt does not own job")?;
-                if active(&state) {
+                if self.report_state(worker, &job_id, &attempt_id)?.is_some_and(|state| active(&state)) {
                     let state = if self.cancel_requested(&job_id)? {
                         "cancelling"
                     } else {
@@ -1394,7 +1408,9 @@ impl Store {
             }
             WorkerMessage::Waiting { job_id, attempt_id, reason } => {
                 anyhow::ensure!(reason.len() <= 128, "waiting reason is too long");
-                self.assignment_state(worker, &job_id, &attempt_id)?.context("worker/attempt does not own job")?;
+                if self.report_state(worker, &job_id, &attempt_id)?.is_none() {
+                    return Ok(());
+                }
                 self.db.execute("UPDATE jobs SET data=json_set(data,'$.state','waiting','$.wait_reason',?2,'$.updated_at',?3) WHERE id=?1 AND json_extract(data,'$.state') IN ('assigned','waiting') AND json_extract(data,'$.started_at') IS NULL",
                     params![job_id, reason, now() as i64])?;
             }
@@ -1422,7 +1438,9 @@ impl Store {
                     }
                     false
                 } else {
-                    self.assignment_state(worker, &entry.job_id, &entry.attempt_id)?.context("worker/attempt does not own job")?;
+                    if self.report_state(worker, &entry.job_id, &entry.attempt_id)?.is_none() {
+                        return Ok(());
+                    }
                     true
                 };
                 if entry.seq > i64::MAX as u64
@@ -2077,7 +2095,7 @@ async fn cancel(
 ) -> ApiResult<Json<Job>> {
     let mut store = lock(&state)?;
     let mut job = store.job(&id)?.ok_or_else(|| missing("job"))?;
-    if !terminal(&job.state) {
+    if !job_is_terminal(&job.state) {
         store
             .db
             .execute("UPDATE jobs SET cancel_requested=1 WHERE id=?1", [&id])
@@ -3020,7 +3038,7 @@ mod tests {
         assert!(second.stats.is_none());
         let combined: BTreeSet<_> = first.jobs.iter().chain(&second.jobs).chain(&third.jobs).map(|j| &j.id).collect();
         assert_eq!(combined.len(), 123);
-        let filtered = store.job_summaries(&JobListQuery { state: Some("active".into()), worker: Some("one".into()), q: Some("needle-12".into()), ..Default::default() }).unwrap();
+        let filtered = store.job_summaries(&JobListQuery { state: Some("active".into()), worker: Some("one".into()), q: Some("echo needle-12".into()), ..Default::default() }).unwrap();
         assert_eq!(filtered.total, 3); // 12, 120, 122
         assert_eq!(filtered.jobs.len(), 3);
         assert!(store.job_summaries(&JobListQuery { q: Some("does-not-exist".into()), ..Default::default() }).unwrap().jobs.is_empty());
@@ -3042,6 +3060,38 @@ mod tests {
         }
         let response = app.oneshot(axum::http::Request::builder().uri("/v1/jobs/summary?limit=50").header(header::AUTHORIZATION, "Bearer test-token-long-enough").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn job_deletion_requires_a_confirmed_terminal_state() {
+        use tower::ServiceExt;
+        let (_dir, mut store) = test_store();
+        let (session, _rx) = worker(&mut store, "one");
+        let mut job = store.add_job(spec(), None).unwrap();
+        let log = WorkerMessage::Log { entry: LogEntry {
+            job_id: job.id.clone(), attempt_id: job.attempt_id.clone(), seq: 1,
+            stream: "stdout".into(), text: "output".into(),
+        } };
+        store.receive("one", session, log.clone()).unwrap();
+        let state = Arc::new(Mutex::new(store));
+        let app = router(state.clone());
+        for status in ["queued", "assigned", "waiting", "running", "cancelling", "unknown", "succeeded"] {
+            job.state = status.into();
+            state.lock().unwrap().save_job(&job).unwrap();
+            let request = axum::http::Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/jobs/{}", job.id))
+                .header(header::AUTHORIZATION, "Bearer test-token-long-enough")
+                .body(Body::empty()).unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            let finished = status == "succeeded";
+            assert_eq!(response.status(), if finished { StatusCode::NO_CONTENT } else { StatusCode::CONFLICT }, "{status}");
+            assert_eq!(state.lock().unwrap().job(&job.id).unwrap().is_none(), finished);
+        }
+        let mut store = state.lock().unwrap();
+        store.receive("one", session, log).unwrap();
+        let retained: i64 = store.db.query_row("SELECT COUNT(*) FROM logs WHERE job=?1", [&job.id], |row| row.get(0)).unwrap();
+        assert_eq!(retained, 0);
     }
 
     #[cfg(dashboard_assets)]

@@ -1762,7 +1762,7 @@ fn megabytes(bytes: u64) -> String {
 
 /// Fetches input blobs concurrently, then copies them into the checkout, reporting progress.
 /// Thousands of small inputs are latency-bound, so one-at-a-time downloads take minutes.
-async fn materialize_inputs(state: &State, attempt: &Attempt, job: &Job, workdir: &Path, cancel: &watch::Receiver<bool>) -> Result<()> {
+async fn materialize_inputs(state: &State, attempt: &Attempt, job: &Job, workdir: &Path, cancel: &mut watch::Receiver<bool>) -> Result<()> {
     const FETCHES: usize = 16;
     const PROGRESS: Duration = Duration::from_secs(1);
     let inputs = &job.spec.inputs;
@@ -1793,7 +1793,11 @@ async fn materialize_inputs(state: &State, attempt: &Attempt, job: &Job, workdir
         {
             fetches.push(fetch_input(state, input));
         }
-        let Some(result) = fetches.next().await else { break };
+        let next = tokio::select! {
+            result = fetches.next() => result,
+            _ = cancel.changed() => bail!("job cancelled"),
+        };
+        let Some(result) = next else { break };
         cancelled(cancel)?;
         let (input, path) = result?;
         fetched += input.size;
@@ -1942,7 +1946,7 @@ async fn run_attempt(
     let workspace = Workspace::claim(state, &job.spec, &attempt.dir)?;
     let workdir = workspace.dir.clone();
     fs::create_dir(&workdir).context("create fresh attempt checkout")?;
-    materialize_inputs(state, attempt, job, &workdir, &cancel).await?;
+    materialize_inputs(state, attempt, job, &workdir, &mut cancel).await?;
     waiting(state, job, "Checking job requirements".into());
     let path = if let Some(image) = &image {
         Some(image_path(state, image).await?)
@@ -4931,8 +4935,8 @@ mod tests {
         let mut events = state.events.subscribe();
         let workdir = temp.path().join("work");
         fs::create_dir(&workdir).unwrap();
-        let (_cancel, receiver) = watch::channel(false);
-        tokio::time::timeout(Duration::from_secs(10), materialize_inputs(&state, &attempt, &job, &workdir, &receiver))
+        let (_cancel, mut receiver) = watch::channel(false);
+        tokio::time::timeout(Duration::from_secs(10), materialize_inputs(&state, &attempt, &job, &workdir, &mut receiver))
             .await
             .expect("inputs must download concurrently")
             .unwrap();
@@ -4953,6 +4957,39 @@ mod tests {
         let Ok(WorkerMessage::Waiting { reason, .. }) = events.try_recv() else { panic!("expected a waiting reason") };
         assert_eq!(reason.len(), 127, "truncation keeps the Hub limit on a char boundary");
     }
+    #[tokio::test]
+    async fn cancelling_an_attempt_interrupts_a_stalled_input_download() {
+        let temp = tempfile::tempdir().unwrap();
+        let requested = Arc::new(tokio::sync::Notify::new());
+        let notify = requested.clone();
+        let app = axum::Router::new().route("/v1/blobs/{hash}", axum::routing::get(move || {
+            let notify = notify.clone();
+            async move {
+                notify.notify_one();
+                std::future::pending::<String>().await
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut state = state_at(temp.path());
+        Arc::get_mut(&mut state).unwrap().hub = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut job = policy_job(&["must-not-run"], None);
+        job.spec.inputs.push(FileEntry { path: "input".into(), hash: "0".repeat(64), size: 1, mode: 0o644 });
+        let mut events = state.events.subscribe();
+        accept(state.clone(), job.clone(), None).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), requested.notified()).await.unwrap();
+        request_cancel(&state, &job.id, &job.attempt_id).await.unwrap();
+        let report = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let WorkerMessage::Finished { report } = events.recv().await.unwrap() {
+                    break report;
+                }
+            }
+        }).await.expect("cancellation must interrupt the stalled request");
+        assert_eq!(report.state, "cancelled");
+        server.abort();
+    }
+
     fn policy_job(command: &[&str], environment: Option<&str>) -> Job {
         Job {
             id: "job".into(),

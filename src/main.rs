@@ -119,7 +119,11 @@ enum Commands {
     Cleanup {
         #[arg(long, default_value_t = 30)]
         older_than_days: u64,
+        /// Also prune finished job history on the shared Hub (requires an admin token).
         #[arg(long)]
+        hub_history: bool,
+        /// Estimated size budget for finished Hub job records, in MiB.
+        #[arg(long, requires = "hub_history")]
         max_total_mb: Option<u64>,
         #[arg(long)]
         apply: bool,
@@ -601,7 +605,7 @@ async fn update_release(
                     let active: Vec<String> = match client.get::<Vec<Job>>("/v1/jobs").await {
                         Ok(jobs) => jobs
                             .into_iter()
-                            .filter(|job| matches!(job.state.as_str(), "queued" | "assigned" | "waiting" | "running"))
+                            .filter(|job| !job_is_terminal(&job.state))
                             .map(|job| job.id)
                             .collect(),
                         Err(error) => {
@@ -622,9 +626,24 @@ async fn update_release(
                     version, version
                 )
             } else {
+                let exe = std::env::current_exe()?.canonicalize()?;
+                let installed_prefix = exe.parent()
+                    .filter(|bin| bin.ends_with("bin") && exe.ends_with("ylcc"))
+                    .and_then(Path::parent);
+                let explicit_prefix = std::env::var_os("YLCC_PREFIX");
+                let prefix = explicit_prefix.as_deref().or_else(|| installed_prefix.map(Path::as_os_str));
+                if apply && prefix.is_none() {
+                    bail!("installer expects PREFIX/bin/ylcc; set YLCC_PREFIX to choose the install location");
+                }
+                let prefix = match prefix {
+                    Some(path) => {
+                        let path = path.to_str().context("installer prefix must be valid Unicode")?;
+                        format!("YLCC_PREFIX='{}' ", path.replace('\'', "'\"'\"'"))
+                    }
+                    None => String::new(),
+                };
                 format!(
-                    "YLCC_VERSION={} curl -fsSL https://raw.githubusercontent.com/semanticist21/your-local-cloud-computing/{}/scripts/install.sh | sh -s -- --version {}",
-                    version, version, version
+                    "{prefix}bash -o pipefail -c 'curl -fsSL https://raw.githubusercontent.com/semanticist21/your-local-cloud-computing/{version}/scripts/install.sh | bash -s -- --version {version}'"
                 )
             };
             if apply {
@@ -638,7 +657,7 @@ async fn update_release(
                     std::process::Command::new("sh")
                         .args(["-c", &command])
                         .status()
-                        .context("failed to launch the POSIX installer")?
+                        .context("failed to launch the Unix installer")?
                 };
                 if !status.success() {
                     bail!("installer exited with status {status}")
@@ -1549,14 +1568,14 @@ async fn execute() -> Result<()> {
             let latest = latest || version.is_none();
             update_release(version, latest, true, force, &hub, &token).await
         }
-        Commands::Cleanup { older_than_days, max_total_mb, apply } => {
+        Commands::Cleanup { older_than_days, hub_history, max_total_mb, apply } => {
             use std::time::{Duration, SystemTime};
             let retention_seconds = older_than_days.checked_mul(86400).context("retention period is too large")?;
             let cutoff = SystemTime::now()
                 .checked_sub(Duration::from_secs(retention_seconds))
                 .context("invalid retention period")?;
             let client = Client::new(&hub, &token).context("failed to connect to the Hub, active jobs cannot be enumerated")?;
-            // Enumerate all jobs page by page so cleanup works with bounded memory.
+            // Page the Hub response so one large history cannot exceed the response limit.
             let mut all_jobs: Vec<Job> = Vec::new();
             let mut offset = 0usize;
             loop {
@@ -1573,29 +1592,26 @@ async fn execute() -> Result<()> {
             }
             let active_job_ids: std::collections::BTreeSet<String> = all_jobs
                 .iter()
-                .filter(|job| matches!(job.state.as_str(), "queued" | "assigned" | "waiting" | "running"))
+                .filter(|job| !job_is_terminal(&job.state))
                 .map(|job| job.id.clone())
                 .collect();
+            let finished_jobs: Vec<&Job> = all_jobs.iter().filter(|job| job_is_terminal(&job.state)).collect();
+            let finished_job_ids: std::collections::BTreeSet<&str> = finished_jobs.iter().map(|job| job.id.as_str()).collect();
             let mut skipped_active = Vec::new();
             let mut job_ids_to_delete: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
             // Rule 1: retention age, using job updated_at when available.
-            for job in &all_jobs {
-                if active_job_ids.contains(&job.id) {
-                    continue;
-                }
-                let modified_epoch = job.updated_at;
-                let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(modified_epoch as u64);
-                if modified < cutoff {
-                    job_ids_to_delete.insert(job.id.clone());
+            if hub_history {
+                for job in &finished_jobs {
+                    let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(job.updated_at);
+                    if modified < cutoff {
+                        job_ids_to_delete.insert(job.id.clone());
+                    }
                 }
             }
             // Rule 2: max total bytes (higher priority than retention).
             if let Some(max_mb) = max_total_mb {
                 let max_bytes = max_mb.saturating_mul(1024 * 1024);
-                let mut candidates: Vec<&Job> = all_jobs
-                    .iter()
-                    .filter(|job| !active_job_ids.contains(&job.id))
-                    .collect();
+                let mut candidates = finished_jobs;
                 candidates.sort_by_key(|job| job.created_at);
                 let mut estimated_total: u64 = candidates
                     .iter()
@@ -1623,19 +1639,29 @@ async fn execute() -> Result<()> {
                             skipped_active.push(name.to_string());
                             continue;
                         }
-                        if job_ids_to_delete.contains(name) {
+                        let modified = entry.metadata()?.modified()?;
+                        if (finished_job_ids.contains(name) && modified < cutoff) || job_ids_to_delete.contains(name) {
                             candidates.push(path);
                         }
                     }
                 }
             }
             if apply {
-                for path in &candidates {
-                    fs::remove_dir_all(path)
-                        .with_context(|| format!("remove {}", path.display()))?;
+                if hub_history && !job_ids_to_delete.is_empty()
+                    && client.get::<Principal>("/v1/whoami").await?.role != Role::Admin
+                {
+                    bail!("shared Hub history cleanup requires an admin token");
                 }
-                for id in &job_ids_to_delete {
-                    let _ = client.delete(&format!("/v1/jobs/{}", id)).await;
+                for path in &candidates {
+                    match fs::remove_dir_all(path) {
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        result => result.with_context(|| format!("remove {}", path.display()))?,
+                    }
+                }
+                if hub_history {
+                    for id in &job_ids_to_delete {
+                        client.delete(&format!("/v1/jobs/{id}")).await?;
+                    }
                 }
             }
             print(&serde_json::json!({
@@ -1643,7 +1669,7 @@ async fn execute() -> Result<()> {
                 "older_than_days": older_than_days,
                 "mode": if apply {"applied"} else {"dry-run"},
                 "candidate_count": candidates.len(),
-                "job_ids_to_delete": job_ids_to_delete.iter().cloned().collect::<Vec<_>>(),
+                "job_ids_to_delete": hub_history.then_some(job_ids_to_delete).unwrap_or_default(),
                 "max_total_mb": max_total_mb,
                 "candidates": candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                 "skipped_active_jobs": skipped_active,

@@ -255,6 +255,11 @@ pub struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_output_at: Option<u64>,
 }
+
+pub fn job_is_terminal(state: &str) -> bool {
+    matches!(state, "succeeded" | "failed" | "cancelled")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerInfo {
     pub id: String,

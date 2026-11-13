@@ -159,6 +159,7 @@ const isInsecureRemote = () =>
   window.location.protocol !== 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(window.location.hostname)
 
 function ConnectScreen({ error, onConnect }: { error: string; onConnect: (token: string, persist?: boolean) => void }) {
+  const [usePassword, setUsePassword] = useState(false)
   const [token, setToken] = useState('')
   const [localError, setLocalError] = useState('')
   const submit = async (event: FormEvent<HTMLFormElement>) => {
@@ -166,27 +167,25 @@ function ConnectScreen({ error, onConnect }: { error: string; onConnect: (token:
     const value = token.trim()
     if (!value) return
     setLocalError('')
-    try {
-      const probe = async (secret: string) => {
-        const response = await fetch('/v1/whoami', { headers: { Authorization: `Bearer ${secret}` } })
-        return response.ok
-      }
-      if (await probe(value)) {
-        onConnect(value, true)
-        return
-      }
-      let hashed: string
+    let credential = value
+    if (usePassword) {
       try {
-        hashed = await hashPassword(value)
-      } catch (hashError) {
-        setLocalError(hashError instanceof Error ? hashError.message : 'Could not hash password.')
+        credential = await hashPassword(value)
+      } catch (error) {
+        setLocalError(error instanceof Error ? error.message : 'Could not hash password.')
         return
       }
-      if (await probe(hashed)) {
-        onConnect(hashed, false)
+    }
+    try {
+      const response = await fetch('/v1/whoami', {
+        headers: { Authorization: `Bearer ${credential}` },
+        cache: 'no-store',
+      })
+      if (response.ok) {
+        onConnect(credential, !usePassword)
         return
       }
-      setLocalError('That token or password was rejected.')
+      setLocalError(usePassword ? 'That password was rejected.' : 'That token was rejected.')
     } catch {
       setLocalError('Could not reach the Hub.')
     }
@@ -201,15 +200,23 @@ function ConnectScreen({ error, onConnect }: { error: string; onConnect: (token:
         <p className="connect-description">Enter the pool token, a requester token issued with `ylcc tokens create`, or your dashboard password. Find a token file path with `ylcc dashboard`; it is never displayed by ylcc. Your dashboard reads status from this address.</p>
         <div className="endpoint-field"><span className="online-dot" />{window.location.origin}</div>
         <form onSubmit={submit} className="connect-form">
-          <label htmlFor="pool-token">Hub token or password</label>
+          <label htmlFor="credential-type">Sign in with</label>
+          <select id="credential-type" className="field" value={usePassword ? 'password' : 'token'} onChange={(event) => {
+            setUsePassword(event.target.value === 'password')
+            setToken('')
+            setLocalError('')
+          }}>
+            <option value="token">Hub token</option>
+            <option value="password">Dashboard password</option>
+          </select>
+          <label htmlFor="pool-token">{usePassword ? 'Dashboard password' : 'Hub token'}</label>
           <input
             id="pool-token"
             type="password"
-            autoComplete="off"
+            autoComplete={usePassword ? 'current-password' : 'off'}
             autoFocus
             value={token}
             onChange={(event) => setToken(event.target.value)}
-            placeholder="Paste token or password"
             required
           />
           {error && <p className="form-error" role="alert">{error}</p>}
@@ -219,7 +226,7 @@ function ConnectScreen({ error, onConnect }: { error: string; onConnect: (token:
             Connect to Hub <Check size={16} />
           </Button>
         </form>
-        <div className="session-note"><ShieldCheck size={15} /> Token or password stays in this browser and is cleared when you disconnect. Copy it from your local token file; never paste it into chat or logs.</div>
+        <div className="session-note"><ShieldCheck size={15} /> Disconnect to clear the saved sign-in from this browser.</div>
       </section>
       <span className="connect-version">YLCC · self-hosted compute</span>
     </main>
@@ -757,7 +764,7 @@ function JobsPage() {
           />
           <select className="field" aria-label="Filter by state" value={search.state ?? ''} onChange={(event) => setSearch({ state: event.target.value || undefined })}>
             <option value="">All states</option>
-            <option value="active">Active (waiting + running)</option>
+            <option value="active">Active or unresolved</option>
             {jobStates.map((state) => <option key={state} value={state}>{state}</option>)}
           </select>
           <select className="field" aria-label="Filter by worker" value={search.worker ?? ''} onChange={(event) => setSearch({ worker: event.target.value || undefined })}>

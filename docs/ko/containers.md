@@ -35,6 +35,8 @@ docker --context "$YLCC_DOCKER_CONTEXT" run -d --init --name ylcc-worker --resta
   worker --id container-worker --data-dir /data --max-jobs 1
 ```
 
+인자 없이 실행하면 이미지는 `/run/secrets/token`의 토큰으로 `worker --data-dir /data`를 실행하므로, `-e YLCC_HUB_URL=https://HUB.example.ts.net:10000`, `--hostname 워커-ID`와 위의 두 마운트만 있으면 됩니다. `:latest`는 최신 릴리스를 따라갑니다. 컨테이너 워커는 스스로 업데이트하지 않으므로, 업그레이드하려면 이미지를 받은 뒤 컨테이너를 직접 또는 호스트 측 업데이트 도구로 다시 만드세요.
+
 rootless Podman 서비스로 관리하려면 `$YLCC_SUPPORT_DIR/examples/quadlet/ylcc-worker.container`([예제](../../examples/quadlet/ylcc-worker.container))를 `~/.config/containers/systemd/`에 복사하고, 허브 URL과 워커 ID를 바꾼 뒤 `systemctl --user daemon-reload && systemctl --user start ylcc-worker`를 실행하세요. keep-id 매핑 덕분에 서비스가 모드 600 토큰을 읽을 수 있습니다. [Podman Quadlet](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html)을 참고하세요.
 
 ## 선택 사항: 형제 컨테이너 실행

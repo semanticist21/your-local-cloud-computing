@@ -241,6 +241,7 @@ jobs:
           test "${RELEASE_TAG#v}" != "$RELEASE_TAG"
           version="${RELEASE_TAG#v}"
           docker buildx imagetools create -t "ghcr.io/semanticist21/your-local-cloud-computing:$version" \
+            -t ghcr.io/semanticist21/your-local-cloud-computing:latest \
             'ghcr.io/semanticist21/your-local-cloud-computing:sha-${{ github.sha }}-amd64' \
             'ghcr.io/semanticist21/your-local-cloud-computing:sha-${{ github.sha }}-arm64'
           docker buildx imagetools create --prefer-index=false -t "ghcr.io/semanticist21/your-local-cloud-computing:$version-windows-ltsc2022" \

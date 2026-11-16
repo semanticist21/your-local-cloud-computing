@@ -35,6 +35,8 @@ docker --context "$YLCC_DOCKER_CONTEXT" run -d --init --name ylcc-worker --resta
   worker --id container-worker --data-dir /data --max-jobs 1
 ```
 
+Without arguments the image runs `worker --data-dir /data` with its token at `/run/secrets/token`, so `-e YLCC_HUB_URL=https://HUB.example.ts.net:10000`, `--hostname WORKER-ID` and the two mounts above are enough. `:latest` follows the newest release. Container workers never self-update: to upgrade, pull the image and recreate the container, by hand or with a host-side updater.
+
 For rootless Podman service management, copy `$YLCC_SUPPORT_DIR/examples/quadlet/ylcc-worker.container` ([example](../examples/quadlet/ylcc-worker.container)) to `~/.config/containers/systemd/`, replace the hub URL and worker ID, then `systemctl --user daemon-reload && systemctl --user start ylcc-worker`. Its keep-id mapping lets the service read your mode-600 token. See [Podman Quadlet](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html).
 
 ## Optional sibling-container execution

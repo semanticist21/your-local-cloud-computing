@@ -25,12 +25,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 10001 --create-home --home-dir /data ylcc \
     && mkdir -p /data && chown 10001:10001 /data
-ENV HOME=/data YLCC_CONTAINERIZED=1
+# With no arguments the image runs a worker: set YLCC_HUB_URL and mount the token here.
+ENV HOME=/data YLCC_CONTAINERIZED=1 YLCC_TOKEN_FILE=/run/secrets/token
 COPY LICENSE THIRD_PARTY_NOTICES.txt /usr/local/share/licenses/ylcc/
 WORKDIR /data
 USER 10001:10001
 ENTRYPOINT ["/usr/local/bin/ylcc"]
-CMD ["--help"]
+CMD ["worker", "--data-dir", "/data"]
 
 # Release CI supplies the already tested, native architecture binary.
 FROM base AS runtime

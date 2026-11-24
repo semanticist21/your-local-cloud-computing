@@ -4330,6 +4330,7 @@ mod tests {
             submitted_by: None,
             started_at: None,
             wait_reason: None,
+            wait_reason_code: None,
             last_output_at: None,
         };
         accept(state.clone(), job, None).unwrap();
@@ -4388,6 +4389,7 @@ mod tests {
             submitted_by: None,
             started_at: None,
             wait_reason: None,
+            wait_reason_code: None,
             last_output_at: None,
         };
         let (cancel, receiver) = watch::channel(false);
@@ -4873,6 +4875,7 @@ mod tests {
             submitted_by: None,
             started_at: None,
             wait_reason: None,
+            wait_reason_code: None,
             last_output_at: None,
         };
         let (_keepalive, receiver) = watch::channel(false);
@@ -4938,6 +4941,7 @@ mod tests {
             submitted_by: None,
             started_at: None,
             wait_reason: None,
+            wait_reason_code: None,
             last_output_at: None,
         };
         let (_keepalive, receiver) = watch::channel(false);
@@ -5058,6 +5062,7 @@ mod tests {
             submitted_by: None,
             started_at: None,
             wait_reason: None,
+            wait_reason_code: None,
             last_output_at: None,
         }
     }

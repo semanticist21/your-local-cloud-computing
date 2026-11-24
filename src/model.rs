@@ -229,6 +229,39 @@ impl JobSpec {
         Ok(())
     }
 }
+pub const IDEMPOTENT_SUBMIT: &str = "idempotent_job_submit";
+pub const IDEMPOTENT_JOBS_PATH: &str = "/v1/jobs/idempotent";
+
+/// Ordered from least to most ready to run, for choosing a reason across candidate workers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum WaitReasonCode {
+    NoCompatibleWorker,
+    WorkerOffline,
+    WorkerPaused,
+    WorkerUpdating,
+    WorkerReconciling,
+    HostCpuLimit,
+    NoSlots,
+    EnvironmentPreparation,
+    WorkerStart,
+}
+
+impl WaitReasonCode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NoCompatibleWorker => "no_compatible_worker",
+            Self::WorkerOffline => "worker_offline",
+            Self::WorkerPaused => "worker_paused",
+            Self::WorkerUpdating => "worker_updating",
+            Self::WorkerReconciling => "worker_reconciling",
+            Self::HostCpuLimit => "host_cpu_limit",
+            Self::NoSlots => "no_slots",
+            Self::EnvironmentPreparation => "environment_preparation",
+            Self::WorkerStart => "worker_start",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
     pub id: String,
@@ -248,9 +281,11 @@ pub struct Job {
     /// When the current attempt started running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<u64>,
-    /// Why this assigned worker has not started the command yet.
+    /// Why the job is queued or its assigned worker has not started the command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_reason_code: Option<String>,
     /// Last stdout/stderr output of the current attempt, recorded at most every few seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_output_at: Option<u64>,
@@ -313,6 +348,8 @@ pub struct HostInfo {
     pub cpu_percent: Option<f64>,
     pub cpu_at: Option<u64>,
     pub schedulable: bool,
+    #[serde(skip)]
+    pub(crate) cpu_blocked: bool,
     pub wait_reason: Option<String>,
 }
 

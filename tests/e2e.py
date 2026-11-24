@@ -247,7 +247,7 @@ def main():
 
             busy, _ = cli("run", "--input", "input.txt", *common, "--detach", "--", *python("import time; time.sleep(3)"))
             queued, _ = cli("run", "--input", "input.txt", *common, "--detach", "--", *noop)
-            assert queued["state"] == "queued"
+            assert queued["state"] == "queued" and queued["wait_reason_code"] == "no_slots"
             wait(busy)
             wait(queued)
 
@@ -261,10 +261,15 @@ def main():
             reconnect, _ = cli("run", "--input", "input.txt", "--output", "answer.txt", *common, "--detach", "--", *python("import time; from pathlib import Path; print('start',flush=True); time.sleep(5); Path('answer.txt').write_bytes(b'done')"))
             until(lambda: state(reconnect)["state"] == "running")
             stop(hub)
+            waiting = subprocess.Popen(prefix + ["jobs", "wait", reconnect["id"]],
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                       start_new_session=os.name != "nt")
+            processes.append(waiting)
             time.sleep(1)
             hub = start("hub", "--listen", f"127.0.0.1:{port}", "--data-dir", str(base / "hub"))
-            until(lambda: any(w["online"] for w in cli("workers")[0]))
-            resumed = wait(reconnect)
+            output, errors = waiting.communicate(timeout=70)
+            assert waiting.returncode == 0 and "checking again" in errors, errors
+            resumed = json.loads(output)
             assert resumed["attempt_id"] == reconnect["attempt_id"] and result(resumed) == "done"
             logs, _ = cli("jobs", "logs", reconnect["id"])
             assert len({line["seq"] for line in logs}) == len(logs)
@@ -317,6 +322,17 @@ def main():
             assert sorted(result(job) for job in counted) == ["inline1", "inline2"], counted
             counted_again, _ = repeat_cli("task", "run", "count")
             assert sorted(result(job) for job in counted_again) == ["inline3", "inline4"]
+            (repeat / "partial.yaml").write_text(
+                "version: 1\n"
+                f"tasks:\n  partial:\n    command: {json.dumps(noop)}\n    no_input: true\n"
+                "    targets: [{}, {worker: nonexistent-worker}]\n")
+            partial = subprocess.run(prefix + ["task", "run", "partial", "--file", "partial.yaml", "--detach"],
+                                     cwd=repeat, text=True, capture_output=True, timeout=60)
+            assert partial.returncode != 0 and "no compatible" in partial.stderr, partial.stderr
+            confirmed = json.loads(partial.stdout)
+            assert wait(confirmed)["id"] == confirmed["id"]
+            retried, _ = cli("jobs", "retry", confirmed["id"])
+            assert retried["id"] != confirmed["id"] and retried["state"] == "succeeded"
             # Defaults (environment, cache) would change this run, so saving is refused before submission.
             refused = subprocess.run(prefix + ["run", "--no-input", *common, "--save-task", "noop", "--", *noop],
                                      cwd=repeat, text=True, capture_output=True, timeout=60)
@@ -338,6 +354,7 @@ def main():
             reprioritized, _ = cli("jobs", "priority", high["id"], "20")
             assert reprioritized["spec"]["priority"] == 20
             assert state(low)["state"] == state(high)["state"] == "queued"
+            assert state(low)["wait_reason_code"] == "worker_paused"
             cli("workers", "limit", "test-worker", "--max-jobs", "2", ok=False)
             # Both Hub restart and worker reconnect must retain the operator's pause.
             stop(worker)

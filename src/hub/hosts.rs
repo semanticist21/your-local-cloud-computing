@@ -175,6 +175,7 @@ impl Store {
                     .evaluate(guard, sample, at)
             });
             let free = config.max_jobs.saturating_sub(used).min(worker_slots);
+            let cpu_blocked = guard_reason.is_some();
             let reason = guard_reason.or_else(|| {
                 (free == 0).then(|| "Host concurrency limit or no available worker slots".into())
             });
@@ -188,6 +189,7 @@ impl Store {
                 cpu_percent: fresh.and_then(|s| s.percent),
                 cpu_at: sample.map(|s| s.at),
                 schedulable: reason.is_none(),
+                cpu_blocked,
                 wait_reason: reason,
             });
         }

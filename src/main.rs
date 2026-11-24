@@ -734,8 +734,8 @@ fn tools(values: Vec<String>) -> BTreeMap<String, String> {
         .collect()
 }
 /// Fails when the Hub predates a feature the spec relies on; older Hubs would silently ignore it.
-async fn require_hub_support(client: &Client, spec: &JobSpec) -> Result<()> {
-    let needed: Vec<_> = [
+fn require_hub_support(supported: &[String], spec: &JobSpec) -> Result<()> {
+    let needed = [
         (spec.priority != 0, "job_priority", "job priority"),
         (
             spec.requirements.worker.is_some(),
@@ -744,16 +744,7 @@ async fn require_hub_support(client: &Client, spec: &JobSpec) -> Result<()> {
         ),
     ]
     .into_iter()
-    .filter(|(used, _, _)| *used)
-    .collect();
-    if needed.is_empty() {
-        return Ok(());
-    }
-    let health: serde_json::Value = client.get("/health").await?;
-    let supported = health["capabilities"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    .filter(|(used, _, _)| *used);
     for (_, capability, feature) in needed {
         if !supported.iter().any(|c| c == capability) {
             bail!("this Hub does not support {feature}; upgrade the Hub first")
@@ -801,8 +792,10 @@ async fn submit(
     for spec in &specs {
         spec.validate()?;
     }
+    let supported = client.hub_capabilities().await?;
+    let idempotent = supported.iter().any(|capability| capability == IDEMPOTENT_SUBMIT);
     for spec in &specs {
-        require_hub_support(client, spec).await?;
+        require_hub_support(&supported, spec)?;
     }
     let (count, bytes) = client.upload(&snap).await?;
     eprintln!(
@@ -811,7 +804,7 @@ async fn submit(
     );
     let mut jobs = Vec::new();
     for spec in &specs {
-        match client.post::<_, Job>("/v1/jobs", spec).await {
+        match client.submit_job(spec, idempotent).await {
             Ok(job) => {
                 eprintln!("job {} ({})", job.id, job.state);
                 jobs.push(job);
@@ -819,7 +812,7 @@ async fn submit(
             // Keep already-submitted jobs trackable on stdout instead of orphaning them.
             Err(error) if !jobs.is_empty() => {
                 report(&jobs, true)?;
-                return Err(error.context("a later target was not submitted; the jobs above are running"));
+                return Err(error.context("a later target could not be confirmed; the jobs above were submitted"));
             }
             Err(error) => return Err(error),
         }
@@ -1405,8 +1398,10 @@ async fn execute() -> Result<()> {
                     if !matches!(previous.state.as_str(), "succeeded" | "failed" | "cancelled") {
                         bail!("job {} is not terminal ({})", id, previous.state)
                     }
-                    require_hub_support(&c, &previous.spec).await?;
-                    let job: Job = c.post("/v1/jobs", &previous.spec).await?;
+                    let supported = c.hub_capabilities().await?;
+                    require_hub_support(&supported, &previous.spec)?;
+                    let idempotent = supported.iter().any(|capability| capability == IDEMPOTENT_SUBMIT);
+                    let job = c.submit_job(&previous.spec, idempotent).await?;
                     if detach {
                         print(&job)
                     } else {

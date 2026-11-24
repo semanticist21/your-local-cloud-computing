@@ -16,9 +16,17 @@ ylcc jobs cancel JOB_ID
 
 `--detach` 없는 `run`과 `jobs wait`는 선언된 출력물을 자동으로 가져옵니다. 결과는 `~/.local/share/ylcc/results/JOB_ID/`에 저장되며 `--results-dir`로 바꿀 수 있습니다. `jobs fetch`는 실제 경로를 알려 줍니다. 출력물을 원격에 그대로 두려면 `--no-download`를 쓰세요. 결과가 프로젝트를 자동으로 덮어쓰는 일은 없습니다.
 
-`jobs show`는 워커가 명령을 시작하기 전까지 `waiting`과 `wait_reason`을 보여 줍니다. `wait_reason`에는 `Fetching job inputs 1200/7780 (45.0 MB of 270.0 MB, 7780 to download)`처럼 지금 하는 단계가 나옵니다. 이후 `started_at`과 `last_output_at`(Unix 초, 최대 5초 간격 갱신)으로 느린 잡과 멈춘 잡을 구분하세요. 로그에는 명령의 stdout/stderr만 담기므로 진행 상황을 파일에만 쓰지 말고 출력하세요(예: `cmd 2>&1 | tee out/log.txt`). `--worker ID`는 특정 워커에서만 실행하고, `--tool NAME`은 감지된 모든 버전을 허용합니다.
+`jobs wait`는 Hub의 일시적인 오류나 워커의 `unknown` 상태가 해소될 때까지 최대 60초간 같은 잡 ID를 다시 조회합니다. CLI가 종료되면 `jobs wait JOB_ID`로 이어서 확인할 수 있습니다. 출력물 전송이 일시적으로 끊기면 재시도하고, 이미 체크섬이 일치하는 로컬 파일은 건너뜁니다.
+
+Hub가 `idempotent_job_submit`을 지원하면 CLI는 같은 호출에서 타깃마다 요청 키를 만들어 제출을 재시도합니다. 제출 여부가 계속 불확실하면 다시 제출하기 전에 `jobs list`를 확인하세요. `jobs retry`는 새 잡을 만듭니다. 구형 Hub에는 제출을 한 번만 요청합니다.
+
+`jobs show`와 대시보드는 잡이 대기 중인 이유를 표시합니다. `wait_reason_code`는 원인을 나타내고 `wait_reason`은 표시 문구를 담습니다. 명령이 시작되면 `started_at`과 `last_output_at`(Unix 초, 최대 5초 간격 갱신)으로 오래 걸리는 잡과 멈춘 잡을 구분할 수 있습니다. 로그에는 명령의 stdout/stderr만 들어갑니다. `--worker ID`는 특정 워커에서만 실행하고, `--tool NAME`은 감지된 모든 버전을 허용합니다.
 
 timeout이나 cancel은 명령의 프로세스 그룹에 SIGTERM을 보내고 30초 뒤 SIGKILL을 보냅니다. 따라서 `trap cleanup EXIT TERM`으로 시뮬레이터 같은 외부 자원을 정리할 수 있습니다(Windows는 잡 객체를 즉시 종료). 잡이 실패·timeout·cancel로 끝나도 그때까지 생긴 선언 출력물은 수집됩니다.
+
+## 제출 API
+
+기존 잡 명세를 `POST /v1/jobs/idempotent`에 보내고 `Idempotency-Key` 헤더에 UUID를 지정합니다. 같은 인증 주체가 같은 키와 명세를 보내면 24시간 동안 현재 잡을 반환합니다. 명세가 다르면 HTTP 409, 그 사이 잡이 삭제되면 HTTP 410을 반환합니다. `POST /v1/jobs`는 호출할 때마다 새 잡을 만듭니다.
 
 ## 입력과 실행 규칙
 

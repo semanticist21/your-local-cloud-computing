@@ -84,6 +84,14 @@ struct Session {
 }
 /// Audit rows kept; older events are pruned so a busy pool cannot fill the disk.
 const AUDIT_RETENTION: i64 = 10_000;
+const SUBMISSION_RETENTION: u64 = 24 * 60 * 60;
+
+struct SubmissionReceipt {
+    actor: String,
+    key: String,
+    fingerprint: String,
+    at: u64,
+}
 /// Worker-caused audit events (connect, rejected) allowed per token per hour.
 const WORKER_AUDIT_PER_HOUR: u32 = 20;
 struct Store {
@@ -116,6 +124,7 @@ struct QueuedJob {
     state: String,
     spec: JobSpec,
     wait_reason: Option<String>,
+    wait_reason_code: Option<String>,
 }
 
 fn identifier(value: &str) -> Result<()> {
@@ -178,6 +187,10 @@ impl Store {
         let db = Connection::open(data.join("hub.sqlite"))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
             CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, data TEXT NOT NULL, environment TEXT, cancel_requested INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS job_submissions (
+                actor TEXT NOT NULL, request_key TEXT NOT NULL, fingerprint TEXT NOT NULL,
+                job_id TEXT NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY(actor,request_key));
+            CREATE INDEX IF NOT EXISTS job_submissions_expiry ON job_submissions(expires_at);
             CREATE INDEX IF NOT EXISTS jobs_state_worker ON jobs(json_extract(data,'$.state'),json_extract(data,'$.worker_id'));
             CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS hosts (id TEXT PRIMARY KEY, data TEXT NOT NULL);
@@ -234,7 +247,7 @@ impl Store {
             store.save_worker(&worker)?;
         }
         store.db.execute(
-            "UPDATE jobs SET data=json_set(data,'$.state','unknown','$.error',?1,'$.updated_at',?2)
+            "UPDATE jobs SET data=json_set(data,'$.state','unknown','$.wait_reason',NULL,'$.wait_reason_code',NULL,'$.error',?1,'$.updated_at',?2)
              WHERE json_extract(data,'$.state') IN ('assigned','waiting','running','cancelling','unknown')",
             params!["hub restarted; awaiting worker reconciliation, no automatic retry", now() as i64],
         )?;
@@ -265,7 +278,8 @@ impl Store {
     fn queued_jobs(&self) -> Result<Vec<QueuedJob>> {
         self.rows("SELECT json_object('id',id,'state',json_extract(data,'$.state'),
             'spec',json_remove(json_extract(data,'$.spec'),'$.inputs','$.outputs'),
-            'wait_reason',json_extract(data,'$.wait_reason'))
+            'wait_reason',json_extract(data,'$.wait_reason'),
+            'wait_reason_code',json_extract(data,'$.wait_reason_code'))
             FROM jobs WHERE json_extract(data,'$.state')='queued' ORDER BY rowid")
     }
     fn worker_attempts(&self, worker: &str) -> Result<BTreeSet<(String, String)>> {
@@ -337,7 +351,8 @@ impl Store {
             'worker_id',json_extract(data,'$.worker_id'),
             'created_at',json_extract(data,'$.created_at'),'updated_at',json_extract(data,'$.updated_at'),
             'submitted_by',json_extract(data,'$.submitted_by'),
-            'wait_reason',json_extract(data,'$.wait_reason'))
+            'wait_reason',json_extract(data,'$.wait_reason'),
+            'wait_reason_code',json_extract(data,'$.wait_reason_code'))
             FROM jobs WHERE {predicate} ORDER BY rowid DESC LIMIT ? OFFSET ?"))?;
         values.extend([rusqlite::types::Value::Integer(limit as i64), rusqlite::types::Value::Integer(offset as i64)]);
         let rows = statement.query_map(rusqlite::params_from_iter(values.iter()), |row| row.get::<_, String>(0))?;
@@ -869,7 +884,54 @@ impl Store {
         }
         Ok(())
     }
+    #[cfg(test)]
     fn add_job(&mut self, spec: JobSpec, submitted_by: Option<String>) -> ApiResult<Job> {
+        let job = self.insert_job(spec, submitted_by, None)?;
+        self.schedule()?;
+        Ok(self.job(&job.id)?.expect("inserted job"))
+    }
+
+    fn submit_job(&mut self, spec: JobSpec, principal: &Principal, key: Option<Uuid>) -> ApiResult<Job> {
+        let receipt = if let Some(key) = key {
+            let actor = audit_key(principal);
+            let key = key.to_string();
+            let fingerprint = hex::encode(Sha256::digest(encode(&spec)?.as_bytes()));
+            let at = now();
+            let previous: Option<(String, String)> = self.db.query_row(
+                "SELECT fingerprint, job_id FROM job_submissions
+                 WHERE actor=?1 AND request_key=?2 AND expires_at>?3",
+                params![actor, key, at],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional().map_err(anyhow::Error::from)?;
+            if let Some((original, id)) = previous {
+                if original != fingerprint {
+                    return Err(ApiError(StatusCode::CONFLICT, "request key already used for a different job spec".into()));
+                }
+                return self.job(&id)?.ok_or_else(|| ApiError(StatusCode::GONE, "submitted job was deleted".into()));
+            }
+            Some(SubmissionReceipt { actor, key, fingerprint, at })
+        } else {
+            None
+        };
+        let job = self.insert_job(spec, Some(principal.name.clone()), receipt)?;
+        let mut detail = job.spec.command[0].clone();
+        if let Some(image) = &job.spec.container {
+            detail.push_str(&format!(" container={image}"));
+        }
+        if let Some(environment) = &job.spec.environment {
+            detail.push_str(&format!(" environment={environment}"));
+        }
+        self.record(principal, "job.submit", &job.id, Some(detail));
+        self.schedule()?;
+        Ok(self.job(&job.id)?.expect("inserted job"))
+    }
+
+    fn insert_job(
+        &mut self,
+        spec: JobSpec,
+        submitted_by: Option<String>,
+        receipt: Option<SubmissionReceipt>,
+    ) -> ApiResult<Job> {
         spec.validate().map_err(invalid)?;
         self.validate_files(&spec.inputs).map_err(invalid)?;
         if let Some(image) = &spec.container {
@@ -918,20 +980,25 @@ impl Store {
             submitted_by,
             started_at: None,
             wait_reason: None,
+            wait_reason_code: None,
             last_output_at: None,
         };
-        self.db
-            .execute(
-                "INSERT INTO jobs(id,data,environment) VALUES(?1,?2,?3)",
-                params![
-                    job.id,
-                    encode(&job)?,
-                    environment.as_ref().map(encode).transpose()?
-                ],
-            )
-            .map_err(anyhow::Error::from)?;
-        self.schedule()?;
-        Ok(self.job(&job.id)?.expect("inserted job"))
+        let tx = self.db.transaction().map_err(anyhow::Error::from)?;
+        tx.execute(
+            "INSERT INTO jobs(id,data,environment) VALUES(?1,?2,?3)",
+            params![job.id, encode(&job)?, environment.as_ref().map(encode).transpose()?],
+        ).map_err(anyhow::Error::from)?;
+        if let Some(SubmissionReceipt { actor, key, fingerprint, at }) = receipt {
+            tx.execute("DELETE FROM job_submissions WHERE expires_at<=?1", [at])
+                .map_err(anyhow::Error::from)?;
+            tx.execute(
+                "INSERT INTO job_submissions(actor,request_key,fingerprint,job_id,expires_at)
+                 VALUES(?1,?2,?3,?4,?5)",
+                params![actor, key, fingerprint, job.id, at + SUBMISSION_RETENTION],
+            ).map_err(anyhow::Error::from)?;
+        }
+        tx.commit().map_err(anyhow::Error::from)?;
+        Ok(job)
     }
     fn schedule(&mut self) -> Result<()> { self.schedule_at(now()) }
     fn schedule_at(&mut self, at: u64) -> Result<()> {
@@ -943,7 +1010,7 @@ impl Store {
         for job in &mut jobs {
             if job.state == "queued" && self.cancel_requested(&job.id)? {
                 job.state = "cancelled".into();
-                self.db.execute("UPDATE jobs SET data=json_set(data,'$.state','cancelled','$.updated_at',?2) WHERE id=?1", params![job.id, now() as i64])?;
+                self.db.execute("UPDATE jobs SET data=json_set(data,'$.state','cancelled','$.wait_reason',NULL,'$.wait_reason_code',NULL,'$.updated_at',?2) WHERE id=?1", params![job.id, now() as i64])?;
             }
         }
         let mut hosts = self.host_infos(at)?;
@@ -979,11 +1046,30 @@ impl Store {
         for job_index in 0..jobs.len() {
             if jobs[job_index].state != "queued" { continue; }
             let environment = self.job_environment(&jobs[job_index].id)?;
-            let mut candidates: Vec<_> = workers.iter().filter(|w| {
-                w.online && !w.paused && w.updating.is_none()
-                    && self.sessions.get(&w.id).is_some_and(|s| !s.reconciling)
-                    && candidate(w, &jobs[job_index].spec, environment.as_ref()).is_empty()
-            }).collect();
+            use WaitReasonCode::*;
+            let mut reason = (NoCompatibleWorker, "No compatible registered worker".to_string());
+            let mut note = |code, text| {
+                if code > reason.0 {
+                    reason = (code, text);
+                }
+            };
+            let mut candidates = Vec::new();
+            for worker in &workers {
+                if !candidate(worker, &jobs[job_index].spec, environment.as_ref()).is_empty() {
+                    continue;
+                }
+                if !worker.online {
+                    note(WorkerOffline, "Waiting for a compatible worker to come online".into());
+                } else if worker.paused {
+                    note(WorkerPaused, "Waiting for a compatible worker to resume".into());
+                } else if worker.updating.is_some() {
+                    note(WorkerUpdating, "Waiting for a compatible worker to finish updating".into());
+                } else if self.sessions.get(&worker.id).is_none_or(|session| session.reconciling) {
+                    note(WorkerReconciling, "Waiting for a compatible worker to reconcile after reconnecting".into());
+                } else {
+                    candidates.push(worker);
+                }
+            }
             candidates.sort_by(|a, b| {
                 let ah = &hosts[host_index(&a.id, &hosts)];
                 let bh = &hosts[host_index(&b.id, &hosts)];
@@ -992,26 +1078,36 @@ impl Store {
                         .total_cmp(&(worker_used(&b.id, &counts) as f64 / b.max_jobs as f64)))
                     .then_with(|| a.id.cmp(&b.id))
             });
-            let mut reason = "Waiting for a compatible online worker".to_string();
             for worker in candidates {
                 let index = host_index(&worker.id, &hosts);
+                let preparing = statuses.iter().any(|s| s.worker_id == worker.id
+                    && matches!(s.state.as_str(), "pending" | "preparing" | "unknown"));
                 if let Some(blocked) = &hosts[index].wait_reason {
-                    reason = blocked.clone();
+                    if hosts[index].cpu_blocked {
+                        note(HostCpuLimit, blocked.clone());
+                    } else if preparing {
+                        note(EnvironmentPreparation, "Waiting for environment preparation or reconciliation".into());
+                    } else {
+                        note(NoSlots, blocked.clone());
+                    }
                     continue;
                 }
                 let used = worker_used(&worker.id, &counts);
                 if hosts[index].available_slots == 0 || used >= worker.max_jobs {
-                    reason = "Waiting for host or worker concurrency slots".into();
+                    note(NoSlots, "Waiting for host or worker concurrency slots".into());
                     continue;
                 }
-                if statuses.iter().any(|s| s.worker_id == worker.id && matches!(s.state.as_str(), "pending" | "preparing" | "unknown")) {
-                    reason = "Waiting for environment preparation or reconciliation".into();
+                if preparing {
+                    note(EnvironmentPreparation, "Waiting for environment preparation or reconciliation".into());
                     continue;
                 }
                 if let Some(environment) = &environment {
                     match self.status(&worker.id, environment)? {
                         Some(status) if status.state == "ready" => {}
-                        Some(status) if matches!(status.state.as_str(), "failed" | "unknown") => { continue; }
+                        Some(status) if matches!(status.state.as_str(), "failed" | "unknown") => {
+                            note(EnvironmentPreparation, format!("Waiting for environment {} to become ready", environment.id));
+                            continue;
+                        }
                         _ => {
                             let mut status = EnvironmentStatus {
                                 worker_id: worker.id.clone(), environment_id: environment.id.clone(),
@@ -1023,7 +1119,7 @@ impl Store {
                                 reserve_host(&mut hosts[index]);
                             }
                             statuses.push(status);
-                            reason = format!("Waiting for environment {} preparation", environment.id);
+                            note(EnvironmentPreparation, format!("Waiting for environment {} preparation", environment.id));
                             break;
                         }
                     }
@@ -1032,6 +1128,7 @@ impl Store {
                 let mut job = self.job(&queued.id)?.context("queued job disappeared")?;
                 job.state = "waiting".into();
                 job.wait_reason = Some("Waiting for worker admission".into());
+                job.wait_reason_code = Some(WorkerStart.as_str().into());
                 job.worker_id = Some(worker.id.clone());
                 job.updated_at = now();
                 self.save_job(&job)?;
@@ -1042,6 +1139,8 @@ impl Store {
                 }) {
                     job.state = "unknown".into();
                     job.error = Some("worker connection lost during assignment".into());
+                    job.wait_reason = None;
+                    job.wait_reason_code = None;
                     self.save_job(&job)?;
                 }
                 *counts.entry(worker.id.clone()).or_default() += 1;
@@ -1049,8 +1148,14 @@ impl Store {
                 break;
             }
             let job = &mut jobs[job_index];
-            if job.state == "queued" && job.wait_reason.as_deref() != Some(&reason) {
-                self.db.execute("UPDATE jobs SET data=json_set(data,'$.wait_reason',?2) WHERE id=?1", params![job.id, reason])?;
+            let (code, text) = reason;
+            let code = code.as_str();
+            if job.state == "queued" && (job.wait_reason.as_deref() != Some(&text)
+                || job.wait_reason_code.as_deref() != Some(code)) {
+                self.db.execute(
+                    "UPDATE jobs SET data=json_set(data,'$.wait_reason',?2,'$.wait_reason_code',?3) WHERE id=?1",
+                    params![job.id, text, code],
+                )?;
             }
         }
         // Failed setup is actionable; only an explicit prepare call can retry that revision.
@@ -1074,7 +1179,7 @@ impl Store {
                     "environment {} revision {} preparation failed; inspect status and explicitly prepare to retry",
                     environment.id, environment.revision
                 );
-                self.db.execute("UPDATE jobs SET data=json_set(data,'$.state','failed','$.error',?2,'$.updated_at',?3) WHERE id=?1", params![job.id, error, now() as i64])?;
+                self.db.execute("UPDATE jobs SET data=json_set(data,'$.state','failed','$.error',?2,'$.wait_reason',NULL,'$.wait_reason_code',NULL,'$.updated_at',?3) WHERE id=?1", params![job.id, error, now() as i64])?;
             }
         }
         Ok(())
@@ -1157,13 +1262,14 @@ impl Store {
         }
         if report.state == "unknown" {
             let error = report.error.unwrap_or_else(|| "worker cannot establish the attempt outcome; no automatic retry".into());
-            self.db.execute("UPDATE jobs SET data=json_set(data,'$.state','unknown','$.error',?2,'$.updated_at',?3) WHERE id=?1",
+            self.db.execute("UPDATE jobs SET data=json_set(data,'$.state','unknown','$.wait_reason',NULL,'$.wait_reason_code',NULL,'$.error',?2,'$.updated_at',?3) WHERE id=?1",
                 params![report.job_id, error, now() as i64])?;
         } else if matches!(report.state.as_str(), "running" | "assigned" | "cancelling") {
             let state = if self.cancel_requested(&report.job_id)? { "cancelling" }
                 else if report.state == "assigned" { "waiting" } else { "running" };
-            self.db.execute("UPDATE jobs SET data=json_set(data,'$.state',?2,'$.error',NULL,'$.wait_reason',CASE WHEN ?2='running' THEN NULL ELSE json_extract(data,'$.wait_reason') END,'$.updated_at',?3) WHERE id=?1",
-                params![report.job_id, state, now() as i64])?;
+            self.db.execute("UPDATE jobs SET data=json_set(data,'$.state',?2,'$.error',NULL,'$.wait_reason',CASE WHEN ?2='waiting' THEN COALESCE(json_extract(data,'$.wait_reason'),'Waiting for worker admission') ELSE NULL END,
+                '$.wait_reason_code',CASE WHEN ?2='waiting' THEN ?4 ELSE NULL END,'$.updated_at',?3) WHERE id=?1",
+                params![report.job_id, state, now() as i64, WaitReasonCode::WorkerStart.as_str()])?;
         } else if job_is_terminal(&report.state) {
             let mut state = report.state;
             let mut error = report.error;
@@ -1189,7 +1295,7 @@ impl Store {
                     results.clear();
                 }
             }
-            self.db.execute("UPDATE jobs SET data=json_set(data,'$.state',?2,'$.wait_reason',NULL,'$.exit_code',?3,'$.error',?4,'$.results',json(?5),'$.updated_at',?6) WHERE id=?1",
+            self.db.execute("UPDATE jobs SET data=json_set(data,'$.state',?2,'$.wait_reason',NULL,'$.wait_reason_code',NULL,'$.exit_code',?3,'$.error',?4,'$.results',json(?5),'$.updated_at',?6) WHERE id=?1",
                 params![report.job_id, state, report.exit_code, error, encode(&results)?, now() as i64])?;
         } else {
             bail!("unsupported attempt report state")
@@ -1311,7 +1417,7 @@ impl Store {
         for (job_id, attempt_id) in self.worker_attempts(&id)? {
             if !incremental && !reported.contains(&(job_id.clone(), attempt_id.clone())) {
                 self.db.execute(
-                    "UPDATE jobs SET data=json_set(data,'$.state','unknown','$.error',?2,'$.updated_at',?3) WHERE id=?1",
+                    "UPDATE jobs SET data=json_set(data,'$.state','unknown','$.wait_reason',NULL,'$.wait_reason_code',NULL,'$.error',?2,'$.updated_at',?3) WHERE id=?1",
                     params![job_id, "worker did not report this attempt; cancel explicitly before retrying", now() as i64],
                 )?;
             }
@@ -1392,7 +1498,7 @@ impl Store {
                 session.tx.send(HubMessage::Ready)?;
                 for (id, attempt) in missing {
                     if self.report_state(worker, &id, &attempt)?.is_some_and(|state| active(&state)) {
-                        self.db.execute("UPDATE jobs SET data=json_set(data,'$.state','unknown','$.error',?2,'$.updated_at',?3) WHERE id=?1",
+                        self.db.execute("UPDATE jobs SET data=json_set(data,'$.state','unknown','$.wait_reason',NULL,'$.wait_reason_code',NULL,'$.error',?2,'$.updated_at',?3) WHERE id=?1",
                             params![id, "worker did not report this attempt; cancel explicitly before retrying", now() as i64])?;
                     }
                 }
@@ -1404,7 +1510,7 @@ impl Store {
                     } else {
                         "running"
                     };
-                    self.db.execute("UPDATE jobs SET data=json_set(data,'$.state',?2,'$.error',NULL,'$.wait_reason',NULL,'$.updated_at',?3,'$.started_at',?3,'$.last_output_at',NULL) WHERE id=?1",
+                    self.db.execute("UPDATE jobs SET data=json_set(data,'$.state',?2,'$.error',NULL,'$.wait_reason',NULL,'$.wait_reason_code',NULL,'$.updated_at',?3,'$.started_at',?3,'$.last_output_at',NULL) WHERE id=?1",
                         params![job_id, state, now() as i64])?;
                 }
             }
@@ -1413,8 +1519,8 @@ impl Store {
                 if self.report_state(worker, &job_id, &attempt_id)?.is_none() {
                     return Ok(());
                 }
-                self.db.execute("UPDATE jobs SET data=json_set(data,'$.state','waiting','$.wait_reason',?2,'$.updated_at',?3) WHERE id=?1 AND json_extract(data,'$.state') IN ('assigned','waiting') AND json_extract(data,'$.started_at') IS NULL",
-                    params![job_id, reason, now() as i64])?;
+                self.db.execute("UPDATE jobs SET data=json_set(data,'$.state','waiting','$.wait_reason',?2,'$.wait_reason_code',?4,'$.updated_at',?3) WHERE id=?1 AND json_extract(data,'$.state') IN ('assigned','waiting') AND json_extract(data,'$.started_at') IS NULL",
+                    params![job_id, reason, now() as i64, WaitReasonCode::WorkerStart.as_str()])?;
             }
             WorkerMessage::Log { entry } => {
                 let is_job = if let Some(environment) = entry.job_id.strip_prefix("environment:") {
@@ -1514,7 +1620,7 @@ impl Store {
             self.save_worker(&info)?;
         }
         self.db.execute(
-            "UPDATE jobs SET data=json_set(data,'$.state','unknown','$.error',?2,'$.updated_at',?3)
+            "UPDATE jobs SET data=json_set(data,'$.state','unknown','$.wait_reason',NULL,'$.wait_reason_code',NULL,'$.error',?2,'$.updated_at',?3)
              WHERE json_extract(data,'$.worker_id')=?1 AND json_extract(data,'$.state') IN ('assigned','waiting','running','cancelling','unknown')",
             params![worker, "worker disconnected; awaiting reconciliation, no automatic retry", now() as i64],
         )?;
@@ -1689,6 +1795,7 @@ fn router(state: Shared) -> Router {
         .route("/v1/workers/{id}/metrics", get(worker_metrics))
         .route("/v1/blobs/missing", post(missing_blobs))
         .route("/v1/jobs", post(submit).get(jobs))
+        .route(IDEMPOTENT_JOBS_PATH, post(submit_idempotent))
         .route("/v1/jobs/summary", get(job_summaries))
         .route("/v1/jobs/{id}", get(job))
         .route("/v1/jobs/{id}/logs", get(logs))
@@ -1720,7 +1827,7 @@ fn router(state: Shared) -> Router {
                     "status":"ok",
                     "version":crate::VERSION,
                     "transfer_limits":limits,
-                    "capabilities":["host_scheduling", "job_priority", "worker_control", "scoped_tokens", "audit_log", "command_policy", "job_worker", "worker_metrics", "incremental_reconnect", "worker_updates"]
+                    "capabilities":["host_scheduling", "job_priority", "worker_control", "scoped_tokens", "audit_log", "command_policy", "job_worker", "worker_metrics", "incremental_reconnect", "worker_updates", IDEMPOTENT_SUBMIT]
                 }))
             }),
         )
@@ -1992,6 +2099,8 @@ struct JobSummary {
     updated_at: u64,
     submitted_by: Option<String>,
     wait_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wait_reason_code: Option<String>,
 }
 #[derive(Default, Serialize)]
 struct WorkerJobCounts { total: usize, active: usize }
@@ -2046,17 +2155,22 @@ async fn submit(
     Extension(principal): Extension<Principal>,
     Json(spec): Json<JobSpec>,
 ) -> ApiResult<Json<Job>> {
-    let mut store = lock(&state)?;
-    let job = store.add_job(spec, Some(principal.name.clone()))?;
-    let mut detail = job.spec.command.first().cloned().unwrap_or_default();
-    if let Some(image) = &job.spec.container {
-        detail.push_str(&format!(" container={image}"));
-    }
-    if let Some(environment) = &job.spec.environment {
-        detail.push_str(&format!(" environment={environment}"));
-    }
-    store.record(&principal, "job.submit", &job.id, Some(detail));
-    Ok(Json(job))
+    Ok(Json(lock(&state)?.submit_job(spec, &principal, None)?))
+}
+async fn submit_idempotent(
+    State(state): State<Shared>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    Json(spec): Json<JobSpec>,
+) -> ApiResult<Json<Job>> {
+    let all_keys = headers.get_all("idempotency-key");
+    let mut keys = all_keys.iter();
+    let key = keys.next()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .filter(|_| keys.next().is_none())
+        .ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "expected one UUID Idempotency-Key".into()))?;
+    Ok(Json(lock(&state)?.submit_job(spec, &principal, Some(key))?))
 }
 #[derive(Deserialize)]
 struct LogQuery {
@@ -2126,6 +2240,8 @@ async fn cancel(
             job.error = Some("cancel recorded; awaiting worker reconnection".into());
         }
         job.updated_at = now();
+        job.wait_reason = None;
+        job.wait_reason_code = None;
         store.save_job(&job)?;
         store.schedule()?;
         store.record(&principal, "job.cancel", &id, None);
@@ -2572,6 +2688,123 @@ mod tests {
         let store = Store::open(dir.path().into(), "test-token-long-enough".into()).unwrap();
         (dir, store)
     }
+    #[tokio::test]
+    async fn dropped_and_concurrent_submission_responses_create_one_job_per_key() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let secret = "a".repeat(64);
+        let mut token = tempfile::NamedTempFile::new().unwrap();
+        crate::platform::protect_file(token.as_file()).unwrap();
+        writeln!(token, "{secret}").unwrap();
+        token.flush().unwrap();
+
+        let mut store = Store::open(dir.path().into(), secret.clone()).unwrap();
+        let (_, _worker) = worker(&mut store, "one");
+        let state = Arc::new(Mutex::new(store));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let drop_first_response = {
+            let dropped = dropped.clone();
+            middleware::from_fn(move |request: axum::extract::Request, next: Next| {
+                let dropped = dropped.clone();
+                async move {
+                    let keyed = request.uri().path() == IDEMPOTENT_JOBS_PATH;
+                    let response = next.run(request).await;
+                    if keyed && response.status().is_success() && !dropped.swap(true, Ordering::SeqCst) {
+                        let interrupted = futures_util::stream::once(async {
+                            Err::<axum::body::Bytes, _>(std::io::Error::other("response lost after Hub commit"))
+                        });
+                        return (StatusCode::OK, Body::from_stream(interrupted)).into_response();
+                    }
+                    response
+                }
+            })
+        };
+        let app = router(state.clone()).layer(drop_first_response);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = crate::client::Client::new(&address, token.path()).unwrap();
+        assert!(client.hub_capabilities().await.unwrap().contains(&IDEMPOTENT_SUBMIT.to_string()));
+        let job = client.submit_job(&spec(), true).await.unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(state.lock().unwrap().jobs(None, None).unwrap().len(), 1);
+        assert!(state.lock().unwrap().job(&job.id).unwrap().is_some());
+
+        let key = Uuid::new_v4().to_string();
+        let post = || client.request(reqwest::Method::POST, IDEMPOTENT_JOBS_PATH)
+            .header("Idempotency-Key", key.as_str()).json(&spec()).send();
+        let (first, second) = tokio::join!(post(), post());
+        let first: Job = first.unwrap().error_for_status().unwrap().json().await.unwrap();
+        let second: Job = second.unwrap().error_for_status().unwrap().json().await.unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.attempt_id, second.attempt_id);
+        assert_ne!(job.id, second.id);
+        assert_eq!(state.lock().unwrap().jobs(None, None).unwrap().len(), 2);
+        server.abort();
+    }
+
+    #[test]
+    fn submission_receipt_survives_restart_and_job_deletion() {
+        let (dir, mut store) = test_store();
+        let (_, _worker) = worker(&mut store, "one");
+        let actor = pool_principal();
+        let key = Uuid::new_v4();
+        let job = store.submit_job(spec(), &actor, Some(key)).unwrap();
+        let other_actor = Principal { token_id: Some("other-token".into()), ..pool_principal() };
+        let other_job = store.submit_job(spec(), &other_actor, Some(key)).unwrap();
+        assert_ne!(job.id, other_job.id);
+        drop(store);
+
+        let mut store = Store::open(dir.path().into(), "test-token-long-enough".into()).unwrap();
+        let recovered = store.submit_job(spec(), &actor, Some(key)).unwrap();
+        assert_eq!(recovered.id, job.id);
+        assert_eq!(recovered.attempt_id, job.attempt_id);
+        assert_eq!(recovered.state, "unknown");
+
+        let changed = JobSpec { priority: 10, ..spec() };
+        assert_eq!(store.submit_job(changed, &actor, Some(key)).unwrap_err().0, StatusCode::CONFLICT);
+        let mut finished = recovered;
+        finished.state = "succeeded".into();
+        finished.spec.priority = 5;
+        store.save_job(&finished).unwrap();
+        assert_eq!(store.submit_job(spec(), &actor, Some(key)).unwrap().spec.priority, 5);
+        store.delete_job(&job.id).unwrap();
+        assert_eq!(store.submit_job(spec(), &actor, Some(key)).unwrap_err().0, StatusCode::GONE);
+        assert_eq!(store.jobs(None, None).unwrap().len(), 1);
+
+        store.db.execute("UPDATE job_submissions SET expires_at=0 WHERE actor=?1", [audit_key(&actor)]).unwrap();
+        assert_ne!(store.submit_job(spec(), &actor, Some(key)).unwrap().id, job.id);
+    }
+
+    #[test]
+    fn queue_reason_reports_the_worker_closest_to_running() {
+        let (_dir, mut store) = test_store();
+        let (session_a, _a) = worker(&mut store, "a");
+        let (session_b, _b) = worker(&mut store, "b");
+        let active_job = store.add_job(JobSpec {
+            requirements: Requirements { worker: Some("a".into()), ..Default::default() },
+            ..spec()
+        }, None).unwrap();
+        assert_eq!(active_job.wait_reason_code.as_deref(), Some("worker_start"));
+        store.disconnect("b", session_b).unwrap();
+        let job = store.add_job(spec(), None).unwrap();
+        assert_eq!(job.wait_reason_code.as_deref(), Some("no_slots"));
+
+        let current_reason = |store: &Store| store.job(&job.id).unwrap().unwrap().wait_reason_code;
+        store.control_worker("a", WorkerControl { paused: Some(true), ..Default::default() }).unwrap();
+        assert_eq!(current_reason(&store).as_deref(), Some("worker_paused"));
+        store.sessions.get_mut("a").unwrap().reconciling = true;
+        store.control_worker("a", WorkerControl { paused: Some(false), ..Default::default() }).unwrap();
+        assert_eq!(current_reason(&store).as_deref(), Some("worker_reconciling"));
+        let summaries = store.job_summaries(&JobListQuery::default()).unwrap();
+        let summary = summaries.jobs.iter().find(|summary| summary.id == job.id).unwrap();
+        assert_eq!(summary.wait_reason_code.as_deref(), Some("worker_reconciling"));
+        store.disconnect("a", session_a).unwrap();
+        assert_eq!(current_reason(&store).as_deref(), Some("worker_offline"));
+    }
+
     #[test]
     fn metadata_queries_keep_queue_order_and_all_active_reservations() {
         let (_dir, mut store) = test_store();
@@ -2788,6 +3021,7 @@ mod tests {
         let job = store.add_job(spec(), None).unwrap();
         assert_eq!(job.state, "queued");
         assert!(job.wait_reason.unwrap().contains("CPU"));
+        assert_eq!(job.wait_reason_code.as_deref(), Some("host_cpu_limit"));
         let base = now();
         for offset in [0, 15, 30] {
             store.cpu_samples.insert("a".into(), CpuObservation { at: base + offset, percent: Some(50.0) });
@@ -3317,6 +3551,7 @@ mod tests {
         assert_eq!(running.state, "running");
         assert!(running.started_at.is_some());
         assert!(running.wait_reason.is_none());
+        assert!(running.wait_reason_code.is_none());
     }
     #[test]
     fn pause_drains_active_jobs_and_resume_assigns_queued_work() {

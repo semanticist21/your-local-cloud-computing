@@ -2961,7 +2961,8 @@ pub async fn probe() -> Result<Capabilities> {
     .into();
     let mut tools = BTreeMap::new();
     let values = BTreeMap::new();
-    for name in [
+    let values = &values;
+    let probes = [
         "git",
         "rustc",
         "cargo",
@@ -2990,8 +2991,11 @@ pub async fn probe() -> Result<Capabilities> {
         "zig",
         "protoc",
         "pkg-config",
-    ] {
-        if let Ok(version) = tool_version(name, &values, None).await {
+    ]
+    .map(|name| async move { (name, tool_version(name, &values, None).await) });
+    // Probe concurrently: one slow tool (a JVM, a busy daemon) must not delay startup by the sum.
+    for (name, version) in futures_util::future::join_all(probes).await {
+        if let Ok(version) = version {
             tools.insert(name.into(), version);
         }
     }

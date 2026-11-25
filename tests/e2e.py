@@ -265,10 +265,15 @@ def main():
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                        start_new_session=os.name != "nt")
             processes.append(waiting)
-            time.sleep(1)
+            # Restart the Hub only after the CLI has seen it down; a slow CLI start could miss the outage.
+            seen = ""
+            while "checking again" not in seen:
+                line = waiting.stderr.readline()
+                assert line, seen
+                seen += line
             hub = start("hub", "--listen", f"127.0.0.1:{port}", "--data-dir", str(base / "hub"))
             output, errors = waiting.communicate(timeout=70)
-            assert waiting.returncode == 0 and "checking again" in errors, errors
+            assert waiting.returncode == 0, seen + errors
             resumed = json.loads(output)
             assert resumed["attempt_id"] == reconnect["attempt_id"] and result(resumed) == "done"
             logs, _ = cli("jobs", "logs", reconnect["id"])

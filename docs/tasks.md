@@ -76,6 +76,25 @@ ylcc task run test
 
 YAML version 1 rejects unknown fields and invalid selections. CPU/memory percentage limits are not supported by this schema; configure actual resource caps in the container runtime or operating system. `max_jobs` limits simultaneous jobs, not their CPU or memory consumption.
 
+## Follow-up jobs
+
+`then` lists tasks the Hub submits after a job of this task succeeds, like a deploy after a build. The Hub does it itself, so the requesting CLI may exit or detach. Each follow-up gets its own inputs plus the parent's results at the same relative paths (a result replaces an input at that path). With `targets`, every target's job gets its own follow-ups. A failed or cancelled job submits none.
+
+```yaml
+tasks:
+  build:
+    command: [sh, -c, 'make dist']
+    inputs: [Makefile, src]
+    outputs: [dist]
+    then: [deploy]
+  deploy:
+    command: [sh, -c, './deploy.sh dist']
+    inputs: [deploy.sh]
+    requirements: {worker: deploy-host}
+```
+
+The follow-up jobs are checked when the parent is submitted. Their ids appear in the parent's `followups`, and each follow-up's `parent` points back. If one can no longer be submitted (for example, no compatible worker remains), the parent records `followup_error`. `task run` without `--detach` waits for the parent only; use `jobs wait` on a follow-up id. A follow-up can have its own `then`; cycles are rejected. Keep deploy credentials in the configuration of the worker that `requirements.worker` pins, not in `env`: the Hub stores job specs in plain text.
+
 ## Control queued work
 
 The Hub persists the queue and worker controls. Higher numeric priority runs first among compatible queued jobs; equal priorities retain submission order. Priority defaults to `0` and accepts `-100` through `100`. Changing priority never interrupts an assigned or running job.

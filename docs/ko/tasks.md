@@ -76,6 +76,25 @@ ylcc task run test
 
 YAML 버전 1은 알 수 없는 필드와 잘못된 선택을 거부합니다. 이 스키마는 CPU/메모리 비율 제한을 지원하지 않습니다. 실제 자원 상한은 컨테이너 런타임이나 운영체제에서 설정하세요. `max_jobs`는 동시 잡 수를 제한할 뿐, CPU나 메모리 사용량을 제한하지 않습니다.
 
+## 후속 작업
+
+`then`에는 이 태스크의 job이 성공한 뒤 Hub가 제출할 태스크를 적습니다. 빌드 뒤의 배포가 그런 예입니다. Hub가 직접 제출하므로 요청한 CLI는 종료하거나 detach해도 됩니다. 후속 job은 자신의 입력에 부모의 결과를 같은 상대 경로로 더해 받습니다(같은 경로의 입력은 결과로 바뀝니다). `targets`가 있으면 타깃별 job마다 후속 job이 따로 붙습니다. 실패하거나 취소된 job은 후속 job을 제출하지 않습니다.
+
+```yaml
+tasks:
+  build:
+    command: [sh, -c, 'make dist']
+    inputs: [Makefile, src]
+    outputs: [dist]
+    then: [deploy]
+  deploy:
+    command: [sh, -c, './deploy.sh dist']
+    inputs: [deploy.sh]
+    requirements: {worker: deploy-host}
+```
+
+후속 job은 부모를 제출할 때 함께 검사합니다. 후속 job id는 부모의 `followups`에 나오고, 후속 job의 `parent`는 부모를 가리킵니다. 그사이 호환 워커가 사라지는 등으로 제출할 수 없게 되면 부모에 `followup_error`가 기록됩니다. `--detach` 없는 `task run`은 부모만 기다리므로 후속 job은 그 id로 `jobs wait` 하세요. 후속 태스크도 `then`을 가질 수 있고, 순환은 거부합니다. 배포 자격 증명은 `env`가 아니라 `requirements.worker`로 고정한 워커의 설정에 두세요. Hub는 job spec을 평문으로 저장합니다.
+
 ## 대기 중인 작업 제어
 
 허브는 대기열과 워커 제어 상태를 영구 저장합니다. 호환되는 대기 잡 중에서는 우선순위 숫자가 높은 잡이 먼저 실행되고, 우선순위가 같으면 제출 순서를 유지합니다. 우선순위 기본값은 `0`이며 `-100`부터 `100`까지 허용됩니다. 우선순위를 바꿔도 이미 할당되었거나 실행 중인 잡은 중단되지 않습니다.

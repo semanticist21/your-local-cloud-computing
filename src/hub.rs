@@ -933,6 +933,31 @@ impl Store {
         receipt: Option<SubmissionReceipt>,
     ) -> ApiResult<Job> {
         spec.validate().map_err(invalid)?;
+        let environment = self.check_spec(&spec)?;
+        let job = Job {
+            id: Uuid::new_v4().to_string(),
+            attempt_id: Uuid::new_v4().to_string(),
+            state: "queued".into(),
+            spec,
+            worker_id: None,
+            created_at: now(),
+            updated_at: now(),
+            exit_code: None,
+            error: None,
+            results: vec![],
+            submitted_by,
+            started_at: None,
+            wait_reason: None,
+            wait_reason_code: None,
+            last_output_at: None,
+            parent: None,
+            followups: vec![],
+            followup_error: None,
+        };
+        self.store_job(job, environment, receipt)
+    }
+    /// Checks a spec and its follow-ups against stored blobs, environments and workers.
+    fn check_spec(&self, spec: &JobSpec) -> ApiResult<Option<Environment>> {
         self.validate_files(&spec.inputs).map_err(invalid)?;
         if let Some(image) = &spec.container {
             image_ref(image).map_err(invalid)?;
@@ -955,7 +980,7 @@ impl Store {
             ));
         }
         let workers = self.workers()?;
-        let reasons = incompatibilities(&workers, &spec, environment.as_ref());
+        let reasons = incompatibilities(&workers, spec, environment.as_ref());
         if workers.is_empty() || reasons.len() == workers.len() {
             return Err(invalid(format!(
                 "no compatible registered worker: {}",
@@ -966,23 +991,17 @@ impl Store {
                 }
             )));
         }
-        let job = Job {
-            id: Uuid::new_v4().to_string(),
-            attempt_id: Uuid::new_v4().to_string(),
-            state: "queued".into(),
-            spec,
-            worker_id: None,
-            created_at: now(),
-            updated_at: now(),
-            exit_code: None,
-            error: None,
-            results: vec![],
-            submitted_by,
-            started_at: None,
-            wait_reason: None,
-            wait_reason_code: None,
-            last_output_at: None,
-        };
+        for next in &spec.then {
+            self.check_spec(next)?;
+        }
+        Ok(environment)
+    }
+    fn store_job(
+        &mut self,
+        job: Job,
+        environment: Option<Environment>,
+        receipt: Option<SubmissionReceipt>,
+    ) -> ApiResult<Job> {
         let tx = self.db.transaction().map_err(anyhow::Error::from)?;
         tx.execute(
             "INSERT INTO jobs(id,data,environment) VALUES(?1,?2,?3)",
@@ -1134,9 +1153,12 @@ impl Store {
                 self.save_job(&job)?;
                 queued.state = job.state.clone();
                 // A lost delivery remains an unknown attempt; never retry it on another host.
-                if let Err(mpsc::error::SendError(HubMessage::Run { mut job, .. })) = self.sessions[&worker.id].tx.send(HubMessage::Run {
-                    job: Box::new(job), environment: environment.clone(),
-                }) {
+                // Follow-ups stay on the Hub; the worker needs only this job.
+                let mut sent = job.clone();
+                sent.spec.then.clear();
+                if self.sessions[&worker.id].tx.send(HubMessage::Run {
+                    job: Box::new(sent), environment: environment.clone(),
+                }).is_err() {
                     job.state = "unknown".into();
                     job.error = Some("worker connection lost during assignment".into());
                     job.wait_reason = None;
@@ -1250,6 +1272,31 @@ impl Store {
         }
         Ok(assignment)
     }
+    /// Queues `spec.then` with the parent's results as inputs. A follow-up that cannot be
+    /// submitted is recorded on the parent instead of failing the worker's report.
+    fn submit_followups(&mut self, parent_id: &str, results: &[FileEntry]) -> Result<()> {
+        let parent = self.job(parent_id)?.context("unknown job")?;
+        let mut ids = vec![];
+        let mut errors = vec![];
+        for mut spec in parent.spec.then {
+            // A result replaces an input at the same path; inputs that clash as file/directory go.
+            let clashes = |path: &str| results.iter().any(|r| {
+                r.path == path || path.starts_with(&format!("{}/", r.path)) || r.path.starts_with(&format!("{path}/"))
+            });
+            spec.inputs.retain(|input| !clashes(&input.path));
+            spec.inputs.extend(results.iter().cloned());
+            match self.insert_job(spec, parent.submitted_by.clone(), None) {
+                Ok(job) => {
+                    self.db.execute("UPDATE jobs SET data=json_set(data,'$.parent',?2) WHERE id=?1", params![job.id, parent_id])?;
+                    ids.push(job.id);
+                }
+                Err(ApiError(_, error)) => errors.push(error),
+            }
+        }
+        self.db.execute("UPDATE jobs SET data=json_set(data,'$.followups',json(?2),'$.followup_error',?3) WHERE id=?1",
+            params![parent_id, encode(&ids)?, (!errors.is_empty()).then(|| errors.join("; "))])?;
+        Ok(())
+    }
     fn report(&mut self, worker: &str, report: AttemptReport) -> Result<()> {
         let Some(state) = self.report_state(worker, &report.job_id, &report.attempt_id)? else {
             return Ok(());
@@ -1297,6 +1344,9 @@ impl Store {
             }
             self.db.execute("UPDATE jobs SET data=json_set(data,'$.state',?2,'$.wait_reason',NULL,'$.wait_reason_code',NULL,'$.exit_code',?3,'$.error',?4,'$.results',json(?5),'$.updated_at',?6) WHERE id=?1",
                 params![report.job_id, state, report.exit_code, error, encode(&results)?, now() as i64])?;
+            if state == "succeeded" {
+                self.submit_followups(&report.job_id, &results)?;
+            }
         } else {
             bail!("unsupported attempt report state")
         }
@@ -1827,7 +1877,7 @@ fn router(state: Shared) -> Router {
                     "status":"ok",
                     "version":crate::VERSION,
                     "transfer_limits":limits,
-                    "capabilities":["host_scheduling", "job_priority", "worker_control", "scoped_tokens", "audit_log", "command_policy", "job_worker", "worker_metrics", "incremental_reconnect", "worker_updates", IDEMPOTENT_SUBMIT]
+                    "capabilities":["host_scheduling", "job_priority", "worker_control", "scoped_tokens", "audit_log", "command_policy", "job_worker", "worker_metrics", "incremental_reconnect", "worker_updates", IDEMPOTENT_SUBMIT, FOLLOWUPS]
                 }))
             }),
         )
@@ -3161,6 +3211,62 @@ mod tests {
             )
             .unwrap();
         store.schedule().unwrap();
+    }
+
+    fn blob(store: &Store, path: &str, body: &[u8]) -> FileEntry {
+        let hash = hex::encode(Sha256::digest(body));
+        std::fs::write(store.blobs.join(&hash), body).unwrap();
+        FileEntry { path: path.into(), hash, size: body.len() as u64, mode: 0o644 }
+    }
+    fn report_done(store: &mut Store, job: &Job, state: &str, results: Vec<FileEntry>) {
+        store.report(job.worker_id.as_deref().unwrap(), AttemptReport {
+            job_id: job.id.clone(), attempt_id: job.attempt_id.clone(), state: state.into(),
+            exit_code: Some(if state == "succeeded" { 0 } else { 1 }), error: None, results,
+        }).unwrap();
+    }
+    #[test]
+    fn followups_run_after_success_with_the_parent_results_as_inputs() {
+        let (_dir, mut store) = test_store();
+        let (_session, mut rx) = worker(&mut store, "one");
+        let script = blob(&store, "deploy.sh", b"old");
+        let stale = blob(&store, "dist", b"a file where results put a directory");
+        let deploy = JobSpec { command: vec!["deploy".into()], inputs: vec![script, stale], ..spec() };
+        let parent = store.add_job(JobSpec { outputs: vec!["dist".into()], then: vec![deploy], ..spec() }, Some("ci".into())).unwrap();
+        let HubMessage::Run { job: sent, .. } = rx.try_recv().unwrap() else { panic!("expected assignment") };
+        assert!(sent.spec.then.is_empty(), "workers never receive follow-ups");
+        let built = blob(&store, "dist/app", b"binary");
+        report_done(&mut store, &parent, "succeeded", vec![built.clone()]);
+        let parent = store.job(&parent.id).unwrap().unwrap();
+        assert_eq!(parent.followups.len(), 1);
+        assert!(parent.followup_error.is_none());
+        let child = store.job(&parent.followups[0]).unwrap().unwrap();
+        assert_eq!(child.parent.as_deref(), Some(parent.id.as_str()));
+        assert_eq!(child.submitted_by.as_deref(), Some("ci"));
+        let paths: Vec<_> = child.spec.inputs.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["deploy.sh", "dist/app"]);
+
+        let (_session, _rx) = worker(&mut store, "two");
+        let failing = store.add_job(JobSpec { then: vec![spec()], ..spec() }, None).unwrap();
+        let failing = store.job(&failing.id).unwrap().unwrap();
+        report_done(&mut store, &failing, "failed", vec![]);
+        assert!(store.job(&failing.id).unwrap().unwrap().followups.is_empty());
+    }
+    #[test]
+    fn followups_are_checked_at_submit_and_failures_are_recorded_on_the_parent() {
+        let (_dir, mut store) = test_store();
+        let (_session, _rx) = worker(&mut store, "one");
+        let unsatisfiable = JobSpec { requirements: Requirements { os: Some("macos".into()), ..Default::default() }, ..spec() };
+        assert!(store.add_job(JobSpec { then: vec![unsatisfiable.clone()], ..spec() }, None).is_err());
+        let parent = store.add_job(JobSpec { then: vec![spec()], ..spec() }, None).unwrap();
+        // The follow-up's worker disappears while the parent runs.
+        let mut stored = store.job(&parent.id).unwrap().unwrap();
+        stored.spec.then = vec![unsatisfiable];
+        store.save_job(&stored).unwrap();
+        report_done(&mut store, &stored, "succeeded", vec![]);
+        let parent = store.job(&parent.id).unwrap().unwrap();
+        assert_eq!(parent.state, "succeeded");
+        assert!(parent.followups.is_empty());
+        assert!(parent.followup_error.unwrap().contains("no compatible registered worker"));
     }
 
     #[test]

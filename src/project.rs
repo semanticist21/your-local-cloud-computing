@@ -93,6 +93,9 @@ pub struct Task {
     /// Workspace-relative directories (for example target or node_modules) kept on the worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<Vec<String>>,
+    /// Tasks the Hub runs after each job of this one succeeds, with its outputs as extra inputs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub then: Vec<String>,
 }
 
 /// An environment declared in the project file: a preset (`uses: bun@1.3.14`) or a full recipe.
@@ -478,12 +481,44 @@ impl Project {
         Ok(environment)
     }
 
-    /// Applies defaults and targets; `root` names the default cache scope.
+    /// Applies defaults and targets; `root` names the default cache scope. Follow-up tasks get no inputs.
     pub fn plan(&self, name: &str, root: &Path, inputs: Vec<FileEntry>) -> Result<Plan> {
+        self.plan_with(name, root, &BTreeMap::from([(name.to_string(), inputs)]))
+    }
+
+    /// Like [`Project::plan`], taking each task's inputs (including follow-ups) by task name.
+    pub fn plan_with(&self, name: &str, root: &Path, inputs: &BTreeMap<String, Vec<FileEntry>>) -> Result<Plan> {
+        self.plan_chain(name, root, inputs, &mut Vec::new())
+    }
+
+    fn plan_chain(
+        &self,
+        name: &str,
+        root: &Path,
+        inputs: &BTreeMap<String, Vec<FileEntry>>,
+        chain: &mut Vec<String>,
+    ) -> Result<Plan> {
+        if chain.iter().any(|n| n == name) {
+            bail!("follow-up cycle: {} -> {name}", chain.join(" -> "))
+        }
         let task = self
             .tasks
             .get(name)
             .with_context(|| format!("unknown task {name}"))?;
+        chain.push(name.to_string());
+        let mut environments: Vec<Environment> = Vec::new();
+        let mut then = Vec::new();
+        for next in &task.then {
+            let plan = self.plan_chain(next, root, inputs, chain)?;
+            for environment in plan.environments {
+                if !environments.iter().any(|e| e.id == environment.id) {
+                    environments.push(environment);
+                }
+            }
+            then.extend(plan.specs);
+        }
+        chain.pop();
+        let inputs = inputs.get(name).cloned().unwrap_or_default();
         let defaults = &self.defaults;
         let environment_name = task.environment.as_ref().or(defaults.environment.as_ref());
         let cache = task.cache.clone().unwrap_or_else(|| defaults.cache.clone());
@@ -500,7 +535,6 @@ impl Project {
         };
         let mut env = defaults.env.clone();
         env.extend(task.env.clone());
-        let mut environments: Vec<Environment> = Vec::new();
         let mut specs = Vec::new();
         for target in &targets {
             let requirements = merge(&base, target);
@@ -536,6 +570,7 @@ impl Project {
                 priority: task.priority.or(defaults.priority).unwrap_or(0),
                 cache: cache.clone(),
                 cache_scope: (!cache.is_empty()).then(|| scope.clone()),
+                then: then.clone(),
             };
             spec.validate()?;
             specs.push(spec);
@@ -752,6 +787,45 @@ mod tests {
             fs::read_to_string(snapshot.blobs.path().join(&snapshot.files[0].hash)).unwrap(),
             "project input"
         );
+    }
+
+    #[test]
+    fn then_attaches_follow_up_tasks_to_every_target_and_rejects_cycles() {
+        let yaml = |deploy_then: &str| format!("version: 1
+environments:
+  tools: {{setup: [true]}}
+tasks:
+  build:
+    command: [make]
+    inputs: [src]
+    outputs: [dist]
+    targets: [{{os: linux}}, {{os: macos}}]
+    then: [deploy]
+  deploy:
+    command: [./deploy.sh]
+    inputs: [deploy.sh]
+    environment: tools
+    then: [{deploy_then}]
+  notify:
+    command: [true]
+    no_input: true
+");
+        let project = Project::parse(&yaml("notify")).unwrap();
+        let script = FileEntry { path: "deploy.sh".into(), hash: "a".repeat(64), size: 1, mode: 0o755 };
+        let inputs = BTreeMap::from([("deploy".to_string(), vec![script])]);
+        let plan = project.plan_with("build", Path::new("/x/app"), &inputs).unwrap();
+        assert_eq!(plan.specs.len(), 2);
+        assert_eq!(plan.environments.len(), 1, "follow-up environments are registered");
+        for spec in &plan.specs {
+            assert!(spec.inputs.is_empty());
+            assert_eq!(spec.then.len(), 1);
+            assert_eq!(spec.then[0].command, ["./deploy.sh"]);
+            assert_eq!(spec.then[0].inputs[0].path, "deploy.sh");
+            assert_eq!(spec.then[0].then[0].command, ["true"]);
+        }
+        let cycle = Project::parse(&yaml("build")).unwrap_err();
+        assert!(format!("{cycle:#}").contains("follow-up cycle"), "{cycle:#}");
+        assert!(Project::parse(&yaml("missing")).is_err());
     }
 
     #[test]

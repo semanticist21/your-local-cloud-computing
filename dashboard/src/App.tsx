@@ -841,6 +841,9 @@ function JobPage() {
       {job.error && (
         <div className="error-notice" role="alert"><CircleAlert size={16} /><span>{job.error}</span></div>
       )}
+      {job.followup_error && (
+        <div className="error-notice" role="alert"><CircleAlert size={16} /><span>Follow-up not submitted: {job.followup_error}</span></div>
+      )}
       <section className="content-section">
         <dl className="detail-grid">
           <Detail label="Worker">{job.worker_id ? <Link className="table-link" to="/workers/$workerId" params={{ workerId: job.worker_id }}>{job.worker_id}</Link> : <span className="muted-text">Unassigned</span>}</Detail>
@@ -852,6 +855,13 @@ function JobPage() {
           <Detail label="Timeout">{spec.timeout_secs ? `${spec.timeout_secs}s` : <span className="muted-text">None</span>}</Detail>
           <Detail label="Container">{spec.container ?? <span className="muted-text">None</span>}</Detail>
           <Detail label="Submitted by">{job.submitted_by ?? <span className="muted-text">Not recorded</span>}</Detail>
+          {job.parent && <Detail label="Follows"><JobLink id={job.parent} /></Detail>}
+          {(job.followups?.length || spec.then?.length) ? (
+            <Detail label="Follow-ups">
+              {job.followups?.length ? job.followups.map((id) => <JobLink key={id} id={id} />)
+                : <span className="muted-text">{spec.then?.length} after success</span>}
+            </Detail>
+          ) : null}
         </dl>
       </section>
 
@@ -895,6 +905,10 @@ function JobPage() {
       </section>
     </>
   )
+}
+
+function JobLink({ id }: { id: string }) {
+  return <Link className="table-link" to="/jobs/$jobId" params={{ jobId: id }}><code className="job-id">{id.slice(0, 8)}</code></Link>
 }
 
 function JobsTable({ jobs }: { jobs: JobSummary[] }) {

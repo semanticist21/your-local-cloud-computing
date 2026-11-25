@@ -4332,6 +4332,9 @@ mod tests {
             wait_reason: None,
             wait_reason_code: None,
             last_output_at: None,
+            parent: None,
+            followups: vec![],
+            followup_error: None,
         };
         accept(state.clone(), job, None).unwrap();
         assert!(!attempt.dir.join("work").exists());
@@ -4391,6 +4394,9 @@ mod tests {
             wait_reason: None,
             wait_reason_code: None,
             last_output_at: None,
+            parent: None,
+            followups: vec![],
+            followup_error: None,
         };
         let (cancel, receiver) = watch::channel(false);
         let (exit, _) = run_attempt(&state, &attempt, &job, None, receiver)
@@ -4877,6 +4883,9 @@ mod tests {
             wait_reason: None,
             wait_reason_code: None,
             last_output_at: None,
+            parent: None,
+            followups: vec![],
+            followup_error: None,
         };
         let (_keepalive, receiver) = watch::channel(false);
         let error = run_attempt(&state, &attempt, &job, Some(&environment), receiver)
@@ -4943,6 +4952,9 @@ mod tests {
             wait_reason: None,
             wait_reason_code: None,
             last_output_at: None,
+            parent: None,
+            followups: vec![],
+            followup_error: None,
         };
         let (_keepalive, receiver) = watch::channel(false);
         let (exit, _) = tokio::time::timeout(
@@ -5064,6 +5076,9 @@ mod tests {
             wait_reason: None,
             wait_reason_code: None,
             last_output_at: None,
+            parent: None,
+            followups: vec![],
+            followup_error: None,
         }
     }
     #[cfg(unix)]

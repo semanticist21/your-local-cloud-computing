@@ -305,6 +305,20 @@ def main():
             assert task.returncode == 0, task.stderr
             assert result(json.loads(task.stdout)) == "99\n"
 
+            # A follow-up runs on the Hub after its parent succeeds, with the parent's outputs as inputs,
+            # even though the requesting CLI already exited.
+            (project / "suffix.txt").write_text("!\n")
+            deploy = "from pathlib import Path; Path('answer.txt').write_text(Path('built.txt').read_text().strip() + Path('suffix.txt').read_text())"
+            project_file.write_text(json.dumps({"version": 1, "defaults": {"requirements": {"os": os_name, "arch": arch}}, "tasks": {
+                "build": {"command": python("from pathlib import Path; Path('built.txt').write_text('built')"), "no_input": True, "outputs": ["built.txt"], "then": ["deploy"]},
+                "deploy": {"command": python(deploy), "inputs": ["suffix.txt"], "outputs": ["answer.txt"]}}}))
+            built, _ = cli("task", "run", "build", "--file", str(project_file), "--detach")
+            parent = until(lambda: (lambda job: job if job["state"] == "succeeded" else None)(state(built)))
+            assert parent.get("followups") and not parent.get("followup_error"), parent
+            child = wait({"id": parent["followups"][0]})
+            assert child["state"] == "succeeded" and child["parent"] == parent["id"], child
+            assert result(child) == "built!\n"
+
             # Inline environment, defaults, targets and a worker-persistent cache, then save an ad-hoc run.
             repeat = base / "repeat"
             repeat.mkdir()

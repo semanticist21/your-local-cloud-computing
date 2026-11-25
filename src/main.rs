@@ -742,6 +742,7 @@ fn require_hub_support(supported: &[String], spec: &JobSpec) -> Result<()> {
             "job_worker",
             "worker selection",
         ),
+        (!spec.then.is_empty(), FOLLOWUPS, "follow-up jobs"),
     ]
     .into_iter()
     .filter(|(used, _, _)| *used);
@@ -750,7 +751,7 @@ fn require_hub_support(supported: &[String], spec: &JobSpec) -> Result<()> {
             bail!("this Hub does not support {feature}; upgrade the Hub first")
         }
     }
-    Ok(())
+    spec.then.iter().try_for_each(|next| require_hub_support(supported, next))
 }
 fn print<T: Serialize>(v: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(v)?);
@@ -1040,7 +1041,13 @@ async fn execute() -> Result<()> {
                                 environments.push(environment);
                             }
                         }
-                        specs.extend(plan.specs);
+                        // Follow-ups run under the same worker policy as their parent.
+                        let mut pending = plan.specs;
+                        while !pending.is_empty() {
+                            let next: Vec<JobSpec> = pending.iter_mut().flat_map(|spec| std::mem::take(&mut spec.then)).collect();
+                            specs.extend(pending);
+                            pending = next;
+                        }
                     }
                 }
                 for name in environment {
@@ -1165,6 +1172,7 @@ async fn execute() -> Result<()> {
                 cache_scope: (!r.cache.is_empty())
                     .then(|| ylcc::project::project_scope(project_name.as_deref(), &cwd)),
                 cache: r.cache.clone(),
+                then: vec![],
             };
             let saved = match r.save_task {
                 Some(name) => {
@@ -1257,10 +1265,26 @@ async fn execute() -> Result<()> {
                     )
                 })?;
                 let snap = task.snapshot(&root)?;
-                let plan = project.plan(&name, &root, snap.files.clone())?;
+                let mut inputs = BTreeMap::from([(name.clone(), snap.files.clone())]);
+                let mut followups = Vec::new();
+                let mut pending = task.then.clone();
+                while let Some(next) = pending.pop() {
+                    if inputs.contains_key(&next) {
+                        continue;
+                    }
+                    let task = project.tasks.get(&next).with_context(|| format!("unknown task {next}"))?;
+                    let snap = task.snapshot(&root)?;
+                    inputs.insert(next, snap.files.clone());
+                    pending.extend(task.then.clone());
+                    followups.push(snap);
+                }
+                let plan = project.plan_with(&name, &root, &inputs)?;
                 let client = Client::new(&hub, &token)?;
                 for environment in &plan.environments {
                     register(&client, environment).await?;
+                }
+                for snap in &followups {
+                    client.upload(snap).await?;
                 }
                 let jobs = submit(&client, snap, plan.specs, &results, detach, no_download).await?;
                 report(&jobs, detach)

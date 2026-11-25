@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -187,6 +187,9 @@ pub struct JobSpec {
     pub cache: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_scope: Option<String>,
+    /// Jobs the Hub submits after this one succeeds, with its results added to their inputs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub then: Vec<JobSpec>,
 }
 impl JobSpec {
     pub fn validate(&self) -> Result<()> {
@@ -226,9 +229,13 @@ impl JobSpec {
         if self.requirements.emulation {
             bail!("emulation is not implemented; use a native matching worker")
         }
+        for next in &self.then {
+            next.validate().context("follow-up job")?;
+        }
         Ok(())
     }
 }
+pub const FOLLOWUPS: &str = "job_followups";
 pub const IDEMPOTENT_SUBMIT: &str = "idempotent_job_submit";
 pub const IDEMPOTENT_JOBS_PATH: &str = "/v1/jobs/idempotent";
 
@@ -289,6 +296,14 @@ pub struct Job {
     /// Last stdout/stderr output of the current attempt, recorded at most every few seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_output_at: Option<u64>,
+    /// The job whose success submitted this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Jobs submitted from `spec.then` after this one succeeded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub followups: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followup_error: Option<String>,
 }
 
 pub fn job_is_terminal(state: &str) -> bool {

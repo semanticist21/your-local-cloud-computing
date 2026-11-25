@@ -86,6 +86,7 @@ export type JobSpec = {
   container?: string | null
   env?: Record<string, string>
   timeout_secs?: number | null
+  then?: JobSpec[]
 }
 
 export type Job = {
@@ -102,6 +103,9 @@ export type Job = {
   wait_reason_code?: string | null
   results?: FileEntry[]
   submitted_by?: string | null
+  parent?: string | null
+  followups?: string[]
+  followup_error?: string | null
 }
 
 export type JobSummary = Pick<Job, 'id' | 'state' | 'worker_id' | 'created_at' | 'updated_at' | 'submitted_by' | 'wait_reason' | 'wait_reason_code'> & {

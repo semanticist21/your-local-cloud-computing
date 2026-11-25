@@ -2992,7 +2992,9 @@ pub async fn probe() -> Result<Capabilities> {
         "protoc",
         "pkg-config",
     ]
-    .map(|name| async move { (name, tool_version(name, &values, None).await) });
+    // An iterator, not `array.map`: thirty futures built in one stack array overflow Windows' 1 MiB main stack.
+    .into_iter()
+    .map(|name| Box::pin(async move { (name, tool_version(name, values, None).await) }));
     // Probe concurrently: one slow tool (a JVM, a busy daemon) must not delay startup by the sum.
     for (name, version) in futures_util::future::join_all(probes).await {
         if let Ok(version) = version {

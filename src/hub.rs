@@ -2745,10 +2745,12 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let secret = "a".repeat(64);
-        let mut token = tempfile::NamedTempFile::new().unwrap();
-        crate::platform::protect_file(token.as_file()).unwrap();
-        writeln!(token, "{secret}").unwrap();
-        token.flush().unwrap();
+        // A closed file: Windows refuses to reopen a NamedTempFile that is still held open.
+        let token = dir.path().join("token");
+        let mut file = std::fs::File::create(&token).unwrap();
+        crate::platform::protect_file(&file).unwrap();
+        writeln!(file, "{secret}").unwrap();
+        drop(file);
 
         let mut store = Store::open(dir.path().into(), secret.clone()).unwrap();
         let (_, _worker) = worker(&mut store, "one");
@@ -2775,7 +2777,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = crate::client::Client::new(&address, token.path()).unwrap();
+        let client = crate::client::Client::new(&address, &token).unwrap();
         assert!(client.hub_capabilities().await.unwrap().contains(&IDEMPOTENT_SUBMIT.to_string()));
         let job = client.submit_job(&spec(), true).await.unwrap();
         assert!(dropped.load(Ordering::SeqCst));
